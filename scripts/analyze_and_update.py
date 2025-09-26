@@ -5,6 +5,8 @@ analyze_and_update.py
 - 날짜가 시트에 '이미 있으면' 해당 행 업데이트, 없으면 '맨 아래'에 새로 추가
 - 전국: '광역'별 건수, 서울: '서울특별시'만 필터 후 '구'별 건수
 - 탭 매칭: 공백/0패딩 차이 허용(예: '서울25년 7월' == '서울 25년 07월')
+- 날짜 매칭: 시트에 'YYYY. M. D' 형태여도 내부적으로 YYYY-MM-DD로 정규화하여 비교
+- 날짜 기록: 시트에는 'YYYY. M. D' 형식으로 기록
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ def fuzzy_find_sheet(sh: gspread.Spreadsheet, want_title: str) -> Optional[gspre
     tgt = _month_normalize(want_title)
     for ws in sh.worksheets():
         if _month_normalize(ws.title) == tgt:
-            log(f"[ws] fuzzy matched: '{ws.title}'")
+            log(f"[ws] fuzzy matched (exact norm): '{ws.title}'")
             return ws
     titles = [_month_normalize(ws.title) for ws in sh.worksheets()]
     log(f"[ws] no match for '{want_title}' (norm='{tgt}'). available(norm)={titles}")
@@ -104,7 +106,7 @@ REGION_ALIAS = {
     "충청남도": "충청남도",
     "경상북도": "경상북도",
     "경상남도": "경상남도",
-    "서울특별시": "서울특별자치시" if "서울특별자치시" in [] else "서울특별시",  # 안전하게 기본 유지
+    "서울특별시": "서울특별시",
     "세종특별자치시": "세종특별자치시",
     "제주특별자치도": "제주특별자치도",
     "부산광역시": "부산광역시",
@@ -123,7 +125,11 @@ def norm_region(name: str) -> str:
 # =========================
 # 날짜 정규화 & 행 찾기
 # =========================
-def to_ymd_str(x) -> Optional[str]:
+def normalize_to_ymd(x) -> Optional[str]:
+    """
+    여러 형태의 날짜(일련번호/문자열/Datetime)를 'YYYY-MM-DD'로 정규화.
+    '2025. 9. 26' 같은 점/공백 혼합도 잡아냄.
+    """
     from datetime import datetime as D, date as Dd
     if x is None:
         return None
@@ -136,13 +142,17 @@ def to_ymd_str(x) -> Optional[str]:
     # 구글시트 일련번호
     if s.isdigit():
         try:
-            base = datetime(1899, 12, 30)
+            base = datetime(1899, 12, 30)  # Google Sheets epoch
             return (base + timedelta(days=int(s))).strftime("%Y-%m-%d")
         except Exception:
             pass
-    s2 = s.replace(".", "-").replace("/", "-")
-    s2 = s2.split()[0]  # 시간 꼬리 제거(예: "2025-09-26 00:00:00")
-    # 2025-9-6 형태도 허용
+    # 숫자/구분자 외 제거
+    s = re.sub(r"[^\d./\- ]", "", s)
+    # 공백 제거 후 표준화(점/슬래시 → 하이픈)
+    s2 = re.sub(r"\s+", "", s)
+    s2 = s2.strip(".-/")
+    s2 = s2.replace(".", "-").replace("/", "-")
+    # e.g. 2025-9-6, 2025-09-06 모두 허용
     m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s2)
     if m:
         y, mo, d = map(int, m.groups())
@@ -151,6 +161,10 @@ def to_ymd_str(x) -> Optional[str]:
         except Exception:
             return None
     return None
+
+def display_dot_date(d: date) -> str:
+    """시트에 쓸 표시용 날짜: 'YYYY. M. D' (0패딩 없이, 점 뒤에 공백 포함)."""
+    return f"{d.year}. {d.month}. {d.day}"
 
 def find_date_col_index(ws, header_row: int = 1) -> int:
     header = ws.row_values(header_row)
@@ -166,16 +180,14 @@ def find_date_col_index(ws, header_row: int = 1) -> int:
 def find_date_row(ws, target_ymd: str, header_row: int = 1) -> Optional[int]:
     """시트에서 '날짜' 열을 자동 탐지 후 target_ymd(YYYY-MM-DD) 행 인덱스 반환."""
     col_idx = find_date_col_index(ws, header_row=header_row)
-    colA1 = rowcol_to_a1(header_row + 1, col_idx).split(":")[0]
-    # 큰 범위 한번에 받아와서 비교(속도+쿼터 절약)
     values = ws.col_values(col_idx)
     # 헤더 아래부터만 검색
     search_values = values[header_row:]
     # 진단 로그(상위 15개 샘플)
-    samples = [to_ymd_str(v) for v in search_values[:15]]
+    samples = [normalize_to_ymd(v) for v in search_values[:15]]
     log(f"[date] target={target_ymd} in col={col_idx} header_row={header_row} samples={samples}")
     for i, cell in enumerate(search_values, start=header_row + 1):
-        got = to_ymd_str(cell)
+        got = normalize_to_ymd(cell)
         if got == target_ymd:
             return i
     return None
@@ -201,11 +213,13 @@ def ensure_header(ws, target_header: List[str], header_row: int = 1) -> List[str
 
 def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series,
                      header_row: int = 1, kind: str = "national"):
-    ymd = when_date.strftime("%Y-%m-%d")
+    ymd_norm = when_date.strftime("%Y-%m-%d")
+    show_date = display_dot_date(when_date)  # 시트에 표시는 'YYYY. M. D'
+
     sheet_header = ensure_header(ws, header, header_row=header_row)
 
-    # 날짜열 탐지 & 행 찾기
-    row_idx = find_date_row(ws, ymd, header_row=header_row)
+    # 날짜열 탐지 & 행 찾기 (정규화 비교)
+    row_idx = find_date_row(ws, ymd_norm, header_row=header_row)
 
     # 값 맵 준비
     values_by_header: Dict[str, int] = {}
@@ -223,7 +237,7 @@ def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series,
     row_vals: List = []
     for i, col in enumerate(sheet_header):
         if i == 0:
-            row_vals.append(ymd); continue
+            row_vals.append(show_date); continue  # 표시용 점 형식
         if not col:
             row_vals.append(""); continue
         if col in ("전체 개수", "총합계", "합계"):
@@ -234,13 +248,13 @@ def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series,
     if row_idx is not None:
         a1 = f"A{row_idx}"
         ws.update([row_vals], a1)
-        log(f"[ws] update row {row_idx} ({kind})")
-        where_write(f"{ws.title} | {ymd} | UPDATE | sum={total_sum}")
+        log(f"[ws] update row {row_idx} ({kind}) -> {show_date}")
+        where_write(f"{ws.title} | {show_date} | UPDATE | sum={total_sum}")
         return {"op": "update", "row": row_idx}
     else:
         ws.append_row(row_vals, value_input_option="RAW")
-        log(f"[ws] append new row ({kind})")
-        where_write(f"{ws.title} | {ymd} | APPEND | sum={total_sum}")
+        log(f"[ws] append new row ({kind}) -> {show_date}")
+        where_write(f"{ws.title} | {show_date} | APPEND | sum={total_sum}")
         return {"op": "append", "row": None}
 
 # =========================
@@ -341,9 +355,8 @@ def main():
         else:
             nat_header = [h.strip() for h in (ws_nat.row_values(1) or [])]
             if not nat_header or nat_header[0] != "날짜":
-                # 기존 시트 헤더를 믿되, 비어 있으면 최소 헤더 구성
                 uniq_regions = sorted(set(df["광역"].map(norm_region))) if "광역" in df.columns else []
-                nat_header = ["날짜"] + (nat_header[1:] if nat_header else uniq_regions)  # 기존 유지
+                nat_header = ["날짜"] + (nat_header[1:] if nat_header else uniq_regions)
                 if "전체 개수" not in nat_header and "총합계" not in nat_header and "합계" not in nat_header:
                     nat_header += ["전체 개수"]
             nat_series = build_national_series(df, nat_header)
