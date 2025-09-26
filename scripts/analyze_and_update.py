@@ -60,9 +60,56 @@ def note_written(s: str):
     except Exception:
         pass
 
-# ---------------- Helpers ----------------
+# ---------------- Normalize helpers ----------------
 
-# 파일명 예: "전국 2506_250926.xlsx" -> (y=2025, m=6, day=26)
+def norm_raw(s: str) -> str:
+    """공백/전각공백 제거 + 소문자화(한글엔 영향無)"""
+    if s is None: return ""
+    return str(s).replace("\u00A0","").replace(" ", "").strip()
+
+# 행정구역 표기 통합(정규화된 키 -> 정규화된 대표키)
+# ex) '강원도'와 '강원특별자치도'는 한 그룹으로 묶기
+CANON_MAP = {
+    # 강원
+    "강원도": "강원특별자치도",
+    "강원특별자치도": "강원특별자치도",
+    # 전북
+    "전라북도": "전북특별자치도",
+    "전북특별자치도": "전북특별자치도",
+    # 세종/제주는 그대로
+    "세종특별자치시": "세종특별자치시",
+    "제주특별자치도": "제주특별자치도",
+    # 나머지 광역은 자체 유지
+    "경기도": "경기도",
+    "경상남도": "경상남도",
+    "경상북도": "경상북도",
+    "광주광역시": "광주광역시",
+    "대구광역시": "대구광역시",
+    "대전광역시": "대전광역시",
+    "부산광역시": "부산광역시",
+    "서울특별시": "서울특별자치시" if False else "서울특별시",  # 시트가 '서울특별시'면 그대로
+    "울산광역시": "울산광역시",
+    "인천광역시": "인천광역시",
+    "전라남도": "전라남도",
+    "충청남도": "충청남도",
+    "충청북도": "충청북도",
+}
+
+# 정규화 키로 매칭할 때 사용할: (정규화문자열) -> (정규화 대표문자열)
+CANON_MAP_NORM: Dict[str,str] = {}
+for k,v in CANON_MAP.items():
+    CANON_MAP_NORM[norm_raw(k)] = norm_raw(v)
+
+def canonize_region_name(s: str) -> str:
+    n = norm_raw(s)
+    return CANON_MAP_NORM.get(n, n)
+
+def canonize_gu_name(s: str) -> str:
+    # 구 이름도 공백 제거만으로 대부분 해결
+    return norm_raw(s)
+
+# ---------------- Filename / Tab parsing ----------------
+
 FN_RE = re.compile(r".*?(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.xlsx$")
 
 def parse_filename(fname: str) -> Tuple[int,int,int]:
@@ -74,20 +121,11 @@ def parse_filename(fname: str) -> Tuple[int,int,int]:
     day = int(m.group(5))
     return y, mth, day
 
-# 탭명(전국/서울 25년 6월 등)에서 (yy, m)
-TAB_RE = re.compile(r"(?:전국|서울)\s*(\d{2})년\s*(\d{1,2})월")
 def parse_tab_ym(title: str) -> Optional[Tuple[int,int]]:
-    t = title.replace(" ", "")
-    m = TAB_RE.match(t)
+    m = re.match(r"(?:전국|서울)\s*(\d{2})년\s*(\d{1,2})월", title.replace(" ",""))
     if not m: return None
-    y = 2000 + int(m.group(1))
-    mth = int(m.group(2))
-    return y, mth
+    return 2000 + int(m.group(1)), int(m.group(2))
 
-def norm(s: str) -> str:
-    return (s or "").strip().replace(" ", "").replace("\u00A0","")
-
-# ‘YYYY. M. D’ 문자열
 def kdate_str(d: date) -> str:
     return f"{d.year}. {d.month}. {d.day}"
 
@@ -95,35 +133,14 @@ def parse_any_date(s: str) -> Optional[date]:
     if s is None: return None
     s = str(s).strip()
     if not s: return None
-    # 주로 사용하는 포맷들
     for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y.%m. %d", "%Y. %m. %d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
+        try: return datetime.strptime(s, fmt).date()
+        except Exception: pass
     m = re.match(r"^\s*(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\s*$", s)
     if m:
         y,mn,dd = map(int, m.groups())
         return date(y,mn,dd)
     return None
-
-# 날짜열에서 target 날짜의 행 찾기(헤더=1행)
-def find_date_row(ws, target: date, date_col_idx: int = 1, header_row: int = 1) -> Optional[int]:
-    rng = ws.range(header_row+1, date_col_idx, ws.row_count, date_col_idx)
-    for off, cell in enumerate(rng, start=header_row+1):
-        v = str(cell.value).strip()
-        if not v: continue
-        d = parse_any_date(v)
-        if d and d == target:
-            return off
-    return None
-
-def find_date_col_idx(ws) -> int:
-    header = ws.row_values(1)
-    for i, v in enumerate(header, start=1):
-        if str(v).strip() == "날짜":
-            return i
-    return 1
 
 # ---------------- Data read & agg ----------------
 
@@ -140,67 +157,102 @@ def read_molit_xlsx(path: Path) -> pd.DataFrame:
     return df
 
 def agg_national(df: pd.DataFrame) -> Dict[str,int]:
-    s = df.groupby("광역").size().astype(int)
-    return dict(s)
+    # 광역명 정규화 -> 대표키 기준으로 합산
+    ser = df["광역"].map(canonize_region_name)
+    s = ser.groupby(ser).size().astype(int)
+    out: Dict[str,int] = dict(s)
+    # 디버그 샘플
+    items = sorted(out.items(), key=lambda x: -x[1])[:10]
+    log(f"[agg/national] sample={items}")
+    return out
 
 def agg_seoul(df: pd.DataFrame) -> Dict[str,int]:
-    se = df[df["광역"]=="서울특별시"]
-    if se.empty: return {}
-    s = se.groupby("구").size().astype(int)
-    return dict(s)
+    # 서울만 필터
+    mask = df["광역"].map(lambda x: canonize_region_name(x) in (canonize_region_name("서울특별시"),))
+    se = df[mask]
+    if se.empty:
+        log("[agg/seoul] empty after filter")
+        return {}
+    ser = se["구"].map(canonize_gu_name)
+    s = ser.groupby(ser).size().astype(int)
+    out: Dict[str,int] = dict(s)
+    items = sorted(out.items(), key=lambda x: -x[1])[:10]
+    log(f"[agg/seoul] sample={items}")
+    return out
 
 # ---------------- Sheet access ----------------
 
 def fuzzy_find_sheet(sh, want_title: str):
-    want_n = norm(want_title)
+    want_n = norm_raw(want_title)
+    hit = None
     for ws in sh.worksheets():
-        if norm(ws.title) == want_n:
-            return ws
-    # 공백/전각 차이 등 느슨 매칭
-    for ws in sh.worksheets():
-        if norm(ws.title) == norm(want_title.replace(" ", "")):
-            return ws
+        if norm_raw(ws.title) == want_n:
+            hit = ws; break
+    if hit:
+        log(f"[ws] fuzzy matched: '{ws.title}'")
+    return hit
+
+def find_date_col_idx(ws) -> int:
+    header = ws.row_values(1)
+    for i, v in enumerate(header, start=1):
+        if str(v).strip() == "날짜":
+            return i
+    return 1
+
+def find_date_row(ws, target: date, date_col_idx: int = 1, header_row: int = 1) -> Optional[int]:
+    rng = ws.range(header_row+1, date_col_idx, ws.row_count, date_col_idx)
+    for off, cell in enumerate(rng, start=header_row+1):
+        v = str(cell.value).strip()
+        if not v: continue
+        d = parse_any_date(v)
+        if d and d == target:
+            return off
     return None
 
-def build_row_by_header(header: List[str], day: date, series: Dict[str,int], kind: str) -> List:
+def build_row_by_header(header: List[str], day: date, series_norm: Dict[str,int]) -> List:
+    """
+    header: A1 행의 표시 텍스트
+    series_norm: 정규화된 키(공백제거/표준화) -> count
+    """
     row = []
     total = 0
-    alias_map = {
-        "강원도": "강원도",
-        "강원특별자치도": "강원특별자치도",
-        "전라북도": "전라북도",
-        "전북특별자치도": "전북특별자치도",
-        "세종특별자치시": "세종특별자치시",
-        "제주특별자치도": "제주특별자치도",
-        "총합계": "__SUM__",
-        "전체 개수": "__SUM__",
-        "합계": "__SUM__",
+    # 헤더 별칭(정규화 형태로 보관)
+    alias_norm = {
+        norm_raw("강원도"): norm_raw("강원특별자치도"),
+        norm_raw("강원특별자치도"): norm_raw("강원특별자치도"),
+        norm_raw("전라북도"): norm_raw("전북특별자치도"),
+        norm_raw("전북특별자치도"): norm_raw("전북특별자치도"),
     }
     for i, h in enumerate(header):
         h = str(h).strip()
         if i == 0:
-            row.append(kdate_str(day))
-            continue
+            row.append(kdate_str(day)); continue
         if not h:
-            row.append("")
-            continue
-        key = h
-        val = series.get(key)
-        if val is None and key in alias_map and alias_map[key] != "__SUM__":
-            val = series.get(alias_map[key])
-        if isinstance(val, int):
-            row.append(val); total += val
-        else:
-            if alias_map.get(key) == "__SUM__":
+            row.append(""); continue
+        nh = norm_raw(h)
+        val = series_norm.get(nh)
+        if val is None and nh in alias_norm:
+            val = series_norm.get(alias_norm[nh])
+        if val is None:
+            # 서울 시트의 '총합계' 등 합계 컬럼 처리
+            if nh in (norm_raw("총합계"), norm_raw("전체 개수"), norm_raw("합계")):
                 row.append(total)
             else:
-                row.append("")
+                row.append(0)   # ← 이전엔 빈칸, 이제 0
+        else:
+            row.append(int(val))
+            total += int(val)
     return row
 
-def upsert_row(ws, day: date, series: Dict[str,int], kind: str) -> Tuple[str,int]:
+def upsert_row(ws, day: date, series: Dict[str,int]) -> Tuple[str,int]:
     header = ws.row_values(1)
     if not header:
         raise RuntimeError(f"empty header in sheet '{ws.title}'")
+    # series를 정규화 키로 재작성
+    series_norm: Dict[str,int] = {}
+    for k,v in series.items():
+        series_norm[norm_raw(k)] = int(v)
+
     date_col = find_date_col_idx(ws)
     row_idx = find_date_row(ws, day, date_col_idx=date_col, header_row=1)
     mode = "update" if row_idx else "append"
@@ -214,7 +266,8 @@ def upsert_row(ws, day: date, series: Dict[str,int], kind: str) -> Tuple[str,int
                 break
         row_idx = used + 1
 
-    out = build_row_by_header(header, day, series, kind)
+    out = build_row_by_header(header, day, series_norm)
+    # A1:마지막열
     last_a1 = gspread.utils.rowcol_to_a1(1, len(header))  # e.g., Z1
     last_col_letter = re.sub(r"\d+","", last_a1)          # Z
     rng = f"A{row_idx}:{last_col_letter}{row_idx}"
@@ -249,7 +302,7 @@ def main():
     log(f"national files count= {len(nat_files)}")
 
     # gspread 인증
-    log("[gspread] auth with sa.json")
+    log("[gspread] auth with SA_JSON (env)")
     sa_raw = os.environ.get("SA_JSON","").strip()
     if not sa_raw:
         raise RuntimeError("SA_JSON is empty")
@@ -260,7 +313,7 @@ def main():
     sh = gc.open_by_key(args.sheet_id)
     log("[gspread] spreadsheet opened")
 
-    # ✅ 오늘 날짜(한국시간)로 고정 사용
+    # 오늘 날짜(한국시간)으로 기록
     today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date()
     log(f"[date] using today (KST) = {kdate_str(today_kst)}")
 
@@ -286,29 +339,31 @@ def main():
         nat_series = agg_national(df)
         se_series = agg_seoul(df)
 
-        # 탭 찾기(느슨 매칭 허용)
-        ws_nat = fuzzy_find_sheet(sh, nat_tab_title)
-        ws_se  = fuzzy_find_sheet(sh, se_tab_title)
+        ws_nat = None
+        ws_se = None
+        for ws in sh.worksheets():
+            t = ws.title.replace(" ", "")
+            if t == nat_tab_title.replace(" ", ""):
+                ws_nat = ws
+            if t == se_tab_title.replace(" ", ""):
+                ws_se = ws
 
         if not ws_nat:
             log(f"[전국] sheet not found: '{nat_tab_title}' (skip)")
         if not ws_se:
             log(f"[서울] sheet not found: '{se_tab_title}' (skip)")
 
-        # ✅ 기록 대상 날짜: 무조건 오늘
         target_date = today_kst
 
-        # 전국 쓰기
         if ws_nat and nat_series:
-            mode, row = upsert_row(ws_nat, target_date, nat_series, kind="national")
+            mode, row = upsert_row(ws_nat, target_date, nat_series)
             log(f"[전국] {ws_nat.title} -> {kdate_str(target_date)} {mode} row={row}")
             note_written(f"{ws_nat.title}\t{kdate_str(target_date)}\t{mode}\t{row}")
         elif ws_nat:
             log(f"[전국] {ws_nat.title} -> no rows (empty agg)")
 
-        # 서울 쓰기
         if ws_se and se_series:
-            mode, row = upsert_row(ws_se, target_date, se_series, kind="seoul")
+            mode, row = upsert_row(ws_se, target_date, se_series)
             log(f"[서울] {ws_se.title} -> {kdate_str(target_date)} {mode} row={row}")
             note_written(f"{ws_se.title}\t{kdate_str(target_date)}\t{mode}\t{row}")
         elif ws_se:
