@@ -1,1 +1,71 @@
+name: analyze-and-update-sheets
 
+on:
+  schedule:
+    - cron: "20 0 * * *"   # UTC 00:20 = KST 09:20
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
+      OUT_DIR: output
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts from ckh3455/file-automation (latest success)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          repo: ckh3455/file-automation
+          workflow: molit.yml         # 소스 레포의 워크플로우 파일명
+          workflow_conclusion: success
+          branch: main                # 소스 레포 기본 브랜치
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write SA JSON to file (validate)
+        run: |
+          python - <<'PY'
+          import os,json,pathlib,sys
+          raw=os.environ.get("SA_JSON","").strip()
+          if not raw:
+              print("::error::GDRIVE_SA_JSON is empty"); sys.exit(1)
+          try:
+              obj=json.loads(raw)
+          except Exception as e:
+              print(f"::error::Invalid SA JSON: {e}"); sys.exit(1)
+          pathlib.Path("sa.json").write_text(json.dumps(obj),encoding="utf-8")
+          print("sa.json written.")
+          PY
+
+      - name: Run analysis & update
+        run: |
+          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-report
+          path: analyze_report/*
