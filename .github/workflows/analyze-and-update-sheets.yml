@@ -1,0 +1,53 @@
+# .github/workflows/analyze-and-update-sheets.yml
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts...
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          # ...
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Write SA JSON to file (validate)
+        run: |
+          # ...
+
+      - name: Run analysis & update
+        run: |
+          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
+
+      # ⬇⬇ 여기부터 네가 준 두 스텝을 그대로 붙여넣기 ⬇⬇
+      - name: Preview analyze_report (always)
+        if: always()
+        run: |
+          echo "== analyze_report tree =="
+          ls -alR analyze_report || true
+          echo "---- latest.log (head) ----"
+          sed -n '1,120p' analyze_report/latest.log || true
+          echo "---- run logs list ----"
+          ls -al analyze_report/run-*.log 2>/dev/null || true
+          echo "---- where_written.txt ----"
+          cat analyze_report/where_written.txt 2>/dev/null || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-report
+          path: analyze_report/**
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
