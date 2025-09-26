@@ -27,11 +27,11 @@ jobs:
       - name: Download artifacts from ckh3455/file-automation (latest success)
         uses: dawidd6/action-download-artifact@v6
         with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}  # Fine-grained PAT
           repo: ckh3455/file-automation
-          workflow: molit.yml         # 소스 레포의 워크플로우 파일명
+          workflow: molit.yml
           workflow_conclusion: success
-          branch: main                # 소스 레포 기본 브랜치
+          branch: main
           path: artifacts
 
       - name: Set up Python
@@ -63,9 +63,16 @@ jobs:
         run: |
           python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
 
+      - name: Ensure report dir (always)
+        if: always()
+        run: |
+          mkdir -p analyze_report
+          test -f analyze_report/log.txt || echo "no log" > analyze_report/log.txt
+
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: analyze-report
-          path: analyze_report/*
+          path: analyze_report
+          if-no-files-found: ignore
