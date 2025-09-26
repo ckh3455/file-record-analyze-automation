@@ -3,7 +3,7 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"   # 매일 KST 10:00 (= UTC 01:00)
+    - cron: "0 1 * * *"   # 매일 KST 10:00 (UTC 01:00)
 
 permissions:
   contents: read
@@ -48,6 +48,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pandas openpyxl gspread google-auth google-auth-oauthlib google-auth-httplib2
+
+      # 안전장치: analyze_report가 '파일'로 남아있으면 미리 제거
+      - name: Clean possible file collision
+        run: |
+          rm -f analyze_report
 
       - name: Run analysis & update
         env:
