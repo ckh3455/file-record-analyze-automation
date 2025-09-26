@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -11,8 +12,7 @@ from datetime import datetime, date, timedelta
 from typing import List, Tuple, Optional
 
 import pandas as pd
-from openpyxl.utils import get_column_letter  # for A1 end-col (AA, AB, ...)
-
+from openpyxl.utils import get_column_letter  # A1 범위 끝열 계산 (AA, AB, ...)
 
 # ===================== 로거 =====================
 class RunLogger:
@@ -27,26 +27,47 @@ class RunLogger:
         print(line, flush=True)
 
     def dump(self, report_dir: Path, sheet_id: str):
-        """report_dir가 파일로 있어도 안전하게 폴더 보장 후 로그 저장"""
-        if report_dir.exists() and not report_dir.is_dir():
-            try:
-                report_dir.unlink()
-            except Exception:
-                bak = report_dir.with_name(report_dir.name + ".bak")
+        """report_dir가 파일로 있어도 안전하게 폴더 보장 후 로그 저장 (flush/fsync 보강)"""
+        try:
+            if report_dir.exists() and not report_dir.is_dir():
                 try:
-                    report_dir.rename(bak)
+                    report_dir.unlink()
                 except Exception:
-                    pass
-        report_dir.mkdir(parents=True, exist_ok=True)
-        run_id = self.t0.strftime("run-%Y%m%d-%H%M%S")
-        (report_dir / "sheet_id.txt").write_text(sheet_id, encoding="utf-8")
-        (report_dir / "latest.log").write_text("\n".join(self.lines) or "(no logs)", encoding="utf-8")
-        (report_dir / f"{run_id}.log").write_text("\n".join(self.lines) or "(no logs)", encoding="utf-8")
+                    bak = report_dir.with_name(report_dir.name + ".bak")
+                    try:
+                        report_dir.rename(bak)
+                    except Exception:
+                        pass
+            report_dir.mkdir(parents=True, exist_ok=True)
 
+            run_id = self.t0.strftime("run-%Y%m%d-%H%M%S")
+            (report_dir / "sheet_id.txt").write_text(sheet_id, encoding="utf-8")
+
+            data = "\n".join(self.lines) or "(no logs)"
+            # latest.log
+            with open(report_dir / "latest.log", "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush(); os.fsync(f.fileno())
+            # run-*.log
+            with open(report_dir / f"{run_id}.log", "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush(); os.fsync(f.fileno())
+        except Exception as e:
+            # 마지막 수단으로 콘솔에만 남김
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [logger] dump failed: {e}", flush=True)
 
 logger = RunLogger()
 log = logger.log
 
+# ===================== 표준화(광역/구) =====================
+CANON_MAP = {
+    "강원도": "강원특별자치도",
+    "전라북도": "전북특별자치도",
+    # 필요시 확장 가능
+}
+def canonize_region(s: str) -> str:
+    s = (s or "").strip()
+    return CANON_MAP.get(s, s)
 
 # ===================== 파일명 파서 =====================
 def parse_national_fname(fname: str) -> Optional[Tuple[int, int, date]]:
@@ -63,7 +84,6 @@ def parse_national_fname(fname: str) -> Optional[Tuple[int, int, date]]:
     wmonth = int(yymmdd[2:4])
     wday = int(yymmdd[4:6])
     return year, month, date(wyear, wmonth, wday)
-
 
 # ===================== 아티팩트 수집 =====================
 def collect_artifacts(artifacts_dir: Path, work_dir: Path) -> List[Path]:
@@ -115,7 +135,6 @@ def collect_artifacts(artifacts_dir: Path, work_dir: Path) -> List[Path]:
     log(f"[collect] total xlsx under work_dir: {len(xlsxs)}")
     return xlsxs
 
-
 # ===================== 데이터 로드/집계 =====================
 def read_xlsx(path: Path) -> pd.DataFrame:
     log(f"[read] loading xlsx: {path}")
@@ -124,13 +143,18 @@ def read_xlsx(path: Path) -> pd.DataFrame:
     log(f"[read] shape={df.shape}, cols={list(df.columns)}")
     return df
 
-
 def aggregate_from_national_file(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     """
     전국 파일 1개로부터:
       - 전국 탭: '광역'별 건수
       - 서울 탭: '광역' == '서울특별시'만 필터 후 '구'별 건수
     """
+    # 표준화
+    if "광역" in df.columns:
+        df["광역"] = df["광역"].astype(str).map(canonize_region)
+    if "구" in df.columns:
+        df["구"] = df["구"].astype(str).str.strip()
+
     nat_series = pd.Series(dtype=int)
     seoul_series = pd.Series(dtype=int)
 
@@ -151,7 +175,6 @@ def aggregate_from_national_file(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series
     log(f"[agg] nat len={len(nat_series)}, seoul len={len(seoul_series)}")
     return nat_series, seoul_series
 
-
 # ===================== gspread 유틸 =====================
 def connect_gspread(sa_json_path: Path):
     import gspread
@@ -166,12 +189,11 @@ def connect_gspread(sa_json_path: Path):
     gc = gspread.authorize(creds)
     return gc
 
-
 def ensure_ws(sh, title: str, header: List[str]):
     """
     시트가 없으면 생성, 있으면 헤더를 '날짜 + 항목 유니온'으로 동기화.
     - 빈 문자열 헤더 제거
-    - gspread 최신 시그니처: ws.update([values], range_name="A1")
+    - 최신 gspread 시그니처: ws.update([values], range_name="A1")
     - frozenRowCount 고려, 최소 2행 보장
     """
     log(f"[ws] ensure '{title}' with header keys={header[1:]}")
@@ -211,7 +233,6 @@ def ensure_ws(sh, title: str, header: List[str]):
 
     return ws
 
-
 def parse_date_str(s: str) -> Optional[date]:
     s = (s or "").strip()
     for fmt in ("%Y-%m-%d", "%y-%m-%d"):
@@ -225,7 +246,6 @@ def parse_date_str(s: str) -> Optional[date]:
     except Exception:
         return None
 
-
 def find_date_row_index(ws, d: date) -> Optional[int]:
     rows = ws.get_all_values()
     if len(rows) <= 1:
@@ -235,7 +255,6 @@ def find_date_row_index(ws, d: date) -> Optional[int]:
             return i
     return None
 
-
 def first_record_date(ws) -> Optional[date]:
     rows = ws.get_all_values()
     if len(rows) <= 1:
@@ -243,7 +262,6 @@ def first_record_date(ws) -> Optional[date]:
     dates = [parse_date_str(r[0]) for r in rows[1:] if r and r[0]]
     dates = [d for d in dates if d]
     return min(dates) if dates else None
-
 
 def last_row_values(ws) -> Optional[Tuple[List[str], List[int]]]:
     rows = ws.get_all_values()
@@ -263,7 +281,6 @@ def last_row_values(ws) -> Optional[Tuple[List[str], List[int]]]:
             return header, vals
     return None
 
-
 def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mode: str) -> str:
     """
     mode:
@@ -276,7 +293,7 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
     # 빈 헤더 제거 + 기존/새 헤더 유니온
     cur_keys = [k for k in header[1:] if k and k.strip()]
     new_keys = [k for k in header_entities if k and k.strip()]
-    # 기존 시트에 '총합계'가 있으면 유지
+    # 기존 시트에 '총합계'가 있으면 유지 (항상 추가하고 싶으면 + ["총합계"]로 고정)
     desired = ["날짜"] + sorted(set(cur_keys + new_keys + (["총합계"] if "총합계" in header else [])))
 
     # 안전 리사이즈
@@ -298,10 +315,9 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
     row_vals = [when.isoformat()] + [int(counts.get(k, 0)) for k in header[1:]]
     # 총합계 자동 계산(있을 때만)
     if "총합계" in header:
-        sum_idx = header.index("총합계")
+        sum_idx = header.index("총합계")  # header[0]은 '날짜', row_vals도 동일 순서로 채움
         value_keys = [k for k in header[1:] if k != "총합계"]
         total = sum(int(counts.get(k, 0)) for k in value_keys)
-        # row_vals는 header 순서와 동일: '날짜' 다음부터 매핑되어 있으므로 위치 보정
         row_vals[sum_idx] = total
 
     def _upsert_row():
@@ -310,10 +326,24 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
         if idx:
             log(f"[ws] update existing row idx={idx}")
             ws.update([row_vals], range_name=f"A{idx}:{end_col}{idx}")
+            # 검증: 즉시 읽어서 확인
+            try:
+                got = ws.get_values(f"A{idx}:{end_col}{idx}")
+                log(f"[verify] readback row {idx}: {got[:1]}")
+            except Exception as e:
+                log(f"[verify] readback failed row {idx}: {e}")
             return "update"
         else:
             log("[ws] append new row")
             ws.append_row(row_vals, value_input_option="RAW")
+            # append 후 마지막 행 번호 추정 & 검증
+            try:
+                rows_now = ws.get_all_values()
+                idx_new = len(rows_now)
+                got = ws.get_values(f"A{idx_new}:{end_col}{idx_new}")
+                log(f"[verify] readback appended row {idx_new}: {got[:1]}")
+            except Exception as e:
+                log(f"[verify] readback appended failed: {e}")
             return "append"
 
     if mode == "force":
@@ -341,7 +371,6 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
         log(f"[policy] >3mo -> {res}")
         return res + "(>3mo)"
 
-
 # ===================== 메인 =====================
 def main():
     ap = argparse.ArgumentParser()
@@ -353,8 +382,9 @@ def main():
     artifacts = Path(args.artifacts_dir).resolve()
     work = Path("extracted").resolve()
 
-    log(f"[main] start artifacts={artifacts}, sa={args.sa}, sheet_id={args.sheet_id}")
+    log(f"[main] start artifacts={artifacts}, sa={args.sa}, sheet_id=***")
 
+    sh = None
     try:
         # 1) 아티팩트 수집(zip/직접 xlsx 모두 지원)
         all_xlsx = collect_artifacts(artifacts, work)
@@ -370,6 +400,13 @@ def main():
         gc = connect_gspread(Path(args.sa))
         sh = gc.open_by_key(args.sheet_id)
         log("[gspread] spreadsheet opened")
+        # 목적지 검증 로그
+        try:
+            log(f"[gspread] spreadsheet URL: {sh.url}")
+            titles = [w.title for w in sh.worksheets()]
+            log(f"[gspread] sheets: {titles}")
+        except Exception as e:
+            log(f"[gspread] WARN list sheets failed: {e}")
 
         # 3) 각 파일 처리
         for p in nat_files:
@@ -409,9 +446,18 @@ def main():
         log(f"[ERROR] {type(e).__name__}: {e}")
         raise
     finally:
-        logger.dump(Path("analyze_report"), args.sheet_id)
-        log("[main] logs written to analyze_report/")
+        # where_written.txt 남기기
+        try:
+            info_txt = f"sheet_id={args.sheet_id}\nurl={getattr(sh, 'url', '(n/a)')}\n"
+            Path("analyze_report").mkdir(exist_ok=True)
+            with open(Path("analyze_report") / "where_written.txt", "w", encoding="utf-8") as f:
+                f.write(info_txt)
+                f.flush(); os.fsync(f.fileno())
+        except Exception as e:
+            log(f"[report] write where_written failed: {e}")
 
+        logger.dump(Path("analyze_report"), args.sheet_id)
+        log(f"[main] logs written to analyze_report/ (lines={len(logger.lines)})")
 
 if __name__ == "__main__":
     main()
