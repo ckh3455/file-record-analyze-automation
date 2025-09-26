@@ -16,6 +16,7 @@ jobs:
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
       OUT_DIR: output
@@ -47,9 +48,9 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl gspread google-auth google-auth-oauthlib google-auth-httplib2
+          pip install pandas openpyxl gspread google-auth
 
-      # 안전장치: analyze_report가 '파일'로 남아있으면 미리 제거
+      # 혹시 '파일'로 남아 있으면 제거 (폴더 만들 때 충돌 방지)
       - name: Clean possible file collision
         run: |
           rm -f analyze_report
