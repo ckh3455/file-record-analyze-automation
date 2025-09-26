@@ -9,10 +9,14 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: analyze-and-update-sheets
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
@@ -27,12 +31,17 @@ jobs:
       - name: Download artifacts from ckh3455/file-automation (latest success)
         uses: dawidd6/action-download-artifact@v6
         with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}  # Fine-grained PAT
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
           repo: ckh3455/file-automation
           workflow: molit.yml
           workflow_conclusion: success
           branch: main
           path: artifacts
+
+      - name: Inspect downloaded artifacts
+        run: |
+          echo "== artifacts tree =="
+          ls -alR artifacts || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,16 +72,20 @@ jobs:
         run: |
           python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
 
-      - name: Ensure report dir (always)
+      - name: Preview analyze_report (always)
         if: always()
         run: |
-          mkdir -p analyze_report
-          test -f analyze_report/log.txt || echo "no log" > analyze_report/log.txt
+          echo "== analyze_report tree =="
+          ls -alR analyze_report || true
+          echo "---- latest.log (head) ----"
+          sed -n '1,120p' analyze_report/latest.log || true
+          echo "---- run logs list ----"
+          ls -al analyze_report/run-*.log 2>/dev/null || true
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: analyze-report
-          path: analyze_report
-          if-no-files-found: ignore
+          path: analyze_report/**
+          if-no-files-found: warn
