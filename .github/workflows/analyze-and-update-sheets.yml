@@ -25,6 +25,12 @@ jobs:
         run: |
           # ...
 
+      - name: Clean old analyze_report if file
+        run: |
+    if [ -f analyze_report ]; then rm -f analyze_report; fi
+    mkdir -p analyze_report
+
+
       - name: Run analysis & update
         run: |
           python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
