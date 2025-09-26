@@ -1,91 +1,40 @@
-name: analyze-and-update-sheets
+- name: Debug write to Sheets (no-create, safe)
+  if: always()
+  env:
+    TARGET_WS: "DEBUG_WRITE"   # ← 바꾸고 싶은 기존 탭 이름으로 설정
+  run: |
+    python - <<'PY'
+    import os, sys, json, gspread
+    from google.oauth2.service_account import Credentials
+    from datetime import datetime
 
-on:
-  schedule:
-    - cron: "20 0 * * *"   # UTC 00:20 = KST 09:20
-  workflow_dispatch: {}
+    SHEET_ID = os.environ["SHEET_ID"]
+    TARGET_WS = os.environ.get("TARGET_WS","").strip()
+    if not TARGET_WS:
+        print("TARGET_WS not set; skip.")
+        sys.exit(0)
 
-permissions:
-  contents: read
-  actions: read
+    # SA 인증
+    raw = os.environ["SA_JSON"].strip()
+    creds = Credentials.from_service_account_info(
+        json.loads(raw),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
 
-concurrency:
-  group: analyze-and-update-sheets
-  cancel-in-progress: false
+    # 새로 만들지 않고 정확히 해당 이름의 기존 시트만 찾아 갱신
+    try:
+        ws = sh.worksheet(TARGET_WS)
+    except Exception:
+        print(f"[SKIP] Worksheet not found (no-create): '{TARGET_WS}'")
+        sys.exit(0)  # 존재하지 않으면 아무것도 안 바꾸고 종료
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-      SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
-      OUT_DIR: output
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download artifacts from ckh3455/file-automation (latest success)
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}
-          repo: ckh3455/file-automation
-          workflow: molit.yml
-          workflow_conclusion: success
-          branch: main
-          path: artifacts
-
-      - name: Inspect downloaded artifacts
-        run: |
-          echo "== artifacts tree =="
-          ls -alR artifacts || true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Write SA JSON to file (validate)
-        run: |
-          python - <<'PY'
-          import os,json,pathlib,sys
-          raw=os.environ.get("SA_JSON","").strip()
-          if not raw:
-              print("::error::GDRIVE_SA_JSON is empty"); sys.exit(1)
-          try:
-              obj=json.loads(raw)
-          except Exception as e:
-              print(f"::error::Invalid SA JSON: {e}"); sys.exit(1)
-          pathlib.Path("sa.json").write_text(json.dumps(obj),encoding="utf-8")
-          print("sa.json written.")
-          PY
-
-      - name: Run analysis & update
-        run: |
-          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
-
-      - name: Preview analyze_report (always)
-        if: always()
-        run: |
-          echo "== analyze_report tree =="
-          ls -alR analyze_report || true
-          echo "---- latest.log (head) ----"
-          sed -n '1,120p' analyze_report/latest.log || true
-          echo "---- run logs list ----"
-          ls -al analyze_report/run-*.log 2>/dev/null || true
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: analyze-report
-          path: analyze_report/**
-          if-no-files-found: warn
+    # 헤더/구조 변경 없이 특정 셀만 기록 (A1 예시)
+    value = [["HELLO_FROM_ACTIONS", datetime.now().isoformat()]]
+    ws.update(value, range_name="A1")
+    print(f"[OK] Updated '{TARGET_WS}'! {sh.url}")
+    PY
