@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 analyze_and_update.py
-- GitHub Actions에서 MOLIT 아티팩트(.xlsx)들을 읽어 Google Sheets의 '기존' 탭에 집계 기록
-- 규칙:
-  1) 파일명에서 년/월/날짜를 추출해 대상 탭명을 퍼지 매칭(기존 탭만 사용, 새 탭 생성 금지)
-  2) 전국 탭: A열 '날짜'에 해당일이 있으면 그 행을 업데이트, 없으면 마지막 행 '아래'에 새 날짜로 append
-  3) 서울 탭: '광역' == '서울특별시'만 필터하여 '구' 단위로 동일 규칙 적용
-  4) 날짜 매칭은 형식이 섞여도 동작(문자열/구글시트 일련번호/다양한 구분자). 내부적으로 YYYY-MM-DD로 정규화 후 비교
-  5) 헤더는 시트의 기존 헤더를 우선. 누락된 컬럼은 뒤에 보강(헤더 1행만 갱신)
+- 아티팩트(.xlsx) → Google Sheets 기존 탭에 집계 기록
+- 날짜가 시트에 '이미 있으면' 해당 행 업데이트, 없으면 '맨 아래'에 새로 추가
+- 전국: '광역'별 건수, 서울: '서울특별시'만 필터 후 '구'별 건수
+- 탭 매칭: 공백/0패딩 차이 허용(예: '서울25년 7월' == '서울 25년 07월')
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ import gspread
 from gspread.utils import rowcol_to_a1
 
 # =========================
-# 로깅 유틸
+# 로깅
 # =========================
 LOG_DIR = Path("analyze_report")
 RUN_STAMP = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -35,8 +32,7 @@ def _safe_mkdir(p: Path):
         p.mkdir(parents=True, exist_ok=True)
     except FileExistsError:
         if p.is_file():
-            bak = p.with_suffix(p.suffix + ".bak")
-            p.rename(bak)
+            p.unlink()
             p.mkdir(parents=True, exist_ok=True)
 
 def log(msg: str):
@@ -79,72 +75,20 @@ def yymmdd_to_date(yymmdd: str) -> date:
     return date(year, mm, dd)
 
 # =========================
-# 구글시트 날짜 정규화
-# =========================
-def to_ymd_str(x) -> Optional[str]:
-    from datetime import datetime as D, date as Dd
-    if x is None:
-        return None
-    if isinstance(x, D):
-        return x.date().strftime("%Y-%m-%d")
-    if isinstance(x, Dd):
-        return x.strftime("%Y-%m-%d")
-    s = str(x).strip()
-    if not s:
-        return None
-    # 구글시트 일련번호
-    if s.isdigit():
-        try:
-            base = datetime(1899, 12, 30)
-            d = base + timedelta(days=int(s))
-            return d.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    # 구분자 통일
-    s2 = s.replace(".", "-").replace("/", "-")
-    for fmt in ("%Y-%m-%d",):
-        try:
-            d = datetime.strptime(s2, fmt).date()
-            return d.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    try:
-        parts = [p for p in s2.split("-") if p]
-        if len(parts) == 3 and all(p.isdigit() for p in parts):
-            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
-            return f"{y:04d}-{m:02d}-{d:02d}"
-    except Exception:
-        pass
-    return None
-
-def find_date_row(ws, target_ymd: str, header_row: int = 1) -> Optional[int]:
-    colA = ws.col_values(1)
-    start_idx = header_row + 1
-    for idx in range(start_idx, len(colA) + 1):
-        got = to_ymd_str(colA[idx - 1])
-        if got == target_ymd:
-            return idx
-    return None
-
-# =========================
-# 퍼지 탭 매칭(0패딩/공백 유연)
+# 퍼지 탭 매칭
 # =========================
 def _month_normalize(s: str) -> str:
-    """'전국 25년 01월' ↔ '전국25년1월' 같은 것들을 동일형으로 표준화."""
-    t = re.sub(r"\s+", "", s.strip())  # 공백 제거
-    # YY(또는 YYYY)년0?M월 -> YY(또는 YYYY)년M월 로 표준화
-    t = re.sub(r"(\d{2,4})년0?([1-9]|1[0-2])월", lambda m: f"{m.group(1)}년{int(m.group(2))}월", t)
-    # 혹시 한글 '월'이 빠진 이상 케이스는 여기서 다루지 않음(탭은 월이 들어가 있으니)
+    t = re.sub(r"\s+", "", s.strip())
+    t = re.sub(r"(\d{2,4})년0?([1-9]|1[0-2])월",
+               lambda m: f"{m.group(1)}년{int(m.group(2))}월", t)
     return t
 
 def fuzzy_find_sheet(sh: gspread.Spreadsheet, want_title: str) -> Optional[gspread.Worksheet]:
     tgt = _month_normalize(want_title)
-    # 1) 완전 일치(정규화 후)
     for ws in sh.worksheets():
         if _month_normalize(ws.title) == tgt:
             log(f"[ws] fuzzy matched: '{ws.title}'")
             return ws
-    # 2) 실패 시 후보 탭들 로그로 노출
     titles = [_month_normalize(ws.title) for ws in sh.worksheets()]
     log(f"[ws] no match for '{want_title}' (norm='{tgt}'). available(norm)={titles}")
     return None
@@ -160,7 +104,7 @@ REGION_ALIAS = {
     "충청남도": "충청남도",
     "경상북도": "경상북도",
     "경상남도": "경상남도",
-    "서울특별시": "서울특별시",
+    "서울특별시": "서울특별자치시" if "서울특별자치시" in [] else "서울특별시",  # 안전하게 기본 유지
     "세종특별자치시": "세종특별자치시",
     "제주특별자치도": "제주특별자치도",
     "부산광역시": "부산광역시",
@@ -174,9 +118,67 @@ REGION_ALIAS = {
 }
 def norm_region(name: str) -> str:
     name = (name or "").strip()
-    if not name:
-        return name
     return REGION_ALIAS.get(name, name)
+
+# =========================
+# 날짜 정규화 & 행 찾기
+# =========================
+def to_ymd_str(x) -> Optional[str]:
+    from datetime import datetime as D, date as Dd
+    if x is None:
+        return None
+    if isinstance(x, (Dd, D)):
+        d = x if isinstance(x, Dd) else x.date()
+        return d.strftime("%Y-%m-%d")
+    s = str(x).strip()
+    if not s:
+        return None
+    # 구글시트 일련번호
+    if s.isdigit():
+        try:
+            base = datetime(1899, 12, 30)
+            return (base + timedelta(days=int(s))).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    s2 = s.replace(".", "-").replace("/", "-")
+    s2 = s2.split()[0]  # 시간 꼬리 제거(예: "2025-09-26 00:00:00")
+    # 2025-9-6 형태도 허용
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s2)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+        except Exception:
+            return None
+    return None
+
+def find_date_col_index(ws, header_row: int = 1) -> int:
+    header = ws.row_values(header_row)
+    if not header:
+        return 1
+    header = [str(h).strip() for h in header]
+    for idx, name in enumerate(header, start=1):
+        if name == "날짜":
+            return idx
+    # 못 찾으면 1열 가정
+    return 1
+
+def find_date_row(ws, target_ymd: str, header_row: int = 1) -> Optional[int]:
+    """시트에서 '날짜' 열을 자동 탐지 후 target_ymd(YYYY-MM-DD) 행 인덱스 반환."""
+    col_idx = find_date_col_index(ws, header_row=header_row)
+    colA1 = rowcol_to_a1(header_row + 1, col_idx).split(":")[0]
+    # 큰 범위 한번에 받아와서 비교(속도+쿼터 절약)
+    values = ws.col_values(col_idx)
+    # 헤더 아래부터만 검색
+    search_values = values[header_row:]
+    # 진단 로그(상위 15개 샘플)
+    samples = [to_ymd_str(v) for v in search_values[:15]]
+    log(f"[date] target={target_ymd} in col={col_idx} header_row={header_row} samples={samples}")
+    for i, cell in enumerate(search_values, start=header_row + 1):
+        got = to_ymd_str(cell)
+        if got == target_ymd:
+            return i
+    return None
 
 # =========================
 # 시트 기록(업서트)
@@ -197,11 +199,15 @@ def ensure_header(ws, target_header: List[str], header_row: int = 1) -> List[str
         log(f"[ws] header updated -> {sheet_header}")
     return sheet_header
 
-def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series, header_row: int = 1, kind: str = "national"):
+def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series,
+                     header_row: int = 1, kind: str = "national"):
     ymd = when_date.strftime("%Y-%m-%d")
     sheet_header = ensure_header(ws, header, header_row=header_row)
+
+    # 날짜열 탐지 & 행 찾기
     row_idx = find_date_row(ws, ymd, header_row=header_row)
 
+    # 값 맵 준비
     values_by_header: Dict[str, int] = {}
     for k in series.index:
         try:
@@ -238,15 +244,8 @@ def write_row_mapped(ws, when_date: date, header: List[str], series: pd.Series, 
         return {"op": "append", "row": None}
 
 # =========================
-# 엑셀 로드 & 집계
+# 집계 빌더
 # =========================
-def read_processed_xlsx(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="data", dtype=str, engine="openpyxl")
-    for c in ("광역","구","계약년","계약월","계약일"):
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).strip()
-    return df
-
 def build_national_series(df: pd.DataFrame, want_columns: List[str]) -> pd.Series:
     if "광역" not in df.columns:
         return pd.Series(dtype=int)
@@ -330,7 +329,7 @@ def main():
 
         log(f"[file] {p.name} -> nat='{nat_title}' seoul='{seoul_title}' date={when.isoformat()}")
 
-        # 엑셀
+        # 엑셀(전처리 결과: sheet_name='data')
         log(f"[read] loading xlsx: {p.as_posix()}")
         df = pd.read_excel(p, sheet_name="data", dtype=str, engine="openpyxl")
         log(f"[read] sheet='data' rows={df.shape[0]} cols={df.shape[1]}")
@@ -340,14 +339,13 @@ def main():
         if ws_nat is None:
             log(f"[전국] {p.name} -> sheet not found: '{nat_title}' (skip)")
         else:
-            nat_header = ws_nat.row_values(1) or []
-            nat_header = [h.strip() for h in nat_header]
+            nat_header = [h.strip() for h in (ws_nat.row_values(1) or [])]
             if not nat_header or nat_header[0] != "날짜":
-                if nat_header:
-                    nat_header[0:1] = ["날짜"]
-                else:
-                    uniq_regions = sorted(set(df["광역"].map(norm_region))) if "광역" in df.columns else []
-                    nat_header = ["날짜"] + uniq_regions + ["전체 개수"]
+                # 기존 시트 헤더를 믿되, 비어 있으면 최소 헤더 구성
+                uniq_regions = sorted(set(df["광역"].map(norm_region))) if "광역" in df.columns else []
+                nat_header = ["날짜"] + (nat_header[1:] if nat_header else uniq_regions)  # 기존 유지
+                if "전체 개수" not in nat_header and "총합계" not in nat_header and "합계" not in nat_header:
+                    nat_header += ["전체 개수"]
             nat_series = build_national_series(df, nat_header)
             write_row_mapped(ws_nat, when, nat_header, nat_series, header_row=1, kind="national")
 
@@ -356,15 +354,14 @@ def main():
         if ws_se is None:
             log(f"[서울] {p.name} -> sheet not found: '{seoul_title}' (skip)")
         else:
-            se_header = ws_se.row_values(1) or []
-            se_header = [h.strip() for h in se_header]
+            se_header = [h.strip() for h in (ws_se.row_values(1) or [])]
             if not se_header or se_header[0] != "날짜":
-                if se_header:
-                    se_header[0:1] = ["날짜"]
-                else:
-                    uniq_gus = sorted(set(df[df["광역"].map(norm_region) == "서울특별시"]["구"])) \
-                               if "광역" in df.columns and "구" in df.columns else []
-                    se_header = ["날짜"] + uniq_gus + ["총합계"]
+                uniq_gus = sorted(set(
+                    df[df["광역"].map(norm_region) == "서울특별시"]["구"]
+                )) if "광역" in df.columns and "구" in df.columns else []
+                se_header = ["날짜"] + (se_header[1:] if se_header else uniq_gus)
+                if "총합계" not in se_header and "전체 개수" not in se_header and "합계" not in se_header:
+                    se_header += ["총합계"]
             se_series = build_seoul_series(df, se_header)
             write_row_mapped(ws_se, when, se_header, se_series, header_row=1, kind="seoul")
 
