@@ -4,10 +4,9 @@ import os, re, sys, json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datetime import date, datetime
-from calendar import monthrange
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -15,26 +14,23 @@ from google.oauth2.service_account import Credentials
 LOG_DIR = Path("analyze_report")
 
 def _ensure_logdir():
-    # analyze_report가 '파일'로 존재하면 삭제 후 폴더로 생성
+    # analyze_report가 '파일'이면 삭제 후 폴더 생성
     if LOG_DIR.exists() and not LOG_DIR.is_dir():
-        try:
-            LOG_DIR.unlink()
-        except Exception:
-            pass
+        try: LOG_DIR.unlink()
+        except Exception: pass
     if not LOG_DIR.exists():
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _ensure_logdir()
 
-RUN_LOG = LOG_DIR / f"run-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.log"
+RUN_LOG = LOG_DIR / f"run-{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%dT%H%M%S%z')}.log"
 LATEST = LOG_DIR / "latest.log"
 WRITTEN = LOG_DIR / "where_written.txt"
 
 def _t():
-    return datetime.utcnow().strftime("[%H:%M:%S]")
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("[%H:%M:%S]")
 
-def log(msg: str):
-    line = f"{_t()} {msg}"
+def _w(line: str):
     print(line)
     try:
         with RUN_LOG.open("a", encoding="utf-8") as f: f.write(line+"\n")
@@ -42,14 +38,11 @@ def log(msg: str):
     except Exception:
         pass
 
+def log(msg: str):
+    _w(f"{_t()} {msg}")
+
 def log_error(msg: str, exc: Optional[BaseException]=None):
-    line = f"{_t()} [ERROR] {msg}"
-    print(line, file=sys.stderr)
-    try:
-        with RUN_LOG.open("a", encoding="utf-8") as f: f.write(line+"\n")
-        with LATEST.open("a", encoding="utf-8") as f: f.write(line+"\n")
-    except Exception:
-        pass
+    _w(f"{_t()} [ERROR] {msg}")
     if exc:
         import traceback
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -78,12 +71,11 @@ def parse_filename(fname: str) -> Tuple[int,int,int]:
         raise ValueError(f"unexpected filename: {fname}")
     y = 2000 + int(m.group(1))
     mth = int(m.group(2))
-    day = int(m.group(5))  # yymmdd -> dd는 group(5)
+    day = int(m.group(5))
     return y, mth, day
 
-# 탭명에서 (yy, m) 추출: "전국 25년 6월", "서울 25년6월", "서울25년 7월" 등 공백 유연
+# 탭명(전국/서울 25년 6월 등)에서 (yy, m)
 TAB_RE = re.compile(r"(?:전국|서울)\s*(\d{2})년\s*(\d{1,2})월")
-
 def parse_tab_ym(title: str) -> Optional[Tuple[int,int]]:
     t = title.replace(" ", "")
     m = TAB_RE.match(t)
@@ -95,15 +87,15 @@ def parse_tab_ym(title: str) -> Optional[Tuple[int,int]]:
 def norm(s: str) -> str:
     return (s or "").strip().replace(" ", "").replace("\u00A0","")
 
-# ‘YYYY. M. D’ 포맷 문자열 만들기
+# ‘YYYY. M. D’ 문자열
 def kdate_str(d: date) -> str:
     return f"{d.year}. {d.month}. {d.day}"
 
-# 문자열 → 날짜(시트 안의 다양한 포맷 허용)
 def parse_any_date(s: str) -> Optional[date]:
     if s is None: return None
     s = str(s).strip()
     if not s: return None
+    # 주로 사용하는 포맷들
     for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y.%m. %d", "%Y. %m. %d"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -115,19 +107,17 @@ def parse_any_date(s: str) -> Optional[date]:
         return date(y,mn,dd)
     return None
 
-# 시트 내 날짜열(A열)에서 특정 날짜 찾기 (헤더는 1행)
+# 날짜열에서 target 날짜의 행 찾기(헤더=1행)
 def find_date_row(ws, target: date, date_col_idx: int = 1, header_row: int = 1) -> Optional[int]:
     rng = ws.range(header_row+1, date_col_idx, ws.row_count, date_col_idx)
     for off, cell in enumerate(rng, start=header_row+1):
-        val = str(cell.value).strip()
-        if not val:
-            continue
-        d = parse_any_date(val)
+        v = str(cell.value).strip()
+        if not v: continue
+        d = parse_any_date(v)
         if d and d == target:
             return off
     return None
 
-# 워크시트 해더(1행)에서 '날짜' 컬럼 위치 파악
 def find_date_col_idx(ws) -> int:
     header = ws.row_values(1)
     for i, v in enumerate(header, start=1):
@@ -144,48 +134,44 @@ def read_molit_xlsx(path: Path) -> pd.DataFrame:
     missing = [c for c in must if c not in df.columns]
     if missing:
         raise ValueError(f"missing columns: {missing}")
+    # 숫자만 남기기
     for c in ["계약년","계약월","계약일"]:
         df[c] = df[c].astype(str).str.replace(r"\D","",regex=True)
     return df
 
-# 전국 집계: ‘광역’ 별 건수
 def agg_national(df: pd.DataFrame) -> Dict[str,int]:
     s = df.groupby("광역").size().astype(int)
     return dict(s)
 
-# 서울 집계: 광역=서울특별시 → ‘구’ 별 건수
 def agg_seoul(df: pd.DataFrame) -> Dict[str,int]:
     se = df[df["광역"]=="서울특별시"]
     if se.empty: return {}
     s = se.groupby("구").size().astype(int)
     return dict(s)
 
-# ---------------- Sheet writing ----------------
+# ---------------- Sheet access ----------------
 
 def fuzzy_find_sheet(sh, want_title: str):
     want_n = norm(want_title)
     for ws in sh.worksheets():
         if norm(ws.title) == want_n:
             return ws
+    # 공백/전각 차이 등 느슨 매칭
     for ws in sh.worksheets():
         if norm(ws.title) == norm(want_title.replace(" ", "")):
             return ws
     return None
 
-# 현재 워크시트 헤더를 기준으로 한 줄(row) 값을 구성
 def build_row_by_header(header: List[str], day: date, series: Dict[str,int], kind: str) -> List:
     row = []
     total = 0
-    # 명칭 표준화(alias)
     alias_map = {
-        # 광역 명칭들
         "강원도": "강원도",
         "강원특별자치도": "강원특별자치도",
         "전라북도": "전라북도",
         "전북특별자치도": "전북특별자치도",
         "세종특별자치시": "세종특별자치시",
         "제주특별자치도": "제주특별자치도",
-        # 총합 컬럼들
         "총합계": "__SUM__",
         "전체 개수": "__SUM__",
         "합계": "__SUM__",
@@ -199,13 +185,11 @@ def build_row_by_header(header: List[str], day: date, series: Dict[str,int], kin
             row.append("")
             continue
         key = h
-        # 값 찾기
         val = series.get(key)
         if val is None and key in alias_map and alias_map[key] != "__SUM__":
             val = series.get(alias_map[key])
         if isinstance(val, int):
-            row.append(val)
-            total += val
+            row.append(val); total += val
         else:
             if alias_map.get(key) == "__SUM__":
                 row.append(total)
@@ -221,7 +205,7 @@ def upsert_row(ws, day: date, series: Dict[str,int], kind: str) -> Tuple[str,int
     row_idx = find_date_row(ws, day, date_col_idx=date_col, header_row=1)
     mode = "update" if row_idx else "append"
     if not row_idx:
-        # 마지막 사용행 계산(날짜열 기준)
+        # 날짜열의 마지막 사용행 뒤에 추가
         col_vals = ws.col_values(date_col)
         used = 1
         for i in range(len(col_vals), 1, -1):
@@ -231,7 +215,8 @@ def upsert_row(ws, day: date, series: Dict[str,int], kind: str) -> Tuple[str,int
         row_idx = used + 1
 
     out = build_row_by_header(header, day, series, kind)
-    last_col_letter = gspread.utils.rowcol_to_a1(1, len(header)).rstrip("1")
+    last_a1 = gspread.utils.rowcol_to_a1(1, len(header))  # e.g., Z1
+    last_col_letter = re.sub(r"\d+","", last_a1)          # Z
     rng = f"A{row_idx}:{last_col_letter}{row_idx}"
     ws.update([out], rng)
     return mode, row_idx
@@ -254,7 +239,6 @@ def main():
 
     log("[MAIN]")
     log("[COLLECT]")
-
     art = Path(args.artifacts_dir)
     log(f"artifacts_dir={art}")
     xlsx_paths: List[Path] = sorted(art.rglob("*.xlsx"))
@@ -275,6 +259,10 @@ def main():
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(args.sheet_id)
     log("[gspread] spreadsheet opened")
+
+    # ✅ 오늘 날짜(한국시간)로 고정 사용
+    today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    log(f"[date] using today (KST) = {kdate_str(today_kst)}")
 
     for x in nat_files:
         try:
@@ -298,7 +286,7 @@ def main():
         nat_series = agg_national(df)
         se_series = agg_seoul(df)
 
-        # 탭 찾기
+        # 탭 찾기(느슨 매칭 허용)
         ws_nat = fuzzy_find_sheet(sh, nat_tab_title)
         ws_se  = fuzzy_find_sheet(sh, se_tab_title)
 
@@ -307,16 +295,8 @@ def main():
         if not ws_se:
             log(f"[서울] sheet not found: '{se_tab_title}' (skip)")
 
-        # 날짜 계산: 탭의 (연,월) + 파일의 일 → 말일 보정
-        if ws_nat or ws_se:
-            y_m_from_tab = parse_tab_ym(ws_nat.title if ws_nat else (ws_se.title if ws_se else ""))
-            if y_m_from_tab:
-                ly, lm = y_m_from_tab
-            else:
-                ly, lm = y, m
-            last_d = monthrange(ly, lm)[1]
-            use_day = min(file_day, last_d)
-            target_date = date(ly, lm, use_day)
+        # ✅ 기록 대상 날짜: 무조건 오늘
+        target_date = today_kst
 
         # 전국 쓰기
         if ws_nat and nat_series:
