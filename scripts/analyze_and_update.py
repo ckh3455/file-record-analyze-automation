@@ -1,374 +1,367 @@
 # -*- coding: utf-8 -*-
 """
-Artifacts의 전처리된 엑셀(전국 월별, 서울 1년)을 받아
-구글 시트의 기존 탭에 날짜별 집계(전국=광역, 서울=구)를 기록한다.
+Artifacts로 받은 MOLIT 전처리 엑셀을 읽어
+- '전국 YY년 MM월' 탭: 날짜별 광역단위 건수 집계, 정책에 따라 upsert
+- '서울 YY년 MM월' 탭: 날짜별 구단위 건수 집계, 정책에 따라 upsert
+를 수행한다.
 
-- 새 탭 생성 금지(없으면 스킵)
-- 오래된 파일도 견고하게 읽도록 헤더 자동 감지 + 포지션 폴백
-- 3개월 규칙:
-  * 해당 탭의 '날짜' 첫 기록일로부터 3개월 이내: 매일 기록/업데이트
-  * 3개월 이후: 마지막 기록값과 비교해 동일하면 스킵, 달라지면 기록
-
-작성: 2025-09
+중요:
+- 기존 시트를 '찾아서' 갱신만 한다(새 시트 생성 금지).
+- analyze_report/ 에 상세 로그와 where_written.txt 남김.
 """
 
 from __future__ import annotations
-import os, re, sys, json, shutil, zipfile, time
+import os, re, sys, json, shutil, zipfile
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List, Tuple, Optional
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
-# ---------------- logging ----------------
-RUN_TS = datetime.now()
+# -------------- 로그 --------------
 LOG_DIR = Path("analyze_report")
+RUN_TS = datetime.now()
 RUN_LOG = LOG_DIR / f"run-{RUN_TS:%Y%m%d-%H%M%S}.log"
-LATEST = LOG_DIR / "latest.log"
-WHERE = LOG_DIR / "where_written.txt"
+LATEST  = LOG_DIR / "latest.log"
+WHERE   = LOG_DIR / "where_written.txt"
 
-def log(msg: str):
-    msg = msg.rstrip()
-    line = f"[{RUN_TS:%H:%M:%S}] {msg}"
-    print(line, flush=True)
+def _ensure_logdir():
+    # 폴더가 파일로 존재하면 삭제하고 폴더로 재생성
+    if LOG_DIR.exists() and not LOG_DIR.is_dir():
+        try:
+            LOG_DIR.unlink()
+        except Exception:
+            shutil.rmtree(LOG_DIR, ignore_errors=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with RUN_LOG.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    with LATEST.open("w", encoding="utf-8") as f:
-        f.write(line + "\n")  # 마지막 한 줄이라도 보이게
-    with LATEST.open("a", encoding="utf-8") as f:
-        pass  # tail 추가를 위해 handle 유지 X
+
+def log(line: str):
+    _ensure_logdir()
+    msg = f"[{RUN_TS:%H:%M:%S}] {line.rstrip()}"
+    print(msg, flush=True)
+    try:
+        with RUN_LOG.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+        with LATEST.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 def log_block(title: str):
-    log(f"[{title}]".upper())
+    log(f"[{title.upper()}]")
 
-# ---------------- args ----------------
-import argparse
-ap = argparse.ArgumentParser()
-ap.add_argument("--artifacts-dir", required=True)
-ap.add_argument("--sa", required=True, help="service account json path")
-ap.add_argument("--sheet-id", required=True)
-ap.add_argument("--work-dir", default="extracted")
-args = ap.parse_args()
-
-# ---------------- collect artifacts ----------------
-def collect_artifacts(artifacts_dir: Path, work_dir: Path) -> List[Path]:
-    log_block("collect")
-    log(f"artifacts_dir={artifacts_dir}")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    zips = list(Path(artifacts_dir).rglob("*.zip"))
-    xlsx_direct = list(Path(artifacts_dir).rglob("*.xlsx"))
-    log(f"zip files found: {len(zips)}")
-    log(f"direct xlsx found: {len(xlsx_direct)}")
-
-    for z in zips:
-        with zipfile.ZipFile(z, "r") as zf:
-            zf.extractall(work_dir)
-
-    copied = []
-    for x in xlsx_direct:
-        dst = work_dir / x.relative_to(artifacts_dir)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(x, dst)
-        copied.append(dst)
-        log(f"copy: {x} -> {dst}")
-
-    all_xlsx = list(work_dir.rglob("*.xlsx"))
-    log(f"total xlsx under work_dir: {len(all_xlsx)}")
-    return all_xlsx
-
-# ---------------- robust excel reader ----------------
-EXPECTED_HEADERS = [
-    "광역","구","법정동","리","번지","본번","부번","단지명",
-    "전용면적(㎡)","계약년","계약월","계약일","거래금액(만원)"
-]
-FALLBACK_BY_POS = [
-    "광역","구","법정동","리","번지","본번","부번","단지명",
-    "전용면적(㎡)","계약년","계약월","계약일","거래금액(만원)"
-]
-
-def _score_header_row(row_vals):
-    s = 0
-    for v in row_vals:
-        t = str(v).strip()
-        if t in EXPECTED_HEADERS:
-            s += 2
-        if any(k in t for k in ["계약", "거래금액", "전용면적", "법정동", "광역"]):
-            s += 1
-    return s
-
-def _promote_header(df_raw, max_scan_rows=20):
-    best_idx, best_score = None, -1
-    scan = min(max_scan_rows, len(df_raw))
-    for r in range(scan):
-        row_vals = df_raw.iloc[r].tolist()
-        score = _score_header_row(row_vals)
-        if score > best_score:
-            best_idx, best_score = r, score
-    if best_idx is not None and best_score >= 2:
-        cols = df_raw.iloc[best_idx].astype(str).str.strip().tolist()
-        df2 = df_raw.iloc[best_idx+1:].copy()
-        df2.columns = cols
-        return df2
-    return None
-
-def _fallback_by_position(df_raw):
-    df2 = df_raw.copy()
-    n = min(len(FALLBACK_BY_POS), df2.shape[1])
-    new_cols = FALLBACK_BY_POS[:n] + [f"col{i+1}" for i in range(df2.shape[1]-n)]
-    df2.columns = new_cols
-    return df2
-
-def _cleanup_columns(df):
-    if df.columns.duplicated().any():
-        keep = ~df.columns.duplicated()
-        df = df.loc[:, keep]
-    empty_cols = [c for c in df.columns if df[c].isna().all()]
-    if empty_cols:
-        df = df.drop(columns=empty_cols)
-    return df
-
-def read_xlsx_robust(xlsx_path: Path, sheet_name: str = "data") -> pd.DataFrame:
-    log(f"[read] loading xlsx: {xlsx_path} (sheet='{sheet_name}')")
+def note_where(s: str):
+    _ensure_logdir()
     try:
-        df_raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, engine="openpyxl")
+        with WHERE.open("a", encoding="utf-8") as f:
+            f.write(s.rstrip() + "\n")
     except Exception:
-        df_raw = pd.read_excel(xlsx_path, header=None, engine="openpyxl")
-    df_raw = df_raw.replace({np.nan: ""})
+        pass
 
-    df = _promote_header(df_raw, max_scan_rows=20)
-    if df is None:
-        df = _fallback_by_position(df_raw)
-    df = _cleanup_columns(df)
+# -------------- 유틸 --------------
+MONTH_TITLE_NAT = re.compile(r"^전국\s+(\d{2})년\s+(\d{2})월$")
+MONTH_TITLE_SEO = re.compile(r"^서울\s+(\d{2})년\s+(\d{2})월$")
 
-    # '광역' 유추(첫 두 컬럼) — 필요시 이름 부여
-    cols = list(df.columns)
-    if "광역" not in cols and len(cols) >= 2:
-        sample = df.iloc[:10, :2].astype(str)
-        def looks_prov(s):
-            return any(k in s for k in ["특별자치도","광역시","서울특별시","세종특별자치시","제주특별자치도","경기도","충청","전라","경상","강원","울산","부산","대구","대전","인천","광주"])
-        p_ratio = (sample.iloc[:,0].apply(looks_prov)).mean()
-        if p_ratio > 0.5:
-            new_cols = cols[:]
-            new_cols[0] = "광역"
-            new_cols[1] = "구"
-            df.columns = new_cols
-            cols = new_cols
+# 기존 정책: 최초 기록일로부터 3개월까지는 매일 기록,
+# 이후에는 '마지막행과 값이 동일하면' 스킵, 다르면 append.
+MAX_DAILY_WINDOW_DAYS = 92
 
-    # 숫자/날짜 정리
-    for c in ["계약년","계약월","계약일"]:
-        if c in df.columns:
-            df[c] = (df[c].astype(str).str.replace(r"[^0-9]", "", regex=True)).replace({"": np.nan})
-    for c in ["거래금액(만원)","전용면적(㎡)"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+SIDO_LIST = [
+    "강원특별자치도","경기도","경상남도","경상북도","광주광역시","대구광역시","대전광역시",
+    "부산광역시","서울특별시","세종특별자치시","울산광역시","인천광역시",
+    "전라남도","전북특별자치도","제주특별자치도","충청남도","충청북도"
+]
+SEOUL_GU = [
+    "강남구","강동구","강북구","강서구","관악구","광진구","구로구","금천구","노원구","도봉구",
+    "동대문구","동작구","마포구","서대문구","서초구","성동구","성북구","송파구","양천구",
+    "영등포구","용산구","은평구","종로구","중구","중랑구"
+]
 
-    log(f"[read] shape=({df.shape[0]},{df.shape[1]}), cols(sample)={list(df.columns)[:12]}")
+def yymm_from_fname(name: str) -> Tuple[int,int]:
+    # "전국 2411_250926.xlsx" -> (24, 11)
+    m = re.search(r"전국\s+(\d{2})(\d{2})_", name)
+    if not m:
+        # "서울시 250926.xlsx" (서울은 파일명에 월 정보 없음 → 스킵)
+        return (0,0)
+    return (int(m.group(1)), int(m.group(2)))
+
+def guess_write_date_from_fname(name: str) -> date:
+    # "..._YYMMDD.xlsx" -> 날짜
+    m = re.search(r"_(\d{2})(\d{2})(\d{2})", name)
+    if m:
+        y, mth, d = map(int, m.groups())
+        # 20xx 로 가정
+        return date(2000 + y, mth, d)
+    return date.today()
+
+def parse_nat_title(y: int, m: int) -> str:
+    return f"전국 {y:02d}년 {m:02d}월"
+
+def parse_seoul_title(y: int, m: int) -> str:
+    return f"서울 {y:02d}년 {m:02d}월"
+
+def month_number(y2: int, m2: int) -> int:
+    # 24년 10월 -> 24*12+10
+    return y2*12 + m2
+
+# -------------- 엑셀 로드 --------------
+def read_xlsx(path: Path) -> pd.DataFrame:
+    """
+    전처리된 'data' 시트가 있으면 그걸 사용.
+    없으면 첫 시트를 읽은 뒤, 상단 헤더 감지 실패 시 1행을 헤더로 간주.
+    """
+    log(f"[read] loading xlsx: {path.as_posix()}")
+    try:
+        df = pd.read_excel(path, sheet_name="data", dtype=str, engine="openpyxl")
+        log(f"[read] sheet='data' rows={len(df)} cols={len(df.columns)}")
+    except Exception:
+        df = pd.read_excel(path, dtype=str, engine="openpyxl")
+        log(f"[read] sheet='(first)' rows={len(df)} cols={len(df.columns)}")
+
+    df = df.fillna("")
+    # 헤더 이름 정규화
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 예전 파일 대비: 중복 컬럼 제거(첫 번째만 유지)
+    dup = [c for c in df.columns if df.columns.tolist().count(c) > 1]
+    if dup:
+        log(f"[read] duplicated columns dropped (keep=first): {dup}")
+        seen=set(); keep=[]
+        for c in df.columns:
+            if c in seen: continue
+            seen.add(c); keep.append(c)
+        df = df[keep]
+
+    # 전처리 스크립트 형식 기준의 컬럼이 있으면 곧바로 return
+    must = {"광역","구","계약년","계약월","계약일"}
+    if must.issubset(set(df.columns)):
+        return df
+
+    # 혹시 '시','시군구' 계열만 있고 '광역'이 없으면 매핑 시도
+    if "시군구" in df.columns and "광역" not in df.columns:
+        # "서울특별시 강남구 역삼동" 형태 분리
+        parts = df["시군구"].astype(str).str.split(expand=True, n=2)
+        df["광역"] = parts[0]
+        df["구"] = parts[1] if parts.shape[1] > 1 else ""
+        if "계약년월" in df.columns and "계약년" not in df.columns:
+            s = df["계약년월"].str.replace(r"\D","",regex=True)
+            df["계약년"] = s.str[:4]
+            df["계약월"] = s.str[4:6]
+        return df
+
+    # 그래도 없으면, 1행을 헤더로 보고 다시 구성
+    if len(df)>0:
+        header = [str(x).strip() for x in df.iloc[0].tolist()]
+        df2 = df.iloc[1:].copy()
+        df2.columns = header
+        df2 = df2.fillna("")
+        log("[read] header fallback -> used first row as header")
+        return df2
+
     return df
 
-# ---------------- Google Sheets ----------------
+# -------------- 집계 --------------
+def aggregate_national(df: pd.DataFrame) -> pd.Series:
+    if "광역" not in df.columns:
+        log("[agg] missing column '광역' -> empty series")
+        return pd.Series(dtype=int)
+    s = df.groupby("광역")["광역"].count()
+    # 시도 목록 기준으로 재정렬/없으면 0
+    out = pd.Series({k:int(s.get(k,0)) for k in SIDO_LIST})
+    return out
+
+def aggregate_seoul(df: pd.DataFrame) -> pd.Series:
+    if "광역" not in df.columns or "구" not in df.columns:
+        log("[agg] missing column '광역/구' -> empty series")
+        return pd.Series(dtype=int)
+    sdf = df[df["광역"]=="서울특별시"]
+    s = sdf.groupby("구")["구"].count()
+    out = pd.Series({k:int(s.get(k,0)) for k in SEOUL_GU})
+    return out
+
+# -------------- Google Sheets --------------
 import gspread
 from google.oauth2.service_account import Credentials
 
 def open_sheet(sa_path: Path, sheet_id: str):
-    log_block("gspread")
-    log("auth with sa.json")
-    creds = Credentials.from_service_account_file(
-        sa_path,
-        scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    log("[gspread] auth with sa.json")
+    info = json.loads(sa_path.read_text(encoding="utf-8"))
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"]
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
-    log("spreadsheet opened")
+    log("[gspread] spreadsheet opened")
     return sh
 
-def yymm_to_title(prefix: str, yy: str, mm: str) -> str:
-    # 예: ("전국","24","10") -> "전국 24년 10월"
-    return f"{prefix} {int(yy):02d}년 {int(mm):02d}월"
-
-def parse_nat_filename(p: Path) -> Optional[Tuple[str, str, date]]:
-    # "전국 2410_250926.xlsx" -> ("24","10"), write_date=2025-09-26
-    m = re.search(r"전국\s*(\d{2})(\d{2})_(\d{6})", p.stem)
-    if not m: 
-        return None
-    yy, mm, d6 = m.group(1), m.group(2), m.group(3)
-    write_date = date(2000+int(d6[:2]), int(d6[2:4]), int(d6[4:6]))
-    return yy, mm, write_date
-
-def ensure_existing_ws(sh, title: str):
-    """없으면 None 반환(생성 금지)."""
+def find_ws(sh, title: str):
     try:
-        ws = sh.worksheet(title)
-        return ws
+        return sh.worksheet(title)
     except Exception:
-        log(f"[ws] SKIP (no such sheet): '{title}'")
         return None
 
-def row_index_by_date(ws, when: date) -> Optional[int]:
-    """A열에서 YYYY-MM-DD 매칭되는 행 찾기."""
-    values = ws.col_values(1)
-    target = when.isoformat()
-    for idx, v in enumerate(values, start=1):
-        if str(v).strip() == target:
-            return idx
-    return None
+def get_header(ws) -> List[str]:
+    vals = ws.row_values(1)
+    return [v.strip() for v in vals]
 
-def get_first_record_date(ws) -> Optional[date]:
-    vals = ws.col_values(1)
-    for v in vals[1:]:  # header 제외
-        s = str(v).strip()
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-            y,m,d = int(s[:4]), int(s[5:7]), int(s[8:10])
-            return date(y,m,d)
-    return None
-
-def last_row_values(ws) -> Optional[List[str]]:
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return None
-    # 마지막 실제 데이터 행 찾기(뒤에서부터)
-    for r in range(len(vals)-1, 0, -1):
-        if any(str(x).strip() for x in vals[r]):
-            return vals[r]
-    return None
-
-def write_row(ws, when: date, keys: List[str], series: pd.Series) -> str:
+def find_or_create_row_index_for_date(ws, when: date) -> Tuple[int, bool]:
     """
-    keys: 헤더(두 번째 칼럼부터의 이름들). 날짜 열은 A.
-    series: keys 인덱스를 가진 시리즈(부재 키는 0 취급)
+    기존 날짜가 있으면 그 행 index 반환, 없으면 append 위치 반환.
+    반환: (row_index, exists_bool)
     """
-    # 헤더
-    header = ws.row_values(1)
-    # 날짜 + keys 순서
-    row_vals = [when.isoformat()]
-    for k in keys:
-        v = series.get(k, 0)
+    colA = ws.col_values(1)
+    for i, v in enumerate(colA, start=1):
+        if i == 1:  # header
+            continue
+        if str(v).strip() == when.isoformat():
+            return i, True
+    # append 위치
+    return len(colA)+1, False
+
+def policy_should_write(ws, when: date, values: List) -> bool:
+    """
+    정책 판단:
+    - 첫 기록일 ~ +92일: 무조건 기록(업데이트)
+    - 이후: 마지막행 값과 동일하면 스킵, 다르면 기록
+    """
+    # 첫 기록일
+    colA = ws.col_values(1)
+    dates = []
+    for i,v in enumerate(colA, start=1):
+        if i == 1: continue
         try:
-            v = int(v)
+            dates.append(date.fromisoformat(str(v).strip()))
         except Exception:
-            try: v = float(v)
-            except Exception: v = 0
-        row_vals.append(v)
+            pass
+    if dates:
+        first = min(dates)
+        if (when - first).days <= MAX_DAILY_WINDOW_DAYS:
+            return True
+        # 마지막행 비교
+        last_row_idx = len(colA)
+        last_vals = ws.row_values(last_row_idx)
+        # 날짜열 포함 헤더 길이에 맞춰 비교
+        cur = [when.isoformat()] + values[1:]
+        return cur != last_vals[:len(cur)]
+    return True
 
-    # 3개월 정책
-    first_dt = get_first_record_date(ws)
-    mode_note = ""
-    if first_dt:
-        if when <= first_dt + timedelta(days=92):
-            mode_note = "<=3mo"
+def write_row(ws, when: date, header: List[str], series: pd.Series, label_total: str="총합계") -> str:
+    # row 구성
+    vals = [when.isoformat()]
+    total = 0
+    for key in header[1:]:
+        if key == label_total:
+            vals.append(total)
         else:
-            # 마지막행과 비교
-            last = last_row_values(ws)
-            if last:
-                # 마지막행의 같은 길이로 비교(없는 칼럼 0)
-                same = True
-                # A열(날짜)은 제외
-                for i, k in enumerate(keys, start=2):
-                    prev = last[i-1] if i-1 < len(last) and str(last[i-1]).strip() else "0"
-                    try:
-                        prev_v = int(float(prev))
-                    except:
-                        prev_v = 0
-                    cur_v = int(series.get(k, 0) or 0)
-                    if prev_v != cur_v:
-                        same = False
-                        break
-                if same:
-                    return f"skip(same-last)"
-            mode_note = ">3mo"
+            v = int(series.get(key, 0))
+            total += v
+            vals.append(v)
 
-    # 이미 그 날짜가 있으면 update, 없으면 append
-    idx = row_index_by_date(ws, when)
-    if idx is None:
-        # append
-        ws.append_row(row_vals, value_input_option="USER_ENTERED")
-        return f"append({mode_note})"
-    else:
-        # update range A{idx}:?{idx}
-        col_end = chr(ord('A') + len(row_vals) - 1)
-        ws.update(range_name=f"A{idx}:{col_end}{idx}", values=[row_vals])
-        return f"update({mode_note})"
+    # upsert 위치 찾기
+    row_idx, exists = find_or_create_row_index_for_date(ws, when)
+    # 정책 체크
+    if not policy_should_write(ws, when, vals):
+        return "skip(=last)"
 
-# ---------------- main ----------------
+    rng = f"A{row_idx}:{gspread.utils.rowcol_to_a1(1, len(header))[:-1]}{row_idx}"
+    ws.update([vals], range_name=rng)
+    return "append" if not exists else "update"
+
+# -------------- 메인 --------------
+def collect_artifacts(art_dir: Path) -> List[Path]:
+    log_block("collect")
+    log(f"artifacts_dir={art_dir}")
+    paths: List[Path] = []
+
+    # zip → 풀기
+    zips = list(art_dir.rglob("*.zip"))
+    log(f"zip files found: {len(zips)}")
+    for z in zips:
+        dest = Path("extracted") / z.parent.name
+        dest.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(z, "r") as zp:
+            zp.extractall(dest)
+
+    # xlsx 모으기
+    for root in ["extracted", str(art_dir)]:
+        for p in Path(root).rglob("*.xlsx"):
+            paths.append(p.resolve())
+    log(f"total xlsx under work_dir: {len(paths)}")
+    return paths
+
 def main():
+    _ensure_logdir()
     log_block("main")
-    log(f"start artifacts={args.artifacts_dir}, sa={args.sa}, sheet_id=***")
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    (LOG_DIR / "sheet_id").write_text(args.sheet_id, encoding="utf-8")
-    WHERE.write_text("", encoding="utf-8")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--artifacts-dir", required=True)
+    ap.add_argument("--sa", required=True)
+    ap.add_argument("--sheet-id", required=True)
+    args = ap.parse_args()
 
-    artifacts = collect_artifacts(Path(args.artifacts_dir), Path(args.work_dir))
+    art_dir = Path(args.artifacts_dir)
+    sa_path = Path(args.sa)
+    sheet_id = args.sheet_id
 
-    # 전국 월 파일만 사용
-    nat_files = [p for p in artifacts if re.search(r"전국\s*\d{4}_\d{6}\.xlsx$", p.name)]
+    files = collect_artifacts(art_dir)
+
+    # 전국 파일만(파일명에 '전국 YYMM_')
+    nat_files = [p for p in files if "전국 " in p.name]
     log(f"national files count={len(nat_files)}")
 
-    sh = open_sheet(Path(args.sa), args.sheet_id)
+    sh = open_sheet(sa_path, sheet_id)
 
-    written_lines = []
-
-    for p in sorted(nat_files):
-        meta = parse_nat_filename(p)
-        if not meta:
+    for f in sorted(nat_files, key=lambda p: p.name):
+        y2, m2 = yymm_from_fname(f.name)
+        if y2 == 0:
             continue
-        yy, mm, write_day = meta
-        nat_title = yymm_to_title("전국", yy, mm)
-        seoul_title = yymm_to_title("서울", yy, mm)
-        log(f"[file] {p.name} -> nat='{nat_title}' seoul='{seoul_title}' date={write_day}")
+        write_day = guess_write_date_from_fname(f.name)
+        nat_title = parse_nat_title(y2, m2)
+        se_title  = parse_seoul_title(y2, m2)
 
-        df = read_xlsx_robust(p, sheet_name="data")
+        log(f"[file] {f.name} -> nat='{nat_title}' seoul='{se_title}' date={write_day}")
 
-        # --------- 전국 집계 (광역별 건수) ----------
-        if "광역" not in df.columns:
-            log("[agg] missing column '광역' -> empty series")
-            nat_series = pd.Series(dtype=int)
+        df = read_xlsx(f)
+
+        # 집계
+        nat_series = aggregate_national(df)
+        se_series  = aggregate_seoul(df)
+
+        # --- 전국 ---
+        ws_nat = find_ws(sh, nat_title)
+        if ws_nat is None:
+            log(f"[전국] {f.name} -> sheet not found: '{nat_title}' (skip)")
         else:
-            nat_series = df.groupby("광역").size().astype(int).sort_index()
-        # --------- 서울 집계 (서울특별시 필터 후 구별 건수) ----------
-        if {"광역","구"}.issubset(df.columns):
-            se_df = df[df["광역"].astype(str).str.contains("서울특별시", na=False)]
-            if len(se_df)==0:
-                log("[서울] no rows for 서울특별시")
-                seoul_series = pd.Series(dtype=int)
-            else:
-                seoul_series = se_df.groupby("구").size().astype(int).sort_index()
-        else:
-            log("[서울] missing columns -> empty series")
-            seoul_series = pd.Series(dtype=int)
+            header = get_header(ws_nat)
+            # 헤더 정리: '날짜' + SIDO_LIST + (총합계 있으면 유지)
+            wants = ["날짜"] + SIDO_LIST
+            if any("총합" in h for h in header):
+                wants.append("총합계")
+            # 헤더 길이가 다르면 수정하지 않고, 교집합 기준으로만 씀
+            header_use = [h for h in header if h in wants]
+            if header_use and header_use[0] != "날짜":
+                header_use = ["날짜"] + [c for c in header_use if c!="날짜"]
+            op = write_row(ws_nat, write_day, header_use, nat_series, label_total="총합계")
+            note_where(f"[전국] {nat_title} @ {write_day}: {op}, sum={int(nat_series.sum()) if len(nat_series)>0 else 0}")
 
-        # --- 전국 탭에 기록 ---
-        ws_nat = ensure_existing_ws(sh, nat_title)
-        if ws_nat is not None and len(nat_series)>0:
-            # header(1행) 기준 키 목록(날짜 제외)
-            hdr = ws_nat.row_values(1)
-            keys_nat = [c for c in hdr[1:] if c]  # B~ 끝
-            if not keys_nat:
-                # 키가 없으면 series 인덱스로
-                keys_nat = nat_series.index.tolist()
-            op = write_row(ws_nat, write_day, keys_nat, nat_series)
-            log(f"[전국] {p.name} -> {nat_title} @ {write_day}: {op}, sum={int(nat_series.sum())}")
-            written_lines.append(f"{nat_title}\t{write_day}\t{op}")
+        # --- 서울 ---
+        ws_se = find_ws(sh, se_title)
+        if ws_se is None:
+            log(f"[서울] {f.name} -> sheet not found: '{se_title}' (skip)")
         else:
-            log(f"[전국] {p.name} -> no national rows or sheet missing")
+            header = get_header(ws_se)
+            wants = ["날짜"] + SEOUL_GU
+            if any("총합" in h for h in header):
+                wants.append("총합계")
+            header_use = [h for h in header if h in wants]
+            if header_use and header_use[0] != "날짜":
+                header_use = ["날짜"] + [c for c in header_use if c!="날짜"]
+            op = write_row(ws_se, write_day, header_use, se_series, label_total="총합계")
+            note_where(f"[서울] {se_title} @ {write_day}: {op}, sum={int(se_series.sum()) if len(se_series)>0 else 0}")
 
-        # --- 서울 탭에 기록 ---
-        ws_se = ensure_existing_ws(sh, seoul_title)
-        if ws_se is not None and len(seoul_series)>0:
-            hdr = ws_se.row_values(1)
-            keys_se = [c for c in hdr[1:] if c]
-            if not keys_se:
-                keys_se = seoul_series.index.tolist()
-            op2 = write_row(ws_se, write_day, keys_se, seoul_series)
-            log(f"[서울] {p.name} -> {seoul_title} @ {write_day}: {op2}, sum={int(seoul_series.sum())}")
-            written_lines.append(f"{seoul_title}\t{write_day}\t{op2}")
-        else:
-            log(f"[서울] {p.name} -> no seoul rows or sheet missing")
-
-    # where_written
-    WHERE.write_text("\n".join(written_lines), encoding="utf-8")
     log("[main] logs written to analyze_report/")
 
 if __name__ == "__main__":
