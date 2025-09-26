@@ -64,43 +64,12 @@ jobs:
           print("sa.json written.")
           PY
 
-      # ── 디버그: 기존 탭만 갱신(없으면 SKIP). 필요 없으면 이 스텝을 주석 처리하세요.
-      - name: Debug write to Sheets (no-create, safe)
-        if: always()
-        env:
-          TARGET_WS: "전국 24년 10월"   # ← 실제로 존재하는 탭명으로 바꾸세요
-        run: |
-          python - <<'PY'
-          import os, sys, json, gspread
-          from google.oauth2.service_account import Credentials
-          from datetime import datetime
-
-          SHEET_ID = os.environ["SHEET_ID"]
-          TARGET_WS = os.environ.get("TARGET_WS","").strip()
-          if not TARGET_WS:
-              print("TARGET_WS not set; skip."); sys.exit(0)
-
-          creds = Credentials.from_service_account_info(
-              json.loads(os.environ["SA_JSON"]),
-              scopes=[
-                  "https://www.googleapis.com/auth/spreadsheets",
-                  "https://www.googleapis.com/auth/drive",
-              ],
-          )
-          gc = gspread.authorize(creds)
-          sh = gc.open_by_key(SHEET_ID)
-          try:
-              ws = sh.worksheet(TARGET_WS)
-          except Exception:
-              print(f"[SKIP] Worksheet not found (no-create): '{TARGET_WS}'"); sys.exit(0)
-
-          ws.update([["HELLO_FROM_ACTIONS", datetime.now().isoformat()]], range_name="A1")
-          print(f"[OK] Updated '{TARGET_WS}'")
-          PY
-
       - name: Run analysis & update
         run: |
-          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
+          python scripts/analyze_and_update.py \
+            --artifacts-dir artifacts \
+            --sa sa.json \
+            --sheet-id "$SHEET_ID"
 
       - name: Preview analyze_report (always)
         if: always()
