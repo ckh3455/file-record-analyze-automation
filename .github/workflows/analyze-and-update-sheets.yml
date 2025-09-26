@@ -33,6 +33,11 @@ jobs:
           workflow_conclusion: success
           branch: main
           path: artifacts
+     - name: Clean report dir
+       run: |
+    rm -rf analyze_report
+    mkdir -p analyze_report
+
 
       - name: Show artifacts tree
         run: |
