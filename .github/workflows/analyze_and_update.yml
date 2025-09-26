@@ -1,40 +1,88 @@
-- name: Debug write to Sheets (no-create, safe)
-  if: always()
-  env:
-    TARGET_WS: "DEBUG_WRITE"   # ← 바꾸고 싶은 기존 탭 이름으로 설정
-  run: |
-    python - <<'PY'
-    import os, sys, json, gspread
-    from google.oauth2.service_account import Credentials
-    from datetime import datetime
+# .github/workflows/analyze-and-update.yml
 
-    SHEET_ID = os.environ["SHEET_ID"]
-    TARGET_WS = os.environ.get("TARGET_WS","").strip()
-    if not TARGET_WS:
-        print("TARGET_WS not set; skip.")
-        sys.exit(0)
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
+      OUT_DIR: output
 
-    # SA 인증
-    raw = os.environ["SA_JSON"].strip()
-    creds = Credentials.from_service_account_info(
-        json.loads(raw),
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # 새로 만들지 않고 정확히 해당 이름의 기존 시트만 찾아 갱신
-    try:
-        ws = sh.worksheet(TARGET_WS)
-    except Exception:
-        print(f"[SKIP] Worksheet not found (no-create): '{TARGET_WS}'")
-        sys.exit(0)  # 존재하지 않으면 아무것도 안 바꾸고 종료
+      - name: Download artifacts...
+        uses: dawidd6/action-download-artifact@v6
+        # ...
 
-    # 헤더/구조 변경 없이 특정 셀만 기록 (A1 예시)
-    value = [["HELLO_FROM_ACTIONS", datetime.now().isoformat()]]
-    ws.update(value, range_name="A1")
-    print(f"[OK] Updated '{TARGET_WS}'! {sh.url}")
-    PY
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write SA JSON to file (validate)
+        run: |
+          python - <<'PY'
+          import os,json,pathlib,sys
+          raw=os.environ.get("SA_JSON","").strip()
+          if not raw:
+              print("::error::GDRIVE_SA_JSON is empty"); sys.exit(1)
+          try:
+              obj=json.loads(raw)
+          except Exception as e:
+              print(f"::error::Invalid SA JSON: {e}"); sys.exit(1)
+          pathlib.Path("sa.json").write_text(json.dumps(obj),encoding="utf-8")
+          print("sa.json written.")
+          PY
+
+      # 🔽 여기 추가
+      - name: Debug write to Sheets (no-create, safe)
+        if: always()
+        env:
+          TARGET_WS: "전국 24년 10월"   # ← 실제 기존 탭명으로 바꿔 주세요
+        run: |
+          python - <<'PY'
+          import os, sys, json, gspread
+          from google.oauth2.service_account import Credentials
+          from datetime import datetime
+
+          SHEET_ID = os.environ["SHEET_ID"]
+          TARGET_WS = os.environ.get("TARGET_WS","").strip()
+          if not TARGET_WS:
+              print("TARGET_WS not set; skip.")
+              sys.exit(0)
+
+          raw = os.environ["SA_JSON"].strip()
+          creds = Credentials.from_service_account_info(
+              json.loads(raw),
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive",
+              ],
+          )
+          gc = gspread.authorize(creds)
+          sh = gc.open_by_key(SHEET_ID)
+
+          try:
+              ws = sh.worksheet(TARGET_WS)
+          except Exception:
+              print(f"[SKIP] Worksheet not found (no-create): '{TARGET_WS}'")
+              sys.exit(0)
+
+          ws.update([["HELLO_FROM_ACTIONS", datetime.now().isoformat()]], range_name="A1")
+          print(f"[OK] Updated '{TARGET_WS}'! {sh.url}")
+          PY
+
+      - name: Run analysis & update
+        run: |
+          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
+
+      # (이하 리포트 미리보기/업로드 스텝 유지)
