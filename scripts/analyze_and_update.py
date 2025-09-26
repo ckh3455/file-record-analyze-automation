@@ -10,10 +10,11 @@ Artifacts 엑셀을 읽어 기존 Google Sheet의 '기존 탭'에만 갱신한�
 - 새 탭 생성/헤더 수정/열 재배치 금지
 - 탭명 퍼지 매칭(공백/괄호/0패딩 차이 허용)
 - 전국 구·신 명칭 정규화(강원도→강원특별자치도, 전라북도→전북특별자치도)
+- **쓰기 최적화:** 한 행을 한 번의 update()로 갱신(429 회피)
 """
 
 from __future__ import annotations
-import os, re, sys, json, shutil, zipfile
+import os, re, sys, json, shutil, zipfile, time
 from pathlib import Path
 from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional
@@ -68,12 +69,10 @@ SIDO_STD = [
     "부산광역시","서울특별시","세종특별자치시","울산광역시","인천광역시",
     "전라남도","전북특별자치도","제주특별자치도","충청남도","충청북도"
 ]
-
-# 구/신 명칭 alias (엑셀에 과거 명칭으로 들어오는 달 대응)
+# 구/신 명칭 alias
 SIDO_ALIAS_TO_STD = {
     "강원도": "강원특별자치도",
     "전라북도": "전북특별자치도",
-    # 필요시 추가
 }
 
 SEOUL_GU = [
@@ -85,22 +84,16 @@ SEOUL_GU = [
 TOTAL_LABEL_CANDIDATES = ["총합계", "전체 개수", "합계", "총계", "전체"]
 
 def yymm_from_fname(name: str) -> Tuple[int,int]:
-    # "전국 2411_250926.xlsx" -> (24, 11)
     m = re.search(r"전국\s+(\d{2})(\d{2})_", name)
     return (int(m.group(1)), int(m.group(2))) if m else (0,0)
 
 def guess_write_date_from_fname(name: str) -> date:
-    # "_YYMMDD.xlsx"
     m = re.search(r"_(\d{2})(\d{2})(\d{2})", name)
     return date(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else date.today()
-
-def expect_title(kind: str, y2: int, m2: int) -> str:
-    return f"{kind} {y2:02d}년 {m2:02d}월"
 
 # ---------------- 엑셀 로드 ----------------
 def read_xlsx(path: Path) -> pd.DataFrame:
     log(f"[read] loading xlsx: {path.as_posix()}")
-    # 전처리 저장된 'data' 시트 우선
     last_err = None
     for sn in ("data", 0):
         try:
@@ -114,22 +107,19 @@ def read_xlsx(path: Path) -> pd.DataFrame:
     df = df.fillna("")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 중복열 방지(첫번째만 유지)
-    dup = [c for c in df.columns if df.columns.tolist().count(c) > 1]
-    if dup:
-        log(f"[read] duplicated columns dropped (keep=first): {dup}")
+    # 중복열 제거(첫 컬럼 유지)
+    dups = [c for c in df.columns if df.columns.tolist().count(c) > 1]
+    if dups:
+        log(f"[read] duplicated columns dropped (keep=first): {dups}")
         seen=set(); keep=[]
         for c in df.columns:
             if c in seen: continue
             seen.add(c); keep.append(c)
         df = df[keep]
 
-    must = {"계약년","계약월"}
-    # 전처리된 형태(광역/구/계약년/계약월/계약일 포함)면 그대로 사용
-    if {"광역","구","계약년","계약월"}.issubset(set(df.columns)):
+    if {"광역","구","계약년","계약월"}.issubset(df.columns):
         return df
 
-    # '시군구'만 있는 경우 분리(광역/구 추출), 계약년월 분리
     if "시군구" in df.columns:
         parts = df["시군구"].astype(str).str.split(expand=True, n=2)
         df["광역"] = parts[0]
@@ -139,11 +129,10 @@ def read_xlsx(path: Path) -> pd.DataFrame:
             df["계약년"] = s.str[:4]
             df["계약월"] = s.str[4:6]
         if "계약일" not in df.columns:
-            # 계약일이 따로 없으면 말일 취급(집계에는 영향 없음)
             df["계약일"] = "01"
         return df
 
-    # 최후: 1행을 헤더로 간주
+    # 최후: 1행 헤더 추정
     if len(df) > 0:
         header = [str(x).strip() for x in df.iloc[0].tolist()]
         df2 = df.iloc[1:].copy()
@@ -159,14 +148,12 @@ def _canon_sido(name: str) -> str:
     return SIDO_ALIAS_TO_STD.get(name, name)
 
 def aggregate_national(df: pd.DataFrame) -> pd.Series:
-    # 광역 명칭 정규화 후 집계
     if "광역" not in df.columns:
         log("[agg] missing column '광역' -> empty series")
         return pd.Series(dtype=int)
     tmp = df.copy()
     tmp["광역"] = tmp["광역"].map(_canon_sido)
     s = tmp.groupby("광역")["광역"].count()
-    # 표준 키로 정렬하여 반환
     return pd.Series({k:int(s.get(k,0)) for k in SIDO_STD})
 
 def aggregate_seoul(df: pd.DataFrame) -> pd.Series:
@@ -180,7 +167,7 @@ def aggregate_seoul(df: pd.DataFrame) -> pd.Series:
 # ---------------- Sheets ----------------
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.utils import rowcol_to_a1
+from gspread.utils import rowcol_to_a1, a1_range_to_grid_range
 
 def open_sheet(sa_path: Path, sheet_id: str):
     log("[gspread] auth with sa.json")
@@ -218,18 +205,14 @@ def find_ws_fuzzy(sh, kind: str, y2: int, m2: int):
     wants_norm = [_norm(w) for w in wants]
     titles = [ws.title for ws in sh.worksheets()]
     titles_norm = [_norm(t) for t in titles]
-
-    # 정확 정규화 일치
     for t, tn in zip(titles, titles_norm):
         if tn in wants_norm:
             log(f"[ws] fuzzy matched (exact norm): '{t}'")
             return sh.worksheet(t)
-    # 접두 정규화 일치
     for t, tn in zip(titles, titles_norm):
         if any(tn.startswith(wn) for wn in wants_norm):
             log(f"[ws] fuzzy matched (prefix norm): '{t}'")
             return sh.worksheet(t)
-    # 토큰 포함(0패딩/무패딩 허용)
     yy = f"{y2:02d}"; mm2 = f"{m2:02d}"; m1 = f"{m2}"
     for t in titles:
         if (("전국" if kind=="전국" else "서울") in t) and (yy in t) and ("월" in t) and (mm2 in t or m1 in t):
@@ -268,10 +251,17 @@ def _choose_total_label(header: List[str]) -> Optional[str]:
             return cand
     return None
 
-def _row_same_as_payload(ws, row_idx: int, payload: Dict[int, object]) -> bool:
-    cur = ws.row_values(row_idx)
-    for cidx, val in payload.items():
-        curv = cur[cidx-1] if cidx-1 < len(cur) else ""
+def _last_col_letter(ncols: int) -> str:
+    # 1->A, 26->Z, 27->AA
+    letters = ""
+    while ncols:
+        ncols, rem = divmod(ncols-1, 26)
+        letters = chr(65+rem) + letters
+    return letters
+
+def _row_same_as_payload_values(current: List[str], payload_map: Dict[int, object]) -> bool:
+    for cidx, val in payload_map.items():
+        curv = current[cidx-1] if cidx-1 < len(current) else ""
         if str(curv) != str(val):
             return False
     return True
@@ -279,44 +269,39 @@ def _row_same_as_payload(ws, row_idx: int, payload: Dict[int, object]) -> bool:
 def write_row_mapped(ws, when: date, header_full: List[str],
                      series: pd.Series, kind: str) -> str:
     """
-    header_full의 '제목'을 기준으로 해당 열만 갱신.
-    kind: 'national' or 'seoul'
+    제목 기준 매핑 + **한 번의 update** 로 행 갱신.
+    - 기존 행을 읽어 베이스라인으로 사용(수식/메모 보존)
+    - 해당되는 칸만 값 대입
     """
     if not header_full or header_full[0] != "날짜":
         log(f"[ws] header missing '날짜' -> skip write ({ws.title})")
         return "skip(header)"
 
-    # 제목→열인덱스 맵
+    # 제목→열 인덱스
     col_map: Dict[str,int] = {}
     for j, t in enumerate(header_full, start=1):
         tt = t.strip()
         if tt:
             col_map[tt] = j
 
-    # 합계 라벨 결정
     total_label = _choose_total_label(header_full)
 
-    # payload 생성(열 인덱스→값)
+    # 업데이트 대상 값 계산
     payload: Dict[int, object] = {}
     if "날짜" in col_map:
         payload[col_map["날짜"]] = when.isoformat()
 
     if kind == "national":
-        # 표준 키 기준으로 합계 계산
         nat_total = int(series.reindex(SIDO_STD).fillna(0).sum()) if len(series)>0 else 0
-        # 각 시도 값: 시트에 구명칭 열(예: '강원도')가 있으면 canonical로부터 값 가져와 채움
         for header_title, cidx in col_map.items():
             if header_title in ("날짜",) + tuple(TOTAL_LABEL_CANDIDATES):
                 continue
-            # 표준/구명칭 모두 수용
             std_key = _canon_sido(header_title)
-            val = int(series.get(std_key, 0)) if std_key in series.index else 0
             if header_title in SIDO_STD or header_title in SIDO_ALIAS_TO_STD.keys():
-                payload[cidx] = val
+                payload[cidx] = int(series.get(std_key, 0))
         if total_label:
             payload[col_map[total_label]] = nat_total
-
-    else:  # seoul
+    else:
         se_total = int(series.sum()) if len(series)>0 else 0
         for header_title, cidx in col_map.items():
             if header_title in ("날짜",) + tuple(TOTAL_LABEL_CANDIDATES):
@@ -326,19 +311,36 @@ def write_row_mapped(ws, when: date, header_full: List[str],
         if total_label:
             payload[col_map[total_label]] = se_total
 
-    # 행 인덱스 및 정책 판단
+    # 행 인덱스 정책
     row_idx, exists = find_or_create_row_index_for_date(ws, when)
     first = _first_record_date(ws)
+    # 베이스라인(현재 행 전체)
+    current = ws.row_values(row_idx)
+    # 3개월 이후 동일하면 스킵
     if first is not None and (when - first).days > MAX_DAILY_WINDOW_DAYS:
-        # 3개월 이후: 마지막 행과 동일하면 스킵
-        if _row_same_as_payload(ws, row_idx, payload):
+        if _row_same_as_payload_values(current, payload):
             return "skip(=last)"
 
-    # 개별 셀 업데이트(제목 위치에 정확히 씀)
-    for cidx, val in sorted(payload.items()):
-        a1 = rowcol_to_a1(row_idx, cidx)
-        # gspread 6.x: values first, range second (Deprecation 대응)
-        ws.update([[val]], a1)
+    # 베이스라인을 헤더 길이에 맞춰 확장
+    ncols = max(len(header_full), len(current))
+    row_vals = current + [""] * (ncols - len(current))
+    # payload 반영
+    for cidx, val in payload.items():
+        if cidx-1 < len(row_vals):
+            row_vals[cidx-1] = val
+        else:
+            # 안전장치: 길이 부족 시 확장
+            row_vals += [""] * (cidx - len(row_vals))
+            row_vals[cidx-1] = val
+
+    # 마지막 유효 열 = 헤더 길이
+    ncols = len(header_full)
+    last_col = _last_col_letter(ncols)
+    rng = f"A{row_idx}:{last_col}{row_idx}"
+    # 단 한 번의 업데이트
+    ws.update([row_vals[:ncols]], rng)
+    # 살짝 쉬어 주면(여러 탭 연속 기록 시) quota에 더 안전
+    time.sleep(0.2)
     return "append" if not exists else "update"
 
 # ---------------- 수집/메인 ----------------
@@ -355,12 +357,14 @@ def collect_artifacts(art_dir: Path) -> List[Path]:
         with zipfile.ZipFile(z, "r") as zp:
             zp.extractall(dest)
 
-    # zip 해제된 곳 + 원본 경로 모두 스캔
     for root in ["extracted", str(art_dir)]:
         for p in Path(root).rglob("*.xlsx"):
             paths.append(p.resolve())
     log(f"total xlsx under work_dir: {len(paths)}")
     return paths
+
+def expect_title(kind: str, y2: int, m2: int) -> str:
+    return f"{kind} {y2:02d}년 {m2:02d}월"
 
 def main():
     _ensure_logdir()
@@ -391,12 +395,10 @@ def main():
         write_day = guess_write_date_from_fname(f.name)
         log(f"[file] {f.name} -> nat='{expect_title('전국', y2, m2)}' seoul='{expect_title('서울', y2, m2)}' date={write_day}")
 
-        # 엑셀 읽기 & 집계
         df = read_xlsx(f)
         nat_series = aggregate_national(df)
         se_series  = aggregate_seoul(df)
 
-        # 탭 퍼지 매칭
         ws_nat = find_ws_fuzzy(sh, "전국", y2, m2)
         ws_se  = find_ws_fuzzy(sh, "서울", y2, m2)
 
