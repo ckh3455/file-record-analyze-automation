@@ -1,5 +1,13 @@
 # .github/workflows/analyze-and-update.yml
 
+name: analyze-and-update-sheets
+
+on:
+  workflow_dispatch:      # ← 이 줄이 꼭 있어야 함
+  schedule:
+    - cron: "20 0 * * *"  # UTC 00:20 = KST 09:20
+
+
 jobs:
   run:
     runs-on: ubuntu-latest
