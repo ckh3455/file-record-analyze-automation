@@ -1,0 +1,30 @@
+name: artifact-inspector
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts from ckh3455/file-automation
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}   # Fine-grained PAT
+          repo: ckh3455/file-automation
+          workflow: molit.yml                            # 성공본 파일명과 일치해야 함
+          workflow_conclusion: success
+          branch: main
+          path: artifacts
+
+      - name: Show downloaded files
+        run: |
+          echo "== artifacts tree =="
+          if [ -d artifacts ]; then
+            find artifacts -maxdepth 3 -type f -printf "%p\n"
+          else
+            echo "no artifacts dir"
+          fi
