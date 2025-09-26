@@ -18,7 +18,7 @@
 """
 
 from __future__ import annotations
-import os, sys, json, zipfile, shutil
+import os, sys, json, zipfile, shutil, traceback
 from pathlib import Path
 from datetime import datetime, date
 from typing import Tuple
@@ -83,12 +83,13 @@ def collect_artifacts(artifacts_dir: Path, work_dir: Path) -> None:
     log(f"[collect] total xlsx under work_dir: {total}")
 
 # =========================
-# 엑셀 로드 (전처리본 가정)
+# 엑셀 로드 (전처리본 가정, 중복 컬럼 안전)
 # =========================
 def read_table(path: Path) -> pd.DataFrame:
     log(f"[read] loading xlsx: {path}")
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
     df = df.fillna("")
+
     # 헤더 추정(전처리본 기준 1행이 헤더, 그래도 0~4행 간 탐색)
     hdr_row = 0
     for i in range(min(5, len(df))):
@@ -96,11 +97,24 @@ def read_table(path: Path) -> pd.DataFrame:
         if ("광역" in row) and ("계약일" in row):
             hdr_row = i
             break
+
+    # 헤더 지정 + 데이터 영역
     df.columns = df.iloc[hdr_row].astype(str).str.strip()
     df = df.iloc[hdr_row + 1 :].reset_index(drop=True)
-    for c in df.columns:
+
+    # 중복 컬럼 제거(첫 발생만 유지) — DataFrame 반환으로 .str 에러 방지
+    dup_mask = df.columns.duplicated(keep="first")
+    if dup_mask.any():
+        dups = [c for c, m in zip(df.columns, dup_mask) if m]
+        log(f"[read] duplicated columns dropped (keep=first): {dups}")
+        df = df.loc[:, ~dup_mask]
+
+    # 객체형(문자열) 컬럼만 strip — Series 보장
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    for c in obj_cols:
         df[c] = df[c].astype(str).str.strip()
-    log(f"[read] shape={df.shape}, cols={list(df.columns)[:10]}...")
+
+    log(f"[read] shape={df.shape}, cols(sample)={list(df.columns)[:12]}")
     return df
 
 # =========================
@@ -119,19 +133,24 @@ SEOUL_GU = [
 
 def aggregate(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     if "광역" not in df.columns:
+        log("[agg] missing column '광역' -> empty series")
         return pd.Series(dtype="int64"), pd.Series(dtype="int64")
-    # 전국
+
+    # 전국(광역) 카운트
     s_nat = df.groupby("광역")["광역"].count()
     s_nat.index.name = None
     s_nat = s_nat.reindex(PROVINCES).fillna(0).astype(int)
-    # 서울
+
+    # 서울(구) 카운트
     if "구" in df.columns:
         seoul = df[df["광역"] == "서울특별시"]
         s_seoul = seoul.groupby("구")["구"].count()
         s_seoul.index.name = None
         s_seoul = s_seoul.reindex(SEOUL_GU).fillna(0).astype(int)
     else:
+        log("[agg] missing column '구' -> empty seoul series")
         s_seoul = pd.Series(dtype="int64")
+
     log(f"[agg] nat len={s_nat.shape[0]} seoul len={s_seoul.shape[0]}")
     return s_nat, s_seoul
 
@@ -165,7 +184,10 @@ def open_sheet(sa_json_path: Path, sheet_id: str):
     import gspread
     creds = Credentials.from_service_account_file(
         sa_json_path.as_posix(),
-        scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
@@ -288,6 +310,9 @@ def main():
 
         except Exception as e:
             log(f"[ERROR] {p.name}: {e}")
+            tb = traceback.format_exc()
+            for ln in tb.rstrip().splitlines():
+                log(f"[TB] {ln}")
 
     log("[main] done")
 
