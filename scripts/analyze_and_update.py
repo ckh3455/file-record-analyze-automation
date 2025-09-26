@@ -7,7 +7,7 @@ Artifacts로 받은 MOLIT 전처리 엑셀을 읽어
 
 중요:
 - 기존 시트를 '찾아서' 갱신만 한다(새 시트 생성 금지).
-- 탭 이름은 퍼지 매칭(공백/불필요 문자 무시, 괄호/접미사 허용)으로 찾는다.
+- 탭 이름은 퍼지 매칭(공백/괄호/하이픈/밑줄/0패딩 무시)으로 찾는다.
 - analyze_report/ 에 상세 로그와 where_written.txt 남김.
 """
 
@@ -177,29 +177,41 @@ def open_sheet(sa_path: Path, sheet_id: str):
     return sh
 
 def _norm(s: str) -> str:
-    # 공백/괄호/하이픈/밑줄 같은 군더더기 제거, 전각 공백 제거
+    # 공백/괄호/하이픈/밑줄/전각 공백 제거
     s = re.sub(r"[\s\u3000\-\_()（）]+", "", s)
     return s
 
 def _title_variants(kind: str, y2: int, m2: int) -> List[str]:
-    # ‘전국 24년 10월’, ‘전국24년10월’, ‘전국(24년10월)’, ‘전국 24년 10월_자동’ 등 폭넓게 매칭
-    base = expect_title(kind, y2, m2)
-    compact = _norm(base)
-    pat = [
-        base,
-        compact,
-        f"{kind}{y2:02d}년{m2:02d}월",
-        f"{kind} {y2:02d}년{m2:02d}월",
-        f"{kind}{y2:02d}년 {m2:02d}월",
-        f"{kind}({y2:02d}년 {m2:02d}월)",
-        f"{kind}({y2:02d}년{m2:02d}월)"
+    """
+    '전국 24년 07월' 케이스 + '전국 24년 7월' (0 미포함)도 모두 생성.
+    """
+    mm2 = f"{m2:02d}"
+    m1  = f"{m2}"  # no zero pad
+    yy  = f"{y2:02d}"
+
+    bases = [
+        f"{kind} {yy}년 {mm2}월",
+        f"{kind} {yy}년 {m1}월",
+        f"{kind}{yy}년{mm2}월",
+        f"{kind}{yy}년{m1}월",
+        f"{kind} {yy}년{mm2}월",
+        f"{kind} {yy}년{m1}월",
+        f"{kind}{yy}년 {mm2}월",
+        f"{kind}{yy}년 {m1}월",
+        f"{kind}({yy}년 {mm2}월)",
+        f"{kind}({yy}년 {m1}월)",
+        f"{kind}({yy}년{mm2}월)",
+        f"{kind}({yy}년{m1}월)",
     ]
-    return list(dict.fromkeys(pat))  # 중복 제거, 순서 유지
+    # 공백 제거 버전도 포함
+    more = [_norm(b) for b in bases]
+    return list(dict.fromkeys(bases + more))
 
 def find_ws_fuzzy(sh, kind: str, y2: int, m2: int):
     """
     탭 이름 퍼지 매칭:
     - 공백/괄호/하이픈/밑줄 무시한 정규화로 비교
+    - 0패딩/무패딩 월 모두 허용
     - 접미사 붙은 변형(예: '..._자동', '...copy')도 허용
     - 최종적으로 가장 먼저 매칭된 탭을 반환
     """
@@ -220,11 +232,12 @@ def find_ws_fuzzy(sh, kind: str, y2: int, m2: int):
             log(f"[ws] fuzzy matched (prefix norm): '{t}'")
             return sh.worksheet(t)
 
-    # 3) 숫자 토큰 검색 — '전국'/'서울' + YY + MM 패턴 포함
+    # 3) 숫자 토큰 검색 — '전국'/'서울' + YY + (MM 또는 M) + '월'
     yy = f"{y2:02d}"
-    mm = f"{m2:02d}"
+    mm2 = f"{m2:02d}"
+    m1  = f"{m2}"
     for t in titles:
-        if ("전국" if kind=="전국" else "서울") in t and yy in t and mm in t and "월" in t:
+        if (("전국" if kind=="전국" else "서울") in t) and (yy in t) and ("월" in t) and (mm2 in t or m1 in t):
             log(f"[ws] fuzzy matched (tokens): '{t}'")
             return sh.worksheet(t)
 
@@ -265,6 +278,10 @@ def policy_should_write(ws, when: date, values: List) -> bool:
     return True
 
 def write_row(ws, when: date, header: List[str], series: pd.Series, label_total: str="총합계") -> str:
+    if not header or header[0] != "날짜":
+        # 최소 방어: 헤더에 '날짜'가 없으면 쓰지 않음
+        log(f"[ws] header missing '날짜' -> skip write ({ws.title})")
+        return "skip(header)"
     vals = [when.isoformat()]
     total = 0
     for key in header[1:]:
@@ -280,7 +297,7 @@ def write_row(ws, when: date, header: List[str], series: pd.Series, label_total:
 
     # range 계산 (A{row} : {lastcol}{row})
     last_a1 = gspread.utils.rowcol_to_a1(1, len(header))
-    last_col = re.sub(r"\d+", "", last_a1)  # "A1" -> "A"
+    last_col = re.sub(r"\d+", "", last_a1)  # e.g., "Z"
     rng = f"A{row_idx}:{last_col}{row_idx}"
     ws.update([vals], range_name=rng)
     return "append" if not exists else "update"
@@ -329,15 +346,17 @@ def main():
     for f in sorted(nat_files, key=lambda p: p.name):
         y2, m2 = yymm_from_fname(f.name)
         if y2 == 0:
+            log(f"[file] skip (no yymm in name): {f.name}")
             continue
         write_day = guess_write_date_from_fname(f.name)
+        log(f"[file] {f.name} -> nat='{expect_title('전국', y2, m2)}' seoul='{expect_title('서울', y2, m2)}' date={write_day}")
 
         # 엑셀 읽기 & 집계
         df = read_xlsx(f)
         nat_series = aggregate_national(df)
         se_series  = aggregate_seoul(df)
 
-        # 탭 이름 퍼지 매칭
+        # 탭 이름 퍼지 매칭 (0패딩/무패딩 모두 지원)
         ws_nat = find_ws_fuzzy(sh, "전국", y2, m2)
         ws_se  = find_ws_fuzzy(sh, "서울", y2, m2)
 
