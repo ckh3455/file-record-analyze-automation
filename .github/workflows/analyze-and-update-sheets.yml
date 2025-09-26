@@ -33,16 +33,10 @@ jobs:
           workflow_conclusion: success
           branch: main
           path: artifacts
-     - name: Clean report dir
-       run: |
-    rm -rf analyze_report
-    mkdir -p analyze_report
-
 
       - name: Show artifacts tree
         run: |
-          echo "== artifacts tree =="
-          ls -alR artifacts || true
+          echo "== artifacts tree ==" && ls -alR artifacts || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,35 +52,61 @@ jobs:
         run: |
           python - <<'PY'
           import os, json, pathlib, sys
-          raw = os.environ.get("SA_JSON","").strip()
+          raw=os.environ.get("SA_JSON","").strip()
           if not raw:
               print("::error::GDRIVE_SA_JSON is empty"); sys.exit(1)
           try:
-              obj = json.loads(raw)
+              obj=json.loads(raw)
           except Exception as e:
               print(f"::error::Invalid SA JSON: {e}"); sys.exit(1)
-          pathlib.Path("sa.json").write_text(json.dumps(obj), encoding="utf-8")
+          pathlib.Path("sa.json").write_text(json.dumps(obj),encoding="utf-8")
           print("sa.json written.")
+          PY
+
+      # --------- 중요: 로그 폴더 충돌 방지(항상 깨끗하게) ---------
+      - name: Clean report dir
+        run: |
+          rm -rf analyze_report
+          mkdir -p analyze_report
+
+      # (선택) 시트 쓰기 권한 빠른 점검 - 기존 탭만 사용(no create)
+      - name: Debug write to Sheets (no-create, safe)
+        run: |
+          python - <<'PY'
+          import os, json, gspread
+          from google.oauth2.service_account import Credentials
+          SHEET_ID = os.environ["SHEET_ID"]
+          TARGET_WS = "HELLO_FROM_ACTIONS"  # 이미 있는 탭 이름으로 바꿔서 점검해도 됨
+          creds = Credentials.from_service_account_info(
+              json.loads(os.environ["SA_JSON"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets",
+                      "https://www.googleapis.com/auth/drive"]
+          )
+          gc = gspread.authorize(creds)
+          sh = gc.open_by_key(SHEET_ID)
+          try:
+              ws = sh.worksheet(TARGET_WS)
+          except Exception:
+              print(f"::warning::[SKIP] Worksheet not found (no-create): '{TARGET_WS}'")
+              raise SystemExit(0)
+          from datetime import datetime
+          ws.update([["OK_FROM_ACTIONS", datetime.now().isoformat()]], range_name="A1")
+          print("[OK] Updated existing sheet:", TARGET_WS)
           PY
 
       - name: Run analysis & update
         run: |
-          python scripts/analyze_and_update.py \
-            --artifacts-dir artifacts \
-            --sa sa.json \
-            --sheet-id "$SHEET_ID"
+          python scripts/analyze_and_update.py --artifacts-dir artifacts --sa sa.json --sheet-id "$SHEET_ID"
 
       - name: Preview analyze_report (always)
         if: always()
         run: |
           echo "== analyze_report tree =="
           ls -alR analyze_report || true
-          echo "---- latest.log (head) ----"
-          sed -n '1,160p' analyze_report/latest.log || true
-          echo "---- run logs list ----"
-          ls -al analyze_report/run-*.log 2>/dev/null || true
-          echo "---- sheet_id.txt ----"
-          cat analyze_report/sheet_id.txt 2>/dev/null || true
+          echo "---- latest.log (tail) ----"
+          tail -n 200 analyze_report/latest.log || true
+          echo "---- where_written.txt ----"
+          cat analyze_report/where_written.txt 2>/dev/null || true
 
       - name: Upload report
         if: always()
