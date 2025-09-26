@@ -1,1 +1,8 @@
+pandas
+numpy
+openpyxl
+selenium
+webdriver-manager
+gspread
+google-auth
 
