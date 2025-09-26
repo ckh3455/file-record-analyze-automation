@@ -63,35 +63,28 @@ jobs:
           print("sa.json written.")
           PY
 
-      # --------- 중요: 로그 폴더 충돌 방지(항상 깨끗하게) ---------
       - name: Clean report dir
         run: |
           rm -rf analyze_report
           mkdir -p analyze_report
 
-      # (선택) 시트 쓰기 권한 빠른 점검 - 기존 탭만 사용(no create)
-      - name: Debug write to Sheets (no-create, safe)
+      # 현재 스프레드시트 탭 이름을 전부 로그로 남겨서 매칭 상황 점검
+      - name: List worksheet titles
         run: |
           python - <<'PY'
           import os, json, gspread
           from google.oauth2.service_account import Credentials
-          SHEET_ID = os.environ["SHEET_ID"]
-          TARGET_WS = "HELLO_FROM_ACTIONS"  # 이미 있는 탭 이름으로 바꿔서 점검해도 됨
+          sid=os.environ["SHEET_ID"]
           creds = Credentials.from_service_account_info(
               json.loads(os.environ["SA_JSON"]),
               scopes=["https://www.googleapis.com/auth/spreadsheets",
                       "https://www.googleapis.com/auth/drive"]
           )
           gc = gspread.authorize(creds)
-          sh = gc.open_by_key(SHEET_ID)
-          try:
-              ws = sh.worksheet(TARGET_WS)
-          except Exception:
-              print(f"::warning::[SKIP] Worksheet not found (no-create): '{TARGET_WS}'")
-              raise SystemExit(0)
-          from datetime import datetime
-          ws.update([["OK_FROM_ACTIONS", datetime.now().isoformat()]], range_name="A1")
-          print("[OK] Updated existing sheet:", TARGET_WS)
+          sh = gc.open_by_key(sid)
+          print("== SHEET TITLES ==")
+          for ws in sh.worksheets():
+              print("-", ws.title)
           PY
 
       - name: Run analysis & update
