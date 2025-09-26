@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
 import shutil
 import sys
@@ -13,6 +11,7 @@ from datetime import datetime, date, timedelta
 from typing import List, Tuple, Optional
 
 import pandas as pd
+from openpyxl.utils import get_column_letter  # for A1 end-col (AA, AB, ...)
 
 
 # ===================== 로거 =====================
@@ -28,21 +27,17 @@ class RunLogger:
         print(line, flush=True)
 
     def dump(self, report_dir: Path, sheet_id: str):
-        """report_dir가 파일로 존재해도 안전하게 폴더 보장 후 로그 저장"""
-        # 폴더 보장(동명 파일 충돌 회피)
+        """report_dir가 파일로 있어도 안전하게 폴더 보장 후 로그 저장"""
         if report_dir.exists() and not report_dir.is_dir():
             try:
-                report_dir.unlink()  # 파일이면 제거
+                report_dir.unlink()
             except Exception:
-                # 이름 바꿔 피함
                 bak = report_dir.with_name(report_dir.name + ".bak")
                 try:
                     report_dir.rename(bak)
                 except Exception:
                     pass
         report_dir.mkdir(parents=True, exist_ok=True)
-
-        # 파일 저장
         run_id = self.t0.strftime("run-%Y%m%d-%H%M%S")
         (report_dir / "sheet_id.txt").write_text(sheet_id, encoding="utf-8")
         (report_dir / "latest.log").write_text("\n".join(self.lines) or "(no logs)", encoding="utf-8")
@@ -175,8 +170,9 @@ def connect_gspread(sa_json_path: Path):
 def ensure_ws(sh, title: str, header: List[str]):
     """
     시트가 없으면 생성, 있으면 헤더를 '날짜 + 항목 유니온'으로 동기화.
-    gspread 최신 시그니처( values 먼저, range_name 둘째 )로 update 호출.
-    '모든 비고정 행 삭제 불가' 오류를 피하기 위해 최소 행 수를 보장.
+    - 빈 문자열 헤더 제거
+    - gspread 최신 시그니처: ws.update([values], range_name="A1")
+    - frozenRowCount 고려, 최소 2행 보장
     """
     log(f"[ws] ensure '{title}' with header keys={header[1:]}")
     try:
@@ -190,13 +186,17 @@ def ensure_ws(sh, title: str, header: List[str]):
 
     rows = ws.get_all_values() or []
     cur_header = rows[0] if rows else []
-    desired = ["날짜"] + sorted(set(cur_header[1:] + header[1:]))
+
+    # 빈 문자열 제거
+    cur_keys = [k for k in cur_header[1:] if k and k.strip()]
+    new_keys = [k for k in header[1:] if k and k.strip()]
+    desired = ["날짜"] + sorted(set(cur_keys + new_keys))
+
     frozen = ws._properties.get("gridProperties", {}).get("frozenRowCount", 0) or 0
     min_rows = max(2, frozen + 1)
     cur_rows = max(ws.row_count, len(rows) or 1)
     target_rows = max(cur_rows, min_rows)
     target_cols = max(ws.col_count, len(desired))
-
     log(f"[ws] frozen={frozen} cur_rows={ws.row_count} cur_cols={ws.col_count} "
         f"-> resize rows={target_rows} cols={target_cols}")
 
@@ -272,8 +272,14 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
     """
     rows = ws.get_all_values() or []
     header = rows[0] if rows else ["날짜"]
-    desired = ["날짜"] + sorted(set(header[1:] + header_entities))
 
+    # 빈 헤더 제거 + 기존/새 헤더 유니온
+    cur_keys = [k for k in header[1:] if k and k.strip()]
+    new_keys = [k for k in header_entities if k and k.strip()]
+    # 기존 시트에 '총합계'가 있으면 유지
+    desired = ["날짜"] + sorted(set(cur_keys + new_keys + (["총합계"] if "총합계" in header else [])))
+
+    # 안전 리사이즈
     frozen = ws._properties.get("gridProperties", {}).get("frozenRowCount", 0) or 0
     min_rows = max(2, frozen + 1)
     cur_rows = max(ws.row_count, len(rows) or 1)
@@ -288,15 +294,22 @@ def write_row(ws, when: date, header_entities: List[str], counts: pd.Series, mod
         ws.update([desired], range_name="A1")
         header = desired
 
+    # 행 데이터 구성 (헤더 순서대로)
     row_vals = [when.isoformat()] + [int(counts.get(k, 0)) for k in header[1:]]
-    log(f"[ws] row values for {when}: {row_vals[:6]}... len={len(row_vals)}")
+    # 총합계 자동 계산(있을 때만)
+    if "총합계" in header:
+        sum_idx = header.index("총합계")
+        value_keys = [k for k in header[1:] if k != "총합계"]
+        total = sum(int(counts.get(k, 0)) for k in value_keys)
+        # row_vals는 header 순서와 동일: '날짜' 다음부터 매핑되어 있으므로 위치 보정
+        row_vals[sum_idx] = total
 
     def _upsert_row():
         idx = find_date_row_index(ws, when)
+        end_col = get_column_letter(len(row_vals))  # e.g., 28 -> AB
         if idx:
-            col_end = chr(ord("A") + len(row_vals) - 1)
             log(f"[ws] update existing row idx={idx}")
-            ws.update([row_vals], range_name=f"A{idx}:{col_end}{idx}")
+            ws.update([row_vals], range_name=f"A{idx}:{end_col}{idx}")
             return "update"
         else:
             log("[ws] append new row")
@@ -393,11 +406,9 @@ def main():
                 log(f"[서울] {p.name} -> no seoul rows")
 
     except Exception as e:
-        # 예외도 상세 출력
         log(f"[ERROR] {type(e).__name__}: {e}")
         raise
     finally:
-        # 어떤 경우에도 로그 파일 남김
         logger.dump(Path("analyze_report"), args.sheet_id)
         log("[main] logs written to analyze_report/")
 
