@@ -1,1 +1,13 @@
 
+# Python
+__pycache__/
+*.pyc
+
+# Local outputs
+output/
+_rt_downloads/
+analyze_report/
+
+# Virtual env
+.venv/
+.env
