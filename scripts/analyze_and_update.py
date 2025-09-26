@@ -21,7 +21,7 @@ from __future__ import annotations
 import os, sys, json, zipfile, shutil, traceback
 from pathlib import Path
 from datetime import datetime, date
-from typing import Tuple
+from typing import Tuple, Optional
 
 import pandas as pd
 from openpyxl.utils import get_column_letter
@@ -83,39 +83,76 @@ def collect_artifacts(artifacts_dir: Path, work_dir: Path) -> None:
     log(f"[collect] total xlsx under work_dir: {total}")
 
 # =========================
-# 엑셀 로드 (전처리본 가정, 중복 컬럼 안전)
+# 엑셀 로드 (전처리본 가정, 시트/헤더 견고)
 # =========================
-def read_table(path: Path) -> pd.DataFrame:
-    log(f"[read] loading xlsx: {path}")
-    df = pd.read_excel(path, engine="openpyxl", dtype=str)
-    df = df.fillna("")
+EXPECTED_HEADERS = {
+    "광역","구","법정동","리","전용면적(㎡)","계약년","계약월","계약일","거래금액(만원)","단지명"
+}
 
-    # 헤더 추정(전처리본 기준 1행이 헤더, 그래도 0~4행 간 탐색)
-    hdr_row = 0
-    for i in range(min(5, len(df))):
+def _try_read(path: Path, sheet_name: Optional[str]) -> pd.DataFrame:
+    info = f"sheet='{sheet_name}'" if sheet_name is not None else "sheet=0"
+    log(f"[read] loading xlsx: {path} ({info})")
+    return pd.read_excel(path, engine="openpyxl", dtype=str, sheet_name=sheet_name)
+
+def _detect_header_row(df: pd.DataFrame, max_scan: int = 50) -> int:
+    # 0..max_scan-1 범위에서 기대 헤더와 교집합 개수가 가장 큰 행 선택 (최소 3개 이상일 때 채택)
+    best_idx, best_score = 0, -1
+    n = min(max_scan, len(df))
+    for i in range(n):
         row = [str(x).strip() for x in df.iloc[i].tolist()]
-        if ("광역" in row) and ("계약일" in row):
-            hdr_row = i
-            break
+        score = sum(1 for x in row if x in EXPECTED_HEADERS)
+        if score > best_score:
+            best_idx, best_score = i, score
+    log(f"[read] header_try: chosen_row={best_idx}, match_count={best_score}")
+    # 3 미만이면 그래도 best_idx 사용하되 이후 유효성 검증에서 걸러짐
+    return best_idx
 
+def _finalize_after_header(df: pd.DataFrame, hdr_row: int) -> pd.DataFrame:
     # 헤더 지정 + 데이터 영역
     df.columns = df.iloc[hdr_row].astype(str).str.strip()
     df = df.iloc[hdr_row + 1 :].reset_index(drop=True)
 
-    # 중복 컬럼 제거(첫 발생만 유지) — DataFrame 반환으로 .str 에러 방지
+    # 중복 컬럼 제거(첫 발생만 유지)
     dup_mask = df.columns.duplicated(keep="first")
     if dup_mask.any():
         dups = [c for c, m in zip(df.columns, dup_mask) if m]
         log(f"[read] duplicated columns dropped (keep=first): {dups}")
         df = df.loc[:, ~dup_mask]
 
-    # 객체형(문자열) 컬럼만 strip — Series 보장
+    # 문자열 컬럼 정리
     obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
     for c in obj_cols:
         df[c] = df[c].astype(str).str.strip()
 
     log(f"[read] shape={df.shape}, cols(sample)={list(df.columns)[:12]}")
     return df
+
+def read_table(path: Path) -> pd.DataFrame:
+    # 1차: sheet='data' 시도
+    try:
+        df = _try_read(path, sheet_name="data")
+    except Exception as e:
+        log(f"[read] sheet='data' failed: {e}")
+        df = _try_read(path, sheet_name=0)  # 폴백: 첫 시트
+
+    # 헤더 탐지
+    hdr_row = _detect_header_row(df, max_scan=50)
+    df2 = _finalize_after_header(df, hdr_row)
+
+    # 유효성 검사: 최소 핵심 컬럼 존재 여부
+    needed = {"계약년","계약월"}
+    if not (("광역" in df2.columns) and needed.issubset(df2.columns)):
+        log("[read] header validation failed -> fallback to first row as header")
+        try:
+            # 폴백: 0행을 헤더로 가정 후 다시 유효성 검증
+            df_fb = _finalize_after_header(df, 0)
+            if ("광역" in df_fb.columns) and needed.issubset(df_fb.columns):
+                log("[read] fallback header accepted (row=0)")
+                return df_fb
+        except Exception as e:
+            log(f"[read] fallback failed: {e}")
+
+    return df2
 
 # =========================
 # 집계 정의
