@@ -203,7 +203,6 @@ def read_month_df(path: Path) -> pd.DataFrame:
     for c in NEEDED_COLS:
         if c not in df.columns:
             df[c] = pd.NA
-    # 컬럼 순서 유지(원본 순)
     return df.copy()
 
 # ===================== 집계(건수·중앙값·평균) =====================
@@ -211,6 +210,13 @@ def eok_series(ser):
     s = pd.to_numeric(ser, errors="coerce").dropna()
     if s.empty: return pd.Series([], dtype=float)
     return s / 10000.0
+
+def round2(v):
+    if v=="" or v is None: return ""
+    try:
+        return f"{float(v):.2f}"
+    except Exception:
+        return ""
 
 def agg_all_stats(df: pd.DataFrame):
     counts = {col:0 for col in SUMMARY_COLS}
@@ -224,8 +230,8 @@ def agg_all_stats(df: pd.DataFrame):
     all_eok = eok_series(df["거래금액(만원)"])
     counts["전국"] = int(len(df))
     if not all_eok.empty:
-        med["전국"] = round(float(all_eok.median()), 2)
-        mean["전국"] = round(float(all_eok.mean()), 2)
+        med["전국"] = round2(all_eok.median())
+        mean["전국"] = round2(all_eok.mean())
 
     # 광역
     if "광역" in df.columns:
@@ -235,8 +241,8 @@ def agg_all_stats(df: pd.DataFrame):
                 counts[prov_std] += int(len(sub))
                 s = eok_series(sub["거래금액(만원)"])
                 if not s.empty:
-                    med[prov_std] = round(float(s.median()), 2)
-                    mean[prov_std] = round(float(s.mean()), 2)
+                    med[prov_std] = round2(s.median())
+                    mean[prov_std] = round2(s.mean())
 
     # 서울/자치구
     seoul = df[df.get("광역","")=="서울특별시"].copy()
@@ -244,8 +250,8 @@ def agg_all_stats(df: pd.DataFrame):
     if len(seoul)>0:
         s = eok_series(seoul["거래금액(만원)"])
         if not s.empty:
-            med["서울"] = round(float(s.median()), 2)
-            mean["서울"] = round(float(s.mean()), 2)
+            med["서울"] = round2(s.median())
+            mean["서울"] = round2(s.mean())
 
     if "구" in seoul.columns:
         for gu, sub in seoul.groupby("구"):
@@ -254,16 +260,16 @@ def agg_all_stats(df: pd.DataFrame):
                 counts[gu] += int(len(sub))
                 s = eok_series(sub["거래금액(만원)"])
                 if not s.empty:
-                    med[gu] = round(float(s.median()), 2)
-                    mean[gu] = round(float(s.mean()), 2)
+                    med[gu] = round2(s.median())
+                    mean[gu] = round2(s.mean())
 
     # 압구정동
     ap = seoul[seoul.get("법정동","")=="압구정동"]
     counts["압구정동"] = int(len(ap))
     if len(ap)>0:
         s = eok_series(ap["거래금액(만원)"])
-        med["압구정동"] = round(float(s.median()), 2)
-        mean["압구정동"] = round(float(s.mean()), 2)
+        med["압구정동"] = round2(s.median())
+        mean["압구정동"] = round2(s.mean())
 
     return counts, int(len(seoul)), int(len(ap)), med, mean
 
@@ -320,7 +326,7 @@ def write_summary_for_month(ws, ym: str,
             payload.append({"range": f"{a1_col(hmap[col])}{row_idx}", "values": [[v]]})
         batch_values_update(ws, payload)
 
-    # 거래건수
+    # 거래건수(볼드)
     row1 = find_summary_row(ws, ym, "거래건수")
     put_row(row1, "거래건수", counts)
     if SUMMARY_COLS and all(c in hmap for c in SUMMARY_COLS):
@@ -329,12 +335,12 @@ def write_summary_for_month(ws, ym: str,
         format_row_bold(ws, row1, first_c, last_c)
     print(f"[summary] {ym} 거래건수 -> row={row1}")
 
-    # 중앙값
+    # 중앙값(단위:억) – 이미 두자리 포맷으로 만든 값
     row2 = find_summary_row(ws, ym, "중앙값(단위:억)")
     put_row(row2, "중앙값(단위:억)", med)
     print(f"[summary] {ym} 중앙값 -> row={row2}")
 
-    # 평균가
+    # 평균가(단위:억)
     row3 = find_summary_row(ws, ym, "평균가(단위:억)")
     put_row(row3, "평균가(단위:억)", mean)
     print(f"[summary] {ym} 평균가 -> row={row3}")
@@ -372,13 +378,17 @@ def ensure_apgu_sheet(sh):
     ws = fuzzy_ws(sh, "압구정동")
     if ws:
         return ws
-    return _retry(sh.add_worksheet, title="압구정동", rows=2000, cols=30)
+    return _retry(sh.add_worksheet, title="압구정동", rows=2000, cols=40)
 
-def make_row_key(row_dict: dict, header: list[str]) -> str:
-    # 중복 판정 키 (계약년/월/일 + 주요 항목)
-    fields = ["계약년","계약월","계약일","광역","구","법정동","도로명","번지","본번","부번","단지명","전용면적(㎡)","층","거래금액(만원)"]
-    parts = [str(row_dict.get(f,"")).strip() for f in fields if f in header]
-    return "|".join(parts)
+def make_row_key(d: dict) -> str:
+    # 중복 판정 키 (너무 엄격 X, 동일 케이스만 막음)
+    parts = [
+        d.get("계약년",""), d.get("계약월",""), d.get("계약일",""),
+        d.get("광역",""), d.get("구",""), d.get("법정동",""),
+        d.get("단지명",""), d.get("전용면적(㎡)",""), d.get("층",""),
+        d.get("거래금액(만원)","")
+    ]
+    return "|".join(str(x).strip() for x in parts)
 
 def number_or_blank(v):
     if v is None or (isinstance(v,float) and pd.isna(v)): return ""
@@ -387,120 +397,92 @@ def number_or_blank(v):
     return v
 
 def upsert_apgu_raw(ws, df_all: pd.DataFrame, webhook_url: str|None):
-    # 압구정동 행만 (== 로 수정)
-    df = df_all[(df_all.get("법정동","")=="압구정동") & (df_all.get("광역","")=="서울특별시")].copy()
+    # 압구정동만 선별
+    cond = (df_all.get("광역","")=="서울특별시") & (df_all.get("법정동","")=="압구정동")
+    df = df_all[cond].copy()
+    log(f"[압구정동] filtered rows in file(s): {len(df)}")
     if df.empty:
         log("[압구정동] no rows in this file")
         return
 
-    # 계약년/월/일 오름차순 정렬
-    if set(["계약년","계약월","계약일"]).issubset(df.columns):
-        df = df.sort_values(["계약년","계약월","계약일","거래금액(만원)"], ascending=[True,True,True,True])
+    # 날짜 오름차순 (오래된→최신)
+    for c in ["계약년","계약월","계약일"]:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df = df.sort_values(["계약년","계약월","계약일"], ascending=[True,True,True], kind="mergesort")
 
-    # 기존 시트 값 읽기
+    # 시트 기존 값/헤더
     vals = _retry(ws.get_all_values) or []
     if not vals:
-        # 헤더 생성: 원본 파일의 컬럼 순서 그대로
         header = list(df.columns)
         _retry(ws.update, [header], "A1")
         vals = [header]
     else:
         header = vals[0]
+        # 헤더 합치기(파일에 있고 시트에 없는 컬럼 추가)
+        union = list(dict.fromkeys(header + [c for c in df.columns if c not in header]))
+        if union != header:
+            # 헤더 확장
+            _retry(ws.update, [union], "A1")
+            header = union
+            vals = _retry(ws.get_all_values) or [union]
 
-    # 기존 중복키 셋/ 기존 월별 카운트
+    # 기존 중복키 구축
     existing_rows = vals[1:]
     idx_map = {name:i for i,name in enumerate(header)}
     def row_to_dict(row):
-        d={}
-        for k, i in idx_map.items():
-            d[k] = row[i] if i < len(row) else ""
-        return d
+        return {k: (row[i] if i<len(row) else "") for k,i in idx_map.items()}
+
     existing_keys = set()
     for r in existing_rows:
-        existing_keys.add(make_row_key(row_to_dict(r), header))
+        existing_keys.add(make_row_key(row_to_dict(r)))
 
-    def ym_of_row(dct):
-        try:
-            y = int(float(dct.get("계약년","") or 0))
-            m = int(float(dct.get("계약월","") or 0))
-            return f"{str(y%100).zfill(2)}/{m}"
-        except Exception:
-            return ""
-
-    # 기존 월별 카운트
-    from collections import Counter
-    prev_counter = Counter()
-    for r in existing_rows:
-        d = row_to_dict(r)
-        ym = ym_of_row(d)
-        if ym:
-            prev_counter[ym]+=1
-
-    # 추가할 행 수집
+    # 신규 레코드 구성(헤더 순으로 값 정렬)
     new_records = []
-    for _, row in df.iterrows():
-        d = {col: row.get(col, "") for col in header if col in df.columns}
-        key = make_row_key(d, header)
-        if key in existing_keys:
+    dup_cnt = 0
+    for _, r in df.iterrows():
+        d = {k: r.get(k, "") for k in header if k in df.columns}
+        k = make_row_key(d)
+        if k in existing_keys:
+            dup_cnt += 1
             continue
-        rec = [number_or_blank(row.get(col, "")) for col in header]
+        rec = [number_or_blank(r.get(col, "")) for col in header]
         new_records.append(rec)
-        existing_keys.add(key)
+        existing_keys.add(k)
 
-    if not new_records:
-        log("[압구정동] no new rows to append")
-    else:
+    log(f"[압구정동] existing={len(existing_rows)}, dup_skipped={dup_cnt}, to_append={len(new_records)}")
+
+    if new_records:
         start_row = len(vals)+1
         end_row = start_row + len(new_records) - 1
         rng = f"A{start_row}:{a1_col(len(header))}{end_row}"
         _retry(ws.update, new_records, rng)
         log(f"[압구정동] appended {len(new_records)} rows")
+    else:
+        log("[압구정동] no new rows to append")
 
-        # 정렬(계약년, 계약월, 계약일 오름차순)
-        sort_requests = []
-        for col_name in ["계약년","계약월","계약일"]:
-            if col_name in header:
-                col_idx0 = header.index(col_name)
-                sort_requests.append({
-                    "sortSpec": {
-                        "dimensionIndex": col_idx0,
-                        "sortOrder": "ASCENDING"
-                    }
-                })
-        if sort_requests:
-            _retry(ws.spreadsheet.batch_update, {
-                "requests": [{
-                    "sortRange": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "startRowIndex": 1,  # 헤더 제외
-                            "startColumnIndex": 0,
-                            "endColumnIndex": len(header)
-                        },
-                        "sortSpecs": [s["sortSpec"] for s in sort_requests]
-                    }
-                }]
-            })
-
-        # 알림(월별 건수 증가 감지)
-        if webhook_url:
-            # 최신 전체 데이터 다시 읽기
-            new_vals = _retry(ws.get_all_values) or []
-            counter = Counter()
-            if new_vals:
-                hdr = new_vals[0]
-                idx = {h:i for i,h in enumerate(hdr)}
-                for r in new_vals[1:]:
-                    d = {k:(r[i] if i<len(r) else "") for k,i in idx.items()}
-                    ym = ym_of_row(d)
-                    if ym: counter[ym]+=1
-            notify_list = []
-            for ym, cnt in counter.items():
-                prv = prev_counter.get(ym, 0)
-                if cnt > prv:
-                    notify_list.append((ym, prv, cnt))
-            if notify_list:
-                send_webhook(webhook_url, notify_list)
+    # 알림(월별 건수 증가 감지) – 선택적
+    if webhook_url:
+        from collections import Counter
+        new_vals = _retry(ws.get_all_values) or []
+        counter = Counter()
+        if new_vals:
+            hdr = new_vals[0]
+            idx = {h:i for h,i in enumerate(hdr)}
+            def ym_of_row(row):
+                try:
+                    y = int(float(row[idx["계약년"]])) if "계약년" in idx and idx["계약년"]<len(row) else 0
+                    m = int(float(row[idx["계약월"]])) if "계약월" in idx and idx["계약월"]<len(row) else 0
+                    return f"{str(y%100).zfill(2)}/{m}"
+                except Exception:
+                    return ""
+            for r in new_vals[1:]:
+                ym = ym_of_row(r)
+                if ym: counter[ym]+=1
+        # 이전 카운트는 알 수 없으므로, 간단히 최근 달 증가시만 알림 등으로 확장 가능
+        notify_list = [(k, 0, v) for k,v in counter.items()]  # 필요 시 로직 고도화
+        if notify_list:
+            send_webhook(webhook_url, notify_list)
 
 # ------------------ 웹훅 ------------------
 def send_webhook(url: str, notify_list):
@@ -551,7 +533,7 @@ def main():
     log(f"found national files: {len(files)}")
 
     month_cache = {}  # ym -> {counts/med/mean}
-    apgu_df_all = []  # 압구정동 원본 누적 (모든 파일)
+    apgu_df_all = []  # 압구정동 원본 누적
 
     today_label = fmt_date_kor(datetime.now())
     with open(LOG_DIR/"where_written.txt","w",encoding="utf-8") as wf:
@@ -601,7 +583,7 @@ def main():
                 "mean": {col:mean_map.get(col,"") for col in SUMMARY_COLS},
             }
 
-            # 압구정동 원본 누적(후에 한 번에 merge/sort)
+            # 압구정동 원본 누적
             ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
             if not ap.empty:
                 apgu_df_all.append(ap)
@@ -623,7 +605,7 @@ def main():
                 prv["counts"] if prv else None
             )
 
-    # 압구정동: 원본 행 그대로 병합/정렬/중복제거 +(선택)알림
+    # 압구정동: 원본 행 그대로 병합/정렬/중복제거 + 로그 + (선택)알림
     if apgu_df_all:
         ws_ap = ensure_apgu_sheet(sh)
         all_ap = pd.concat(apgu_df_all, ignore_index=True)
