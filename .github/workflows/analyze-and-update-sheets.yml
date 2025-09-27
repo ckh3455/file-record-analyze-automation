@@ -1,9 +1,73 @@
-Run python scripts/analyze_and_update.py \
-  
-Traceback (most recent call last):
-  File "/home/runner/work/file-record-analyze-automation/file-record-analyze-automation/scripts/analyze_and_update.py", line 15, in <module>
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-  File "/opt/hostedtoolcache/Python/3.11.13/x64/lib/python3.11/pathlib.py", line 1116, in mkdir
-    os.mkdir(self, mode)
-FileExistsError: [Errno 17] File exists: 'analyze_report'
-Error: Process completed with exit code 1.
+name: analyze-and-update-sheets
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 매일 KST 10:00 = UTC 01:00
+    - cron: "0 1 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts from ckh3455/file-automation (latest success)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          repo: ckh3455/file-automation
+          workflow: molit.yml
+          workflow_conclusion: success
+          branch: main
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run analysis & update
+        run: |
+          python scripts/analyze_and_update.py \
+            --artifacts-dir artifacts \
+            --sheet-id "$SHEET_ID"
+
+      - name: Preview analyze_report (always)
+        if: always()
+        run: |
+          echo "== analyze_report tree =="
+          ls -alR analyze_report || true
+          echo "---- latest.log (head) ----"
+          sed -n '1,220p' analyze_report/latest.log || true
+          echo "---- run logs list ----"
+          ls -al analyze_report/run-*.log 2>/dev/null || true
+          echo "---- where_written.txt ----"
+          cat analyze_report/where_written.txt 2>/dev/null || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-report
+          path: analyze_report/**
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
