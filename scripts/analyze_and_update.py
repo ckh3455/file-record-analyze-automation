@@ -387,8 +387,8 @@ def number_or_blank(v):
     return v
 
 def upsert_apgu_raw(ws, df_all: pd.DataFrame, webhook_url: str|None):
-    # 압구정동 행만
-    df = df_all[(df_all.get("법정동","")==="압구정동") & (df_all.get("광역","")==="서울특별시")].copy()
+    # 압구정동 행만 (== 로 수정)
+    df = df_all[(df_all.get("법정동","")=="압구정동") & (df_all.get("광역","")=="서울특별시")].copy()
     if df.empty:
         log("[압구정동] no rows in this file")
         return
@@ -602,7 +602,7 @@ def main():
             }
 
             # 압구정동 원본 누적(후에 한 번에 merge/sort)
-            ap = df[(df.get("광역","")==="서울특별시") & (df.get("법정동","")==="압구정동")].copy()
+            ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
             if not ap.empty:
                 apgu_df_all.append(ap)
 
