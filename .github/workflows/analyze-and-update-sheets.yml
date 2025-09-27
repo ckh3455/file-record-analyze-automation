@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 1 * * *"   # 매일 KST 10:00 (UTC 01:00)
-
+    - cron: "0 2 * * *"   # 매일 KST 10:30 (UTC 01:00)
 permissions:
   contents: read
   actions: read
