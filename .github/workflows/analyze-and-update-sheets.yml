@@ -3,8 +3,9 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"   # 매일 KST 10:00 (UTC 01:00)
-    - cron: "0 2 * * *"   # 매일 KST 10:30 (UTC 01:00)
+    # 매일 KST 10:00 == UTC 01:00
+    - cron: "0 1 * * *"
+
 permissions:
   contents: read
   actions: read
@@ -12,14 +13,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
-      TZ: Asia/Seoul
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
-      OUT_DIR: output
 
     steps:
       - name: Checkout
@@ -35,11 +34,6 @@ jobs:
           branch: main
           path: artifacts
 
-      - name: Show artifacts tree
-        run: |
-          echo "== artifacts tree =="
-          ls -alR artifacts || true
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -48,27 +42,21 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl gspread google-auth
-
-      # 혹시 '파일'로 남아 있으면 제거 (폴더 만들 때 충돌 방지)
-      - name: Clean possible file collision
-        run: |
-          rm -f analyze_report
+          pip install -r requirements.txt
 
       - name: Run analysis & update
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
         run: |
-          python scripts/analyze_and_update.py --artifacts-dir artifacts --sheet-id "$SHEET_ID"
+          python scripts/analyze_and_update.py \
+            --artifacts-dir artifacts \
+            --sheet-id "$SHEET_ID"
 
       - name: Preview analyze_report (always)
         if: always()
         run: |
           echo "== analyze_report tree =="
           ls -alR analyze_report || true
-          echo "---- latest.log (tail) ----"
-          tail -n 200 analyze_report/latest.log || true
+          echo "---- latest.log (head) ----"
+          sed -n '1,220p' analyze_report/latest.log || true
           echo "---- run logs list ----"
           ls -al analyze_report/run-*.log 2>/dev/null || true
           echo "---- where_written.txt ----"
