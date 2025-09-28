@@ -20,12 +20,12 @@ SHEET_NAME_DATA = "data"
 SUMMARY_SHEET_NAME = "거래요약"
 APGU_SHEET_NAME = "압구정동"
 
-# 거래요약 고정 열(좌→우)
+# 거래요약 고정 열(좌→우)  ←★ 울산 추가
 SUMMARY_COLS = [
     "전국","서울","강남구","압구정동","경기도","인천광역시","세종시","서초구","송파구","용산구",
     "강동구","성동구","마포구","양천구","동작구","영등포구","종로구","광진구","강서구",
     "강북구","관악구","구로구","금천구","도봉구","동대문구","서대문구","성북구","은평구",
-    "중구","중랑구","부산","대구","광주","대전","강원도","경남","경북","전남","전북","충남","충북","제주"
+    "중구","중랑구","부산","대구","광주","대전","울산","강원도","경남","경북","전남","전북","충남","충북","제주"
 ]
 
 # 파일에 반드시 있어야 하는 열
@@ -61,7 +61,6 @@ HEADER_TO_SUMMARY_KEY = {
     "대전광역시": "대전",
     "울산광역시": "울산",
     "세종특별자치시": "세종시",
-    "울산광역시": "울산",
     "경기도": "경기도",
     "인천광역시": "인천광역시",
     "강원특별자치도": "강원도",
@@ -424,12 +423,14 @@ def write_month_summary(ws, y: int, m: int,
     log(f"[summary] {ym} 예상건수 -> row={r5}")
 
 # ========================= 압구정동(원본 전체 + 1년 변동요약) =========================
-def make_key(d: dict) -> str:
+# 요청: 인덱스까지 포함해 그대로 옮기되, 헤더는 지정 순서 사용
+APGU_TARGET_HEADER = ["기록일", "index", "광역", "구", "법정동", "계약년", "계약월", "계약일", "거래금액(만원)", "", "변경구분"]
+
+def make_key_from_target_row(d: dict) -> str:
+    # 기록일/변경구분/빈칸 제외한 원본 동일성 판정 키
     parts = [
-        d.get("계약년",""), d.get("계약월",""), d.get("계약일",""),
-        d.get("광역",""), d.get("구",""), d.get("법정동",""),
-        d.get("단지명",""), d.get("전용면적(㎡)",""), d.get("층",""),
-        d.get("거래금액(만원)","")
+        d.get("index",""), d.get("광역",""), d.get("구",""), d.get("법정동",""),
+        d.get("계약년",""), d.get("계약월",""), d.get("계약일",""), d.get("거래금액(만원)","")
     ]
     return "|".join(str(x).strip() for x in parts)
 
@@ -443,8 +444,11 @@ def ensure_apgu_sheet(sh: gspread.Spreadsheet) -> gspread.Worksheet:
     if ws: return ws
     return _retry(sh.add_worksheet, title=APGU_SHEET_NAME, rows=8000, cols=80)
 
-def _dict_from_row(row: List[str], idx_map: Dict[str,int]) -> dict:
-    return {k:(row[i] if i<len(row) else "") for k,i in idx_map.items()}
+def _row_to_dict_by_header(row: List[str], header: List[str]) -> dict:
+    out={}
+    for i,h in enumerate(header):
+        out[h] = row[i] if i<len(row) else ""
+    return out
 
 def _row_date_from_dict(d: dict) -> Optional[date]:
     try:
@@ -457,8 +461,12 @@ def _row_date_from_dict(d: dict) -> Optional[date]:
         pass
     return None
 
+def _ensure_rows(ws: gspread.Worksheet, need_end_row: int):
+    if need_end_row > ws.row_count:
+        _retry(ws.add_rows, need_end_row - ws.row_count)
+
 def upsert_apgu_all(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: date):
-    # 1) 압구정동 원본 전부 선별
+    # 1) 압구정동 전체 원본(인덱스 포함) 선별
     cond = (df_all.get("광역","")=="서울특별시") & (df_all.get("법정동","")=="압구정동")
     df = df_all[cond].copy()
     if df.empty:
@@ -469,95 +477,100 @@ def upsert_apgu_all(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: date):
     for c in ["계약년","계약월","계약일"]:
         if c not in df.columns: df[c] = pd.NA
     df = df.sort_values(["계약년","계약월","계약일"], ascending=[True,True,True], kind="mergesort")
+    df_reset = df.reset_index()  # ← index 보존
 
-    # 2) 헤더 준비(원본 열 + '기록일','변경구분')
+    # 2) 헤더 고정 (요청 순서)
     vals = _retry(ws.get_all_values) or []
     if not vals:
-        header = list(df.columns) + ["기록일","변경구분"]
-        _retry(ws.update, [header], "A1")
-        vals = [header]
-    else:
-        header = vals[0]
-        union = list(dict.fromkeys(header + [c for c in df.columns if c not in header]))
-        if "기록일" not in union: union.append("기록일")
-        if "변경구분" not in union: union.append("변경구분")
-        if union != header:
-            _retry(ws.update, [union], "A1")
-            header = union
-            vals = _retry(ws.get_all_values) or [header]
+        _retry(ws.update, [APGU_TARGET_HEADER], "A1")
+        vals = [APGU_TARGET_HEADER]
+    header = vals[0]
 
-    idx_map = {h:i for i,h in enumerate(header)}
+    # 3) 기존 키 수집(중복 방지)
     existing_rows = vals[1:]
-
-    # 3) 시트에 없는 원본행만 "그대로" 추가 (기록일/변경구분은 빈칸)
     existing_keys = set()
     for r in existing_rows:
-        d = _dict_from_row(r, idx_map)
-        existing_keys.add(make_key(d))
+        d = _row_to_dict_by_header(r, header)
+        existing_keys.add(make_key_from_target_row(d))
 
+    # 4) 시트에 없는 원본행만 추가
     to_append = []
-    for _, r in df.iterrows():
-        d = {k:r.get(k,"") for k in header if k in df.columns}
-        k = make_key(d)
+    today_label = fmt_kdate(run_day)
+    for _, r in df_reset.iterrows():
+        d = {
+            "기록일": "",
+            "index": r.get("index",""),
+            "광역": r.get("광역",""),
+            "구": r.get("구",""),
+            "법정동": r.get("법정동",""),
+            "계약년": r.get("계약년",""),
+            "계약월": r.get("계약월",""),
+            "계약일": r.get("계약일",""),
+            "거래금액(만원)": r.get("거래금액(만원)",""),
+            "": "",  # 빈칸
+            "변경구분": ""
+        }
+        k = make_key_from_target_row(d)
         if k in existing_keys:
             continue
-        row = [number_or_blank(r.get(col,"")) for col in header if col not in ("기록일","변경구분")]
-        row += ["", ""]  # 기록일, 변경구분 비움
+        row = [number_or_blank(d[h]) for h in APGU_TARGET_HEADER]
         to_append.append(row)
         existing_keys.add(k)
 
     if to_append:
-        vals2 = _retry(ws.get_all_values) or [header]
-        start = len(vals2) + 1
+        start = len(vals) + 1
         end = start + len(to_append) - 1
-        rng = f"A{start}:{a1_col(len(header))}{end}"
+        _ensure_rows(ws, end)  # ←★ 그리드 확장
+        rng = f"A{start}:{a1_col(len(APGU_TARGET_HEADER))}{end}"
         _retry(ws.update, to_append, rng)
         log(f"[압구정동] appended={len(to_append)}")
 
-    # 4) 최근 1년 변동 요약(신규/삭제) – 맨 마지막에 한 번만
-    # 기간: 오늘-365일 ~ 오늘
-    period_start = run_day - timedelta(days=365)
-    today_label = fmt_kdate(run_day)
-
-    # 최신 시트 값 다시 읽기
+    # 5) 최근 1년 변동 요약(신규/삭제) – 하단에 한 번만 (빨간글씨)
+    # 최신 읽기
     all_vals = _retry(ws.get_all_values) or []
-    if not all_vals:
-        return
     header = all_vals[0]
-    idx_map = {h:i for i,h in enumerate(header)}
     rows_now = all_vals[1:]
 
-    # 파일 측 키(최근1년)
-    file_keys_1y = set()
-    file_rows_1y = {}
-    for _, r in df.iterrows():
-        d = {k:r.get(k,"") for k in header if k in df.columns}
+    # 시트 기준 1년치 키
+    period_start = run_day - timedelta(days=365)
+    sheet_keys_1y = set(); sheet_rows_1y = {}
+    for r in rows_now:
+        d = _row_to_dict_by_header(r, header)
         dt = _row_date_from_dict(d)
         if dt and (period_start <= dt <= run_day):
-            k = make_key(d)
+            k = make_key_from_target_row(d)
+            sheet_keys_1y[k] = None
+            sheet_rows_1y[k] = d
+
+    # 파일 기준 1년치 키
+    file_keys_1y = set(); file_rows_1y = {}
+    for _, r in df_reset.iterrows():
+        d = {
+            "index": r.get("index",""),
+            "광역": r.get("광역",""),
+            "구": r.get("구",""),
+            "법정동": r.get("법정동",""),
+            "계약년": r.get("계약년",""),
+            "계약월": r.get("계약월",""),
+            "계약일": r.get("계약일",""),
+            "거래금액(만원)": r.get("거래금액(만원)",""),
+        }
+        dt = _row_date_from_dict(d)
+        if dt and (period_start <= dt <= run_day):
+            k = make_key_from_target_row(d)
             file_keys_1y.add(k)
             file_rows_1y[k] = d
 
-    # 시트 측 키(최근1년)
-    sheet_keys_1y = set()
-    sheet_rows_1y = {}
-    for r in rows_now:
-        d = _dict_from_row(r, idx_map)
-        dt = _row_date_from_dict(d)
-        if dt and (period_start <= dt <= run_day):
-            k = make_key(d)
-            sheet_keys_1y.add(k)
-            sheet_rows_1y[k] = d
+    added = sorted(list(file_keys_1y - set(sheet_rows_1y.keys())))
+    removed = sorted(list(set(sheet_rows_1y.keys()) - file_keys_1y))
 
-    added_keys = file_keys_1y - sheet_keys_1y
-    removed_keys = sheet_keys_1y - file_keys_1y
-
-    if not added_keys and not removed_keys:
+    if not added and not removed:
         log("[압구정동] 1y changes: none")
         return
 
-    # 변동 요약 블록 만들기
+    today_label = fmt_kdate(run_day)
     def to_change_row(kind: str, d: dict) -> List[str]:
+        # 변동 요약은 요청 포맷(APGU_CHANGE_HEADER)
         return [
             kind, today_label,
             str(d.get("계약년","")), str(d.get("계약월","")), str(d.get("계약일","")),
@@ -566,13 +579,14 @@ def upsert_apgu_all(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: date):
         ]
 
     rows_change = [APGU_CHANGE_HEADER]
-    for k in sorted(added_keys):
+    for k in added:
         rows_change.append(to_change_row("(신규)", file_rows_1y[k]))
-    for k in sorted(removed_keys):
+    for k in removed:
         rows_change.append(to_change_row("(삭제)", sheet_rows_1y[k]))
 
     start = len(all_vals) + 1
     end = start + len(rows_change) - 1
+    _ensure_rows(ws, end)  # ←★ 그리드 확장
     rng = f"A{start}:J{end}"
     _retry(ws.update, rows_change, rng)
 
@@ -587,7 +601,7 @@ def upsert_apgu_all(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: date):
         }
     }
     batch_format(ws, [req])
-    log(f"[압구정동] 1y changes: 신규={len(added_keys)} 삭제={len(removed_keys)}")
+    log(f"[압구정동] 1y changes: 신규={len(added)} 삭제={len(removed)}")
 
 # ========================= 메인 =========================
 def main():
@@ -625,7 +639,7 @@ def main():
 
         counts, med, mean = agg_all_stats(df)
 
-        # 전국/서울 탭 (기존 로직 유지)
+        # 전국/서울 탭 (유지)
         ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1) or []
@@ -689,7 +703,7 @@ def main():
     # 압구정동: 원본 전체 추가 + 1년 변동요약
     if apgu_all:
         ws_ap = ensure_apgu_sheet(sh)
-        all_df = pd.concat(apgu_all, ignore_index=True)
+        all_df = pd.concat(apgu_all, ignore_index=False)  # index 유지
         upsert_apgu_all(ws_ap, all_df, today)
 
     log("[main] logs written to analyze_report/")
