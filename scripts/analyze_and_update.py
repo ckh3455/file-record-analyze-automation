@@ -20,7 +20,8 @@ SUMMARY_COLS = [
     "전국","서울","강남구","압구정동","경기도","인천광역시","세종시","서초구","송파구","용산구",
     "강동구","성동구","마포구","양천구","동작구","영등포구","종로구","광진구","강서구",
     "강북구","관악구","구로구","금천구","도봉구","동대문구","서대문구","성북구","은평구",
-    "중구","중랑구","부산","대구","광주","대전","강원도","경남","경북","전남","전북","충남","충북","제주"
+    "중구","중랑구","노원구",     # ← 노원구 추가
+    "부산","대구","광주","대전","강원도","경남","경북","전남","전북","충남","충북","제주"
 ]
 
 PROV_MAP = {
@@ -33,7 +34,7 @@ PROV_MAP = {
     "대구광역시": "대구",
     "광주광역시": "광주",
     "대전광역시": "대전",
-    "울산광역시": "울산",
+    "울산광역시": "울산",      # 요약표에 울산 열이 없다면 자동으로는 안써짐(원하시면 SUMMARY_COLS에도 추가)
     "전라남도": "전남",
     "전북특별자치도": "전북",
     "경상남도": "경남",
@@ -76,7 +77,6 @@ def log_block(title: str):
 
 # ===================== gspread 헬퍼/리트라이 =====================
 def _retry(fn, *a, **kw):
-    # Read/Write 공통 지수 백오프(조금 더 길게)
     delays = [1.0, 2.0, 4.0, 7.0, 12.0, 18.0]
     last = None
     for i, d in enumerate(delays):
@@ -90,11 +90,10 @@ def _retry(fn, *a, **kw):
     raise last
 
 def _values_batch_update_compat(ws, body: dict):
-    # gspread 6.x / 5.x 호환
     try:
-        return _retry(ws.spreadsheet.values_batch_update, body)   # 6.x
+        return _retry(ws.spreadsheet.values_batch_update, body)   # gspread 6.x
     except TypeError:
-        return _retry(ws.client.values_batch_update, ws.spreadsheet.id, body)  # 5.x
+        return _retry(ws.client.values_batch_update, ws.spreadsheet.id, body)  # gspread 5.x
 
 def batch_values_update(ws, payload: List[Dict]):
     body = {
@@ -109,7 +108,6 @@ def batch_format(ws, requests: List[dict]):
 
 # ===================== 캐시 유틸(읽기 최소화) =====================
 class WorksheetCache:
-    """한 실행 내에서 Worksheet의 값을 한 번만 읽고 재사용."""
     def __init__(self, ws: gspread.Worksheet):
         self.ws = ws
         self._values: Optional[List[List[str]]] = None
@@ -204,7 +202,7 @@ def format_row_bold(ws: gspread.Worksheet, row_idx: int, first_col: int, last_co
                 "startColumnIndex": first_col-1,
                 "endColumnIndex": last_col
             },
-            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}}, 
             "fields": "userEnteredFormat.textFormat.bold"
         }
     }
@@ -320,9 +318,11 @@ def write_counts_to_sheet(ws: gspread.Worksheet, cache: WorksheetCache, write_da
     for name in header_names:
         if name in hmap:
             col = hmap[name]
-            v = int(series_map.get(name, 0) or 0)
+            # 헤더명을 집계키로 변환 (예: '부산광역시' -> '부산')
+            key = PROV_MAP.get(name, name)
+            v = int(series_map.get(key, 0) or 0)
             payload.append({"range": f"{a1_col(col)}{row}", "values": [[v]]})
-            if name != "전국":
+            if key != "전국":
                 total += v
     if sum_col_name in hmap:
         payload.append({"range": f"{a1_col(hmap[sum_col_name])}{row}",
@@ -341,7 +341,6 @@ def parse_file_meta(p: Path):
     return 2000+yy, mm
 
 def build_summary_index(cache: WorksheetCache) -> Dict[Tuple[str,str], int]:
-    """(년월,구분) -> rowIdx 캐시"""
     idx = {}
     vals = cache.values()
     for i, r in enumerate(vals[1:], start=2):
@@ -359,12 +358,10 @@ def ensure_summary_row(ws: gspread.Worksheet, cache: WorksheetCache,
         cache.invalidate()
         vals = cache.values()
 
-    # 캐시 인덱스에서 먼저 찾기
     idx_map = build_summary_index(cache)
     if (ym_label, what) in idx_map:
         return idx_map[(ym_label, what)]
 
-    # 없으면 맨 아래에 한 번만 쓰기(읽기 없이)
     row = cache.row_count() + 1
     _retry(ws.update, [[ym_label, what]], f"A{row}:B{row}", value_input_option="USER_ENTERED")
     cache.invalidate()
@@ -456,7 +453,6 @@ def number_or_blank(v):
     return v
 
 def append_change_log(ws: gspread.Worksheet, added_rows: list[list], removed_rows: list[list], header: list[str]):
-    # 맨 아래에 빨간 글자로 변동 기록
     all_vals = _retry(ws.get_all_values) or []
     start = len(all_vals) + 1
     now_label = fmt_date_kor(datetime.now())
@@ -628,14 +624,24 @@ def main():
         if ws_nat:
             cache_nat = WorksheetCache(ws_nat)
             header_nat = cache_nat.header()
-            nat_cols = [c for c in header_nat if (c in PROV_MAP.values()) or c=="전국"]
+            # 헤더가 PROV_MAP의 "키(원명)" 또는 "값(약칭)"이면 모두 포함 + '전국'
+            nat_cols = []
+            for c in header_nat:
+                if c == "전국":
+                    nat_cols.append(c)
+                elif c in PROV_MAP or c in PROV_MAP.values():
+                    nat_cols.append(c)
             write_counts_to_sheet(ws_nat, cache_nat, write_date, nat_cols, counts, sum_col_name="총합계")
             log(f"[전국] {ws_nat.title} -> {fmt_date_kor(write_date)}")
 
         if ws_se:
             cache_se = WorksheetCache(ws_se)
             header_se = cache_se.header()
-            se_cols = [c for c in header_se if (c in SUMMARY_COLS) or c=="서울"]
+            # 서울 탭은 SUMMARY_COLS(구들) 기준으로 기록 + '서울'
+            se_cols = []
+            for c in header_se:
+                if c == "서울" or c in SUMMARY_COLS:
+                    se_cols.append(c)
             write_counts_to_sheet(ws_se, cache_se, write_date, se_cols, counts, sum_col_name="총합계")
             log(f"[서울] {ws_se.title} -> {fmt_date_kor(write_date)}")
 
@@ -647,7 +653,6 @@ def main():
     ws_sum = ensure_ws_exists(sh, SUMMARY_SHEET_NAME)
     if ws_sum:
         cache_sum = WorksheetCache(ws_sum)
-        # 헤더 없으면 생성(읽기 0→쓰기 1회)
         if not cache_sum.values():
             _retry(ws_sum.update, [["년월","구분"] + SUMMARY_COLS], "A1")
             cache_sum.invalidate()
