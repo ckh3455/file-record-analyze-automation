@@ -22,11 +22,9 @@ SUMMARY_SHEET_NAME = "거래요약"
 SUMMARY_COLS = [
     "전국","서울",
     "강남구","압구정동",
-    "경기도","인천광역시","세종시","울산",
+    "경기도","인천광역시","세종시","울산",   # ← 울산 포함
     "서초구","송파구","용산구","강동구","성동구","마포구","양천구","동작구","영등포구","종로구","광진구",
-    "강서구","강북구","관악구","구로구","금천구","도봉구",
-    "노원구",                      # 노원구 포함
-    "동대문구","서대문구","성북구","은평구","중구","중랑구",
+    "강서구","강북구","관악구","구로구","금천구","도봉구","동대문구","서대문구","성북구","은평구","중구","중랑구",
     "부산","대구","광주","대전","강원도","경남","경북","전남","전북","충남","충북","제주"
 ]
 
@@ -41,7 +39,7 @@ PROV_MAP = {
     "대구광역시":"대구",
     "광주광역시":"광주",
     "대전광역시":"대전",
-    "울산광역시":"울산",
+    "울산광역시":"울산",                    # ← 울산 매핑
     "전라남도":"전남",
     "전북특별자치도":"전북",
     "경상남도":"경남",
@@ -58,24 +56,6 @@ APGU_BASE_COLS = [
     "매수자","매도자","건축년도","도로명","해제사유발생일","거래유형",
     "중개사소재지","등기일자","주택유형"
 ]
-
-# ===================== 이름 정규화/별칭 =====================
-def _norm_name(s: str) -> str:
-    """헤더명/구명 등에서 공백류 제거한 표준 key"""
-    return re.sub(r"\s+", "", str(s or "").strip())
-
-# 시트 헤더 → 집계 key 별칭(강원/전북 등 행정명칭 이슈 보정)
-HEADER_ALIAS = {
-    _norm_name("강원특별자치도"): "강원도",
-    _norm_name("강원도"): "강원도",
-    _norm_name("전북특별자치도"): "전북",
-    _norm_name("전라북도"): "전북",
-    _norm_name("울산광역시"): "울산",
-    # 필요시 추가
-}
-def _canon_header_key(h: str) -> str:
-    n = _norm_name(h)
-    return HEADER_ALIAS.get(n, n)
 
 # ===================== 로깅/리트라이 =====================
 def _ensure_logdir():
@@ -194,18 +174,15 @@ def agg_all_stats(df: pd.DataFrame):
         if not s.empty:
             med["서울"] = round2(s.median())
             mean["서울"] = round2(s.mean())
-
     if "구" in seoul.columns:
-        # ★ 구 이름 정규화(공백 제거)로 누락 방지 (노원구 포함)
-        seoul = seoul.assign(__구정규__=seoul["구"].map(lambda x: _norm_name(str(x))))
-        for gu, sub in seoul.groupby("__구정규__"):
+        for gu, sub in seoul.groupby("구"):
+            gu = str(gu)
             if gu in counts:
                 counts[gu] += int(len(sub))
                 s = eok_series(sub["거래금액(만원)"])
                 if not s.empty:
                     med[gu] = round2(s.median())
                     mean[gu] = round2(s.mean())
-
     ap = seoul[seoul.get("법정동","")=="압구정동"]
     counts["압구정동"] = int(len(ap))
     if len(ap)>0:
@@ -252,7 +229,7 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
 
 # ===================== 거래요약 =====================
 def ym_from_filename(fname: str):
-    # '전국 2509_250928.xlsx' → ('전국 20YY년 M월','서울 20YY년 M월','YY/M')
+    # '전국 2509_250928.xlsx' → ('전국 25년 9월','서울 25년 9월','25/9')
     m = re.search(r"(\d{2})(\d{2})_", fname)
     if not m: return None, None, None
     yy, mm = m.group(1), int(m.group(2))
@@ -519,13 +496,11 @@ def main():
             header_nat = _retry(ws_nat.row_values, 1)
             values_nat = {}
             for h in header_nat:
-                if not h or h=="날짜": 
-                    continue
+                if not h or h=="날짜": continue
                 if h=="총합계":
                     values_nat[h] = int(counts.get("전국",0))
                 else:
-                    key = _canon_header_key(h)  # 헤더명 정규화/별칭
-                    values_nat[h] = int(counts.get(key,0))
+                    values_nat[h] = int(counts.get(h,0))
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
         ws_se = fuzzy_ws(sh, se_title)
@@ -533,13 +508,11 @@ def main():
             header_se = _retry(ws_se.row_values, 1)
             values_se = {}
             for h in header_se:
-                if not h or h=="날짜": 
-                    continue
+                if not h or h=="날짜": continue
                 if h=="총합계":
                     values_se[h] = int(counts.get("서울",0))
                 else:
-                    key = _canon_header_key(h)  # 헤더명 정규화/별칭
-                    values_se[h] = int(counts.get(key,0))
+                    values_se[h] = int(counts.get(h,0))
             write_month_sheet(ws_se, today_label, header_se, values_se)
 
         # 압구정동 원본 누적
