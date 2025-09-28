@@ -25,7 +25,7 @@ SUMMARY_COLS = [
     "경기도","인천광역시","세종시","울산",
     "서초구","송파구","용산구","강동구","성동구","마포구","양천구","동작구","영등포구","종로구","광진구",
     "강서구","강북구","관악구","구로구","금천구","도봉구",
-    "노원구",                      # 노원구 포함
+    "노원구",
     "동대문구","서대문구","성북구","은평구","중구","중랑구",
     "부산","대구","광주","대전","강원도","경남","경북","전남","전북","충남","충북","제주"
 ]
@@ -60,18 +60,28 @@ APGU_BASE_COLS = [
 ]
 
 # ===================== 이름 정규화/별칭 =====================
-def _norm_name(s: str) -> str:
-    """헤더명/구명 등에서 공백류 제거한 표준 key"""
-    return re.sub(r"\s+", "", str(s or "").strip())
+ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\ufeff"}
 
-# 시트 헤더 → 집계 key 별칭(강원/전북 등 행정명칭 이슈 보정)
+def _norm_name(s: str) -> str:
+    """모든 유니코드 공백과 제로-폭 문자를 제거해 안정적인 키 생성"""
+    if s is None:
+        return ""
+    s = str(s)
+    # 제로-폭 제거
+    for zw in ZERO_WIDTH:
+        s = s.replace(zw, "")
+    # 모든 공백류 제거(isspace() 기반)
+    s = "".join(ch for ch in s if not ch.isspace())
+    return s.strip()
+
+# 시트 헤더 → 집계 key 별칭(강원/전북/울산 등 행정명칭 이슈 보정)
 HEADER_ALIAS = {
     _norm_name("강원특별자치도"): "강원도",
     _norm_name("강원도"): "강원도",
     _norm_name("전북특별자치도"): "전북",
     _norm_name("전라북도"): "전북",
     _norm_name("울산광역시"): "울산",
-    # 필요시 추가
+    # 필요시 확장 가능
 }
 def _canon_header_key(h: str) -> str:
     n = _norm_name(h)
@@ -196,15 +206,21 @@ def agg_all_stats(df: pd.DataFrame):
             mean["서울"] = round2(s.mean())
 
     if "구" in seoul.columns:
-        # ★ 구 이름 정규화(공백 제거)로 누락 방지 (노원구 포함)
-        seoul = seoul.assign(__구정규__=seoul["구"].map(lambda x: _norm_name(str(x))))
-        for gu, sub in seoul.groupby("__구정규__"):
-            if gu in counts:
-                counts[gu] += int(len(sub))
-                s = eok_series(sub["거래금액(만원)"])
-                if not s.empty:
-                    med[gu] = round2(s.median())
-                    mean[gu] = round2(s.mean())
+        # ★ 자치구 이름을 강력 정규화(모든 공백/제로폭 제거)
+        seoul = seoul.assign(__구정규__=seoul["구"].map(_norm_name))
+        for gu_norm, sub in seoul.groupby("__구정규__"):
+            # counts 키도 정규화 비교를 위해 한번 더 정규화 맵 구성
+            if gu_norm in { _norm_name(k): None for k in counts }.keys():
+                # 실제 표기(예: '노원구') 키로 합산하기 위해 역매핑
+                # 동일 정규화 값을 갖는 counts 키 탐색
+                for k in counts.keys():
+                    if _norm_name(k) == gu_norm:
+                        counts[k] += int(len(sub))
+                        s = eok_series(sub["거래금액(만원)"])
+                        if not s.empty:
+                            med[k] = round2(s.median())
+                            mean[k] = round2(s.mean())
+                        break
 
     ap = seoul[seoul.get("법정동","")=="압구정동"]
     counts["압구정동"] = int(len(ap))
