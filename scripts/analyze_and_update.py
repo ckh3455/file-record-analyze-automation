@@ -1,7 +1,7 @@
 # scripts/analyze_and_update.py
 # -*- coding: utf-8 -*-
 
-import os, re, json, time, math, unicodedata
+import os, re, json, time, math
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
@@ -74,7 +74,7 @@ def log(msg: str):
 def log_block(title: str):
     log(f"[{title.upper()}]")
 
-# ===================== gspread 헬퍼/리트라이 =====================
+# ===================== gspread 리트라이/배치 =====================
 def _retry(fn, *a, **kw):
     # Read/Write 공통 지수 백오프
     delays = [1.0, 2.0, 4.0, 7.0, 12.0, 18.0]
@@ -94,14 +94,31 @@ def _values_batch_update_compat(ws, body: dict):
     try:
         return _retry(ws.spreadsheet.values_batch_update, body)   # 6.x
     except TypeError:
-        return _retry(ws.client.values_batch_update, ws.spreadsheet.id, body)  # 5.x
+        return _retry(ws.client.values_batch_update, ws.spreadsheet.id, body=body)  # 5.x
 
-def batch_values_update(ws, payload: List[Dict]):
+def safe_batch_values_update(ws, payload, *, max_tries=6):
+    """
+    values.batchUpdate를 1회로 보내되, 429가 뜨면 길게 쉬고 재시도.
+    payload: [{"range": "A1", "values": [[...]]}, ...]
+    """
     body = {
         "valueInputOption": "USER_ENTERED",
         "data": [{"range": p["range"], "values": p["values"]} for p in payload],
     }
-    _values_batch_update_compat(ws, body)
+    delay = 5
+    for _ in range(max_tries):
+        try:
+            try:
+                return _retry(ws.spreadsheet.values_batch_update, body)   # 6.x
+            except TypeError:
+                return _retry(ws.client.values_batch_update, ws.spreadsheet.id, body=body)  # 5.x
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg:
+                time.sleep(min(65, delay))
+                delay = int(delay * 1.8) + 5
+                continue
+            raise
 
 def batch_format(ws, requests: List[dict]):
     if not requests: return
@@ -229,14 +246,6 @@ def color_cells_batch(ws: gspread.Worksheet, row: int, col_rgb_list: List[Tuple[
         })
     batch_format(ws, reqs)
 
-# ===================== 문자열 정규화(중복행 방지) =====================
-def _norm_txt(s: str) -> str:
-    if s is None: return ""
-    t = unicodedata.normalize("NFC", str(s))
-    t = t.replace("\u00A0", " ")
-    t = re.sub(r"\s+", "", t)
-    return t
-
 # ===================== 엑셀 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="data")
@@ -336,7 +345,7 @@ def write_counts_to_sheet(ws: gspread.Worksheet, cache: WorksheetCache, write_da
         payload.append({"range": f"{a1_col(hmap[sum_col_name])}{row}",
                         "values": [[series_map.get('전국', total)]]})
     if payload:
-        batch_values_update(ws, payload)
+        safe_batch_values_update(ws, payload)
         cache.invalidate()
 
 # ===================== 거래요약 탭 =====================
@@ -349,15 +358,13 @@ def parse_file_meta(p: Path):
     return 2000+yy, mm
 
 def build_summary_index(cache: WorksheetCache) -> Dict[Tuple[str,str], int]:
-    """정규화된 (년월,구분) -> '가장 위에 있는' rowIdx"""
-    idx: Dict[Tuple[str,str], int] = {}
+    """(년월,구분) -> rowIdx 캐시"""
+    idx = {}
     vals = cache.values()
     for i, r in enumerate(vals[1:], start=2):
-        ym_raw = (r[0] if len(r)>0 else "").strip()
-        lb_raw = (r[1] if len(r)>1 else "").strip()
-        ym = _norm_txt(ym_raw)
-        lb = _norm_txt(lb_raw)
-        if ym and lb and (ym, lb) not in idx:
+        ym = (r[0] if len(r)>0 else "").strip()
+        lb = (r[1] if len(r)>1 else "").strip()
+        if ym and lb:
             idx[(ym, lb)] = i
     return idx
 
@@ -369,71 +376,41 @@ def ensure_summary_row(ws: gspread.Worksheet, cache: WorksheetCache,
         cache.invalidate()
         vals = cache.values()
 
-    ym_key = _norm_txt(ym_label)
-    what_key = _norm_txt(what)
-
     idx_map = build_summary_index(cache)
-    if (ym_key, what_key) in idx_map:
-        return idx_map[(ym_key, what_key)]
-
-    # 혹시 중복행이 있다면 정리(맨 위만 남김)
-    dup_rows = []
-    for i, r in enumerate(cache.values()[1:], start=2):
-        if _norm_txt(r[0] if len(r)>0 else "") == ym_key and _norm_txt(r[1] if len(r)>1 else "") == what_key:
-            dup_rows.append(i)
-    if len(dup_rows) > 1:
-        reqs = []
-        for rr in sorted(dup_rows[1:], reverse=True):
-            reqs.append({"deleteDimension": {
-                "range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": rr-1, "endIndex": rr}
-            }})
-        if reqs:
-            batch_format(ws, reqs)
-            cache.invalidate()
-        idx_map = build_summary_index(cache)
-        if (ym_key, what_key) in idx_map:
-            return idx_map[(ym_key, what_key)]
+    if (ym_label, what) in idx_map:
+        return idx_map[(ym_label, what)]
 
     row = cache.row_count() + 1
     _retry(ws.update, [[ym_label, what]], f"A{row}:B{row}", value_input_option="USER_ENTERED")
     cache.invalidate()
     return row
 
-def put_summary_line(ws: gspread.Worksheet, cache: WorksheetCache,
-                     row_idx: int, line_map: dict):
-    header = cache.header()
-    hmap = {h: i+1 for i,h in enumerate(header)}
-    payload = []
-    for col_name in SUMMARY_COLS:
-        if col_name in hmap:
-            col = hmap[col_name]
-            payload.append({"range": f"{a1_col(col)}{row_idx}",
-                            "values": [[line_map.get(col_name, "")]]})
-    if payload:
-        batch_values_update(ws, payload)
-        cache.invalidate()
-
 def write_month_summary(ws: gspread.Worksheet, cache: WorksheetCache,
                         y: int, m: int, counts: dict, med: dict, mean: dict,
                         prev_counts: Optional[dict]):
+
     ym_label = f"{str(y%100).zfill(2)}/{m}"
 
+    # 각 라인의 행번호 확보(필요하면 생성)
     r1 = ensure_summary_row(ws, cache, ym_label, "거래건수")
-    put_summary_line(ws, cache, r1, counts)
-    header = cache.header()
-    if header:
-        format_row_bold(ws, r1, 3, len(header))
-    log(f"[summary] {ym_label} 거래건수 -> row={r1}")
-
     r2 = ensure_summary_row(ws, cache, ym_label, "중앙값(단위:억)")
-    put_summary_line(ws, cache, r2, med)
-    log(f"[summary] {ym_label} 중앙값 -> row={r2}")
-
     r3 = ensure_summary_row(ws, cache, ym_label, "평균가(단위:억)")
-    put_summary_line(ws, cache, r3, mean)
-    log(f"[summary] {ym_label} 평균가 -> row={r3}")
-
     r4 = ensure_summary_row(ws, cache, ym_label, "전월대비 건수증감")
+    r5 = ensure_summary_row(ws, cache, ym_label, "예상건수")
+
+    header = cache.header()
+    hmap = {h: i+1 for i,h in enumerate(header)}
+
+    def line_to_payload(row_idx: int, data_map: dict):
+        items = []
+        for col_name in SUMMARY_COLS:
+            if col_name in hmap:
+                col = hmap[col_name]
+                items.append({"range": f"{a1_col(col)}{row_idx}",
+                              "values": [[data_map.get(col_name, "")]]})
+        return items
+
+    # 전월대비 계산(문자 +/– 부호 포함)
     diff_line = {}
     if prev_counts:
         for k in SUMMARY_COLS:
@@ -444,21 +421,62 @@ def write_month_summary(ws: gspread.Worksheet, cache: WorksheetCache,
     else:
         for k in SUMMARY_COLS:
             diff_line[k] = ""
-    put_summary_line(ws, cache, r4, diff_line)
 
-    header_map = {h: i+1 for i,h in enumerate(cache.header())}
-    jobs = []
-    for k,v in diff_line.items():
-        if k in header_map and v not in ("", "0"):
-            col = header_map[k]
+    # === 한 번의 values.batchUpdate로 합치기 ===
+    payload = []
+    payload += line_to_payload(r1, counts)
+    payload += line_to_payload(r2, med)
+    payload += line_to_payload(r3, mean)
+    payload += line_to_payload(r4, diff_line)
+    if payload:
+        safe_batch_values_update(ws, payload)
+        cache.invalidate()
+
+    # === 포맷도 한 번으로 묶기 ===
+    fmt_reqs = []
+    if header:
+        fmt_reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": r1-1, "endRowIndex": r1,
+                    "startColumnIndex": 2, "endColumnIndex": len(header)
+                },
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                "fields": "userEnteredFormat.textFormat.bold"
+            }
+        })
+
+    color_specs = []
+    for k, v in diff_line.items():
+        if k in hmap and v not in ("", "0"):
+            col = hmap[k]
             if v.startswith("+"):
-                jobs.append((col, (0.0, 0.35, 1.0)))  # 파랑
+                color_specs.append((col, (0.0, 0.35, 1.0)))  # 파랑
             elif v.startswith("-"):
-                jobs.append((col, (1.0, 0.0, 0.0)))  # 빨강
-    color_cells_batch(ws, r4, jobs)
-    log(f"[summary] {ym_label} 전월대비 -> row={r4}")
+                color_specs.append((col, (1.0, 0.0, 0.0)))   # 빨강
+    for col, (r, g, b) in color_specs:
+        fmt_reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": r4-1, "endRowIndex": r4,
+                    "startColumnIndex": col-1, "endColumnIndex": col
+                },
+                "cell": {"userEnteredFormat": {
+                    "textFormat": {"foregroundColor": {"red": r, "green": g, "blue": b}}
+                }},
+                "fields": "userEnteredFormat.textFormat.foregroundColor"
+            }
+        })
 
-    r5 = ensure_summary_row(ws, cache, ym_label, "예상건수")
+    if fmt_reqs:
+        batch_format(ws, fmt_reqs)
+
+    log(f"[summary] {ym_label} 거래건수 -> row={r1}")
+    log(f"[summary] {ym_label} 중앙값 -> row={r2}")
+    log(f"[summary] {ym_label} 평균가 -> row={r3}")
+    log(f"[summary] {ym_label} 전월대비 -> row={r4}")
     log(f"[summary] {ym_label} 예상건수 -> row={r5}")
 
 # ===================== 압구정동 탭 (원본 누적 + 변경 로그) =====================
@@ -655,6 +673,7 @@ def main():
         if ws_nat:
             cache_nat = WorksheetCache(ws_nat)
             header_nat = cache_nat.header()
+            # 전국 탭은 광역 단위(표준화 이름) + '전국'
             nat_cols = [c for c in header_nat if (c in PROV_MAP.values()) or c=="전국"]
             write_counts_to_sheet(ws_nat, cache_nat, write_date, nat_cols, counts, sum_col_name="총합계")
             log(f"[전국] {ws_nat.title} -> {fmt_date_kor(write_date)}")
@@ -662,6 +681,7 @@ def main():
         if ws_se:
             cache_se = WorksheetCache(ws_se)
             header_se = cache_se.header()
+            # 서울 탭은 SUMMARY_COLS 중 해당 열이 존재하는 것만
             se_cols = [c for c in header_se if (c in SUMMARY_COLS) or c=="서울"]
             write_counts_to_sheet(ws_se, cache_se, write_date, se_cols, counts, sum_col_name="총합계")
             log(f"[서울] {ws_se.title} -> {fmt_date_kor(write_date)}")
@@ -670,7 +690,9 @@ def main():
         if not ap.empty:
             apgu_all.append(ap)
 
-    # 거래요약
+        time.sleep(0.2)  # 탭 간 약간의 완충
+
+    # 거래요약: 읽기 1회 캐시 → 모든 월 처리(월 사이 1.2초)
     ws_sum = ensure_ws_exists(sh, SUMMARY_SHEET_NAME)
     if ws_sum:
         cache_sum = WorksheetCache(ws_sum)
@@ -682,9 +704,8 @@ def main():
             prev = month_cache.get((y, m-1)) if m>1 else month_cache.get((y-1, 12))
             prev_counts = prev["counts"] if prev else None
             write_month_summary(ws_sum, cache_sum, y, m, cur["counts"], cur["med"], cur["mean"], prev_counts)
-            time.sleep(0.5)  # API 부하 분산
+            time.sleep(1.2)
 
-    # 압구정동
     if apgu_all:
         ws_ap = ensure_apgu_sheet(sh)
         all_df = pd.concat(apgu_all, ignore_index=True)
