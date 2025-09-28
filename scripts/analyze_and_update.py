@@ -97,7 +97,7 @@ def _retry(fn, *a, **kw):
                 continue
             raise
 
-# ===================== 정규화/키 유틸 =====================
+# ===================== 정규화 =====================
 ZERO_WIDTH = "".join(chr(c) for c in [0x200B,0x200C,0x200D,0xFEFF])
 
 def normalize_key(s: str) -> str:
@@ -175,7 +175,7 @@ def agg_all_stats(df: pd.DataFrame):
                     med[prov_std] = round2(s.median())
                     mean[prov_std] = round2(s.mean())
 
-    seoul = df[df.get("광역","")=="서울특별시"].copy()
+    seoul = df[normalize_key(df.get("광역","")) == normalize_key("서울특별시")].copy()
     counts["서울"] = int(len(seoul))
     if len(seoul)>0:
         s = eok_series(seoul["거래금액(만원)"])
@@ -183,18 +183,23 @@ def agg_all_stats(df: pd.DataFrame):
             med["서울"] = round2(s.median())
             mean["서울"] = round2(s.mean())
 
-    # 자치구/압구정동(요약용만 유지)
+    # 자치구/압구정동(요약용)
     if "구" in seoul.columns:
-        for gu, sub in seoul.groupby("구"):
-            gu = str(gu)
-            if gu in counts:
-                counts[gu] += int(len(sub))
+        seoul["_gu_key_"] = seoul["구"].map(normalize_key)
+        for gu_key, sub in seoul.groupby("_gu_key_"):
+            gu_name = None
+            # SUMMARY_COLS에 존재하는 한글 구명과 키를 매칭
+            for name in SUMMARY_COLS:
+                if name.endswith("구") and normalize_key(name) == gu_key:
+                    gu_name = name; break
+            if gu_name:
+                counts[gu_name] += int(len(sub))
                 s = eok_series(sub["거래금액(만원)"])
                 if not s.empty:
-                    med[gu] = round2(s.median())
-                    mean[gu] = round2(s.mean())
+                    med[gu_name] = round2(s.median())
+                    mean[gu_name] = round2(s.mean())
 
-    ap = seoul[seoul.get("법정동","")=="압구정동"]
+    ap = seoul[normalize_key(seoul.get("법정동","")) == normalize_key("압구정동")]
     counts["압구정동"] = int(len(ap))
     if len(ap)>0:
         s = eok_series(ap["거래금액(만원)"])
@@ -226,19 +231,19 @@ def build_header_key_map(header: List[str]) -> Dict[str, int]:
 
 def seoul_counts_for_headers(df: pd.DataFrame, header: List[str]) -> Dict[int, int]:
     """
-    시트의 헤더(구명)를 정규화 키로 바꾼 뒤,
-    df에서 '구'를 동일 방식으로 정규화하여 각 헤더별로 직접 카운트.
-    반환: {열index(1-based) -> count}
+    서울 행만 정규화로 필터 + '구'도 정규화해서
+    '헤더에 있는 구'만 정확히 카운트.
     """
     out: Dict[int,int] = {}
     if df.empty or "구" not in df.columns:
         return out
-    se = df[df.get("광역","")=="서울특별시"].copy()
+
+    se = df[normalize_key(df.get("광역","")) == normalize_key("서울특별시")].copy()
     if se.empty:
         return out
+
     se["_gu_key_"] = se["구"].map(normalize_key)
 
-    # 헤더를 돌며 필요한 구만 정확히 집계
     for i, h in enumerate(header, start=1):
         if i == 1:
             continue
@@ -277,14 +282,12 @@ def write_month_sheet_seoul(ws, date_label: str, df: pd.DataFrame):
         return
     hkey_map = build_header_key_map(header)
 
-    # 헤더별로 직접 카운트(노원구 포함 25개 완전 커버)
     by_col = seoul_counts_for_headers(df, header)
 
     row_idx = find_or_append_date_row(ws, date_label)
     payload = [{"range": f"A{row_idx}", "values": [[date_label]]}]
 
     total = 0
-    # 헤더 순회하며 구 칸 채우기
     for i, h in enumerate(header, start=1):
         if i == 1:
             continue
@@ -295,7 +298,6 @@ def write_month_sheet_seoul(ws, date_label: str, df: pd.DataFrame):
         payload.append({"range": f"{a1_col(i)}{row_idx}", "values": [[val]]})
         total += val
 
-    # 총합계는 ‘기존 열’에만 채움(열 추가/이동 절대 없음)
     for cand in ("총합계","합계","전체개수"):
         nk = normalize_key(cand)
         col = hkey_map.get(nk)
@@ -422,7 +424,7 @@ def fmt_kdate(d: date) -> str:
     return f"{d.year}. {d.month}. {d.day}"
 
 def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: date):
-    df = df_all[df_all.get("법정동","")=="압구정동"].copy()
+    df = df_all[normalize_key(df_all.get("법정동","")) == normalize_key("압구정동")].copy()
     if df.empty:
         log("[압구정동] no rows")
         return
@@ -573,7 +575,8 @@ def main():
         if ws_se:
             write_month_sheet_seoul(ws_se, today_label, df)
 
-        ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
+        ap = df[(normalize_key(df.get("광역","")) == normalize_key("서울특별시")) &
+                (normalize_key(df.get("법정동","")) == normalize_key("압구정동"))].copy()
         if not ap.empty:
             apgu_all.append(ap)
 
