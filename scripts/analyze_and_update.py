@@ -430,7 +430,7 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     _ensure_rows(ws, end_chg)
     _retry(ws.update, change_rows, f"A{start_chg}:{a1_col(len(change_header))}{end_chg}")
 
-        req = {
+    req = {
         "repeatCell": {
             "range": {
                 "sheetId": ws.id,
