@@ -74,27 +74,19 @@ def note_written(sheet_title: str, sheet_id: int, dst_range: str):
         pass
 
 # ---------------- 공통 유틸 ----------------
-def norm_soft(s: str) -> str:
-    if s is None: return ""
-    return str(s).replace("\u00A0","").strip()
-
 def norm_nospace(s: str) -> str:
-    return norm_soft(s).replace(" ", "")
+    return "" if s is None else str(s).replace("\u00A0","").replace(" ", "").strip()
 
 def kdate_str(d: date) -> str:
     return f"{d.year}. {d.month}. {d.day}"
 
-def parse_filename(fname: str) -> Tuple[int,int,str,str,str]:
-    # '전국 2509_250928.xlsx' → (2025, 9, '전국 25년 9월', '서울 25년 9월', '25/9')
+def parse_filename(fname: str) -> Tuple[int,int,int]:
+    # '전국 2509_250929.xlsx' → (y_full=2025, m=9, yy=25)
     m = re.search(r"(\d{2})(\d{2})_", fname)
     if not m:
         raise ValueError(f"unexpected filename: {fname}")
     yy = int(m.group(1)); mm = int(m.group(2))
-    y_full = 2000 + yy
-    nat_title = f"전국 {y_full}년 {mm}월"
-    se_title  = f"서울 {y_full}년 {mm}월"
-    ym = f"{yy}/{mm}"
-    return y_full, mm, nat_title, se_title, ym
+    return 2000 + yy, mm, yy
 
 # ---------------- gspread 도우미 ----------------
 _LAST_TS = 0.0
@@ -118,18 +110,30 @@ def _retry(fn, *a, **kw):
                 continue
             raise
 
-def find_ws(st: gspread.Spreadsheet, want: str) -> Optional[gspread.Worksheet]:
-    # 1) 정확 일치
+def _find_ws_exact(st: gspread.Spreadsheet, title: str) -> Optional[gspread.Worksheet]:
     for ws in st.worksheets():
-        if ws.title == want:
+        if ws.title == title:
             log(f"[ws] matched (exact): '{ws.title}'")
             return ws
-    # 2) 공백 제거 정규화 매칭
-    want_ns = norm_nospace(want)
+    return None
+
+def _find_ws_nospace(st: gspread.Spreadsheet, title: str) -> Optional[gspread.Worksheet]:
+    want = norm_nospace(title)
     for ws in st.worksheets():
-        if norm_nospace(ws.title) == want_ns:
-            log(f"[ws] matched (nospace): '{ws.title}' (wanted='{want}')")
+        if norm_nospace(ws.title) == want:
+            log(f"[ws] matched (nospace): '{ws.title}' (wanted='{title}')")
             return ws
+    return None
+
+def find_ws_multi(st: gspread.Spreadsheet, candidates: List[str]) -> Optional[gspread.Worksheet]:
+    # 1) 정확 일치 후보들
+    for t in candidates:
+        ws = _find_ws_exact(st, t)
+        if ws: return ws
+    # 2) 공백 제거 비교
+    for t in candidates:
+        ws = _find_ws_nospace(st, t)
+        if ws: return ws
     return None
 
 def a1_col(idx: int) -> str:
@@ -148,7 +152,6 @@ def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
 def read_month_df(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name=SHEET_NAME_DATA, dtype=str)
     df = df.fillna("")
-    # 필요한 숫자형
     for c in ["계약년","계약월","계약일","거래금액(만원)"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -167,10 +170,9 @@ def agg_seoul(df: pd.DataFrame) -> Dict[str,int]:
     if "광역" not in df.columns or "구" not in df.columns:
         return {}
     se = df[df["광역"] == "서울특별시"]
-    # 구 이름을 그냥 있는 그대로 사용(시트 헤더와 동일해야 함)
     s = se["구"].groupby(se["구"]).size().astype(int)
-    out = {g:int(s.get(g,0)) for g in SEOUL_GU}  # 누락 방지: 없으면 0
-    # 디버그 (노원구 확인)
+    # 누락 방지: 헤더 기준으로 모두 채우고, 없으면 0
+    out = {g:int(s.get(g,0)) for g in SEOUL_GU}
     log(f"[agg/seoul] nowon_present={'노원구' in s.index} value={int(s.get('노원구',0))}")
     return out
 
@@ -195,7 +197,6 @@ def write_month_sheet(ws: gspread.Worksheet, date_label: str, header: List[str],
         v = int(values_by_colname.get(h, 0))
         payload.append({"range": f"{a1_col(hmap[h])}{row_idx}", "values": [[v]]})
         total += v
-    # 총합계 열 보정
     if "총합계" in hmap:
         payload.append({"range": f"{a1_col(hmap['총합계'])}{row_idx}", "values": [[total]]})
     values_batch_update(ws, payload)
@@ -235,9 +236,9 @@ def main():
     sh = gc.open_by_key(os.environ.get("SHEET_ID","").strip())
     log("[gspread] spreadsheet opened")
 
-    # 오늘(한국시간) 날짜로만 기록
-    today_kst = datetime.now().date()
-    date_label = kdate_str(today_kst)
+    # 오늘(한국시간) 날짜로 기록
+    today = datetime.now().date()
+    date_label = kdate_str(today)
     log(f"[date] using today (KST) = {date_label}")
 
     # 파일 수집
@@ -246,41 +247,57 @@ def main():
 
     for p in paths:
         try:
-            y, m, nat_title, se_title, ym = parse_filename(p.name)
-            log(f"[file] {p.name} -> nat='{nat_title}' / seoul='{se_title}' / ym={ym}")
+            y_full, mm, yy = parse_filename(p.name)  # 2025, 9, 25
         except Exception as e:
             log(f"[file] skip (name parse fail): {p.name} {e}")
             continue
 
-        # 엑셀 로드
+        # 탭 후보(2자리 → 4자리 순서로 시도)
+        nat_candidates = [
+            f"전국 {yy}년 {mm}월",
+            f"전국 {y_full}년 {mm}월",
+        ]
+        se_candidates = [
+            f"서울 {yy}년 {mm}월",
+            f"서울 {y_full}년 {mm}월",
+        ]
+
+        log(f"[file] {p.name} -> nat candidates={nat_candidates} / seoul candidates={se_candidates}")
+
+        # 엑셀 로드 & 집계
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
-
-        # 집계
         nat_counts = agg_national(df)
         se_counts  = agg_seoul(df)
 
-        # 시트 찾기 (정확 일치 → nospace 보조)
-        ws_nat = find_ws(sh, nat_title)
-        ws_se  = find_ws(sh, se_title)
+        # 시트 찾기
+        ws_nat = find_ws_multi(sh, nat_candidates)
+        ws_se  = find_ws_multi(sh, se_candidates)
 
-        # 전국 탭
+        # 전국 탭 기록
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
-            # header 그대로의 컬럼만 채움(없으면 0)
-            nat_row = {h:int(nat_counts.get(PROV_MAP.get(h, h), 0)) for h in header_nat if h and h!="날짜" and h!="총합계"}
+            nat_row = {}
+            for h in header_nat:
+                if not h or h in ("날짜","총합계"): 
+                    continue
+                # 광역 헤더 그대로 매핑 (PROV_MAP은 집계 시에만 표준화)
+                nat_row[h] = int(nat_counts.get(h, 0))
             write_month_sheet(ws_nat, date_label, header_nat, nat_row)
         else:
-            log(f"[전국] sheet not found: '{nat_title}' (skip)")
+            log(f"[전국] sheet not found: tried {nat_candidates} (skip)")
 
-        # 서울 탭
+        # 서울 탭 기록
         if ws_se:
             header_se = _retry(ws_se.row_values, 1)
-            # 서울 구 헤더 기준 채우기(없으면 0)
-            se_row = {h:int(se_counts.get(h, 0)) for h in header_se if h and h!="날짜" and h!="총합계"}
+            se_row = {}
+            for h in header_se:
+                if not h or h in ("날짜","총합계"): 
+                    continue
+                se_row[h] = int(se_counts.get(h, 0))  # 노원구 포함 25개 구 모두 헤더 기준 채움
             write_month_sheet(ws_se, date_label, header_se, se_row)
         else:
-            log(f"[서울] sheet not found: '{se_title}' (skip)")
+            log(f"[서울] sheet not found: tried {se_candidates} (skip)")
 
     log("[main] logs written to analyze_report/")
 
