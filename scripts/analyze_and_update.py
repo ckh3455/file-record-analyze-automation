@@ -347,12 +347,12 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     diffs = {}
     if prev_counts:
         for c in SUMMARY_COLS:
-            cur = int(counts.get(c,0) or 0)
-            prv = int(prev_counts.get(c,0) or 0)
+            cur = int(counts.get(c, 0) or 0)
+            prv = int(prev_counts.get(c, 0) or 0)
             d = cur - prv
-            diffs[c] = f"+{d}" if d>0 else (str(d) if d<0 else "0")
+            diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
     else:
-        diffs = {c:"" for c in SUMMARY_COLS}
+        diffs = {c: "" for c in SUMMARY_COLS}
 
     r4 = find_summary_row(ws, ym, "전월대비 건수증감")
     put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
@@ -360,9 +360,11 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     color_diff_line(ws, r4, diffs, header)
     log(f"[summary] {ym} 전월대비 -> row={r4}")
 
-    r5 = find_summary_row(ws, ym, "예상건수")
-    put_summary_line(ws, r5, ym, "예상건수", {c:"" for c in SUMMARY_COLS})
-    log(f"[summary] {ym} 예상건수 -> row={r5}")
+    # ✅ '예상건수'는 쓰지 않음 (이미 있는 행도 건드리지 않음)
+    # r5 = find_summary_row(ws, ym, "예상건수")
+    # put_summary_line(ws, r5, ym, "예상건수", {c:"" for c in SUMMARY_COLS})
+    # log(f"[summary] {ym} 예상건수 -> row={r5}")
+
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
 def _apgu_norm(v) -> str:
