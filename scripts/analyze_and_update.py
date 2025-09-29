@@ -306,18 +306,29 @@ def color_diff_line(ws, row_idx: int, diff_line: dict, header: List[str]):
     hmap = {h:i+1 for i,h in enumerate(header)}
     reqs = []
     for k, v in diff_line.items():
-        if k not in hmap: continue
-        if v == "" or v == "0": continue
+        if k not in hmap: 
+            continue
+        if v == "" or v == "0":
+            continue
         r,g,b = (0.0,0.35,1.0) if str(v).startswith("+") else (1.0,0.0,0.0)
         reqs.append({
             "repeatCell": {
-                "range": {"sheetId": ws.id,
-                          "startRowIndex": row_idx-1, "endRowIndex": row_idx,
-                          "startColumnIndex": hmap[k]-1, "endColumnIndex": hmap[k]},
-                "cell": {"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":r,"green":g,"blue":b}}}}},
-            "fields": "userEnteredFormat.textFormat.foregroundColor"
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row_idx-1, "endRowIndex": row_idx,
+                    "startColumnIndex": hmap[k]-1, "endColumnIndex": hmap[k]
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"foregroundColor": {"red": r, "green": g, "blue": b}}
+                    }
+                },
+                # ✅ fields는 repeatCell 내부에!
+                "fields": "userEnteredFormat.textFormat.foregroundColor"
+            }
         })
     batch_format(ws, reqs)
+
 
 def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict, prev_counts: Optional[dict]):
     ym = f"{str(y%100).zfill(2)}/{m}"
@@ -414,15 +425,26 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     _ensure_rows(ws, end_chg)
     _retry(ws.update, change_rows, f"A{start_chg}:{a1_col(len(change_header))}{end_chg}")
 
-    req = {
+        req = {
         "repeatCell": {
-            "range": {"sheetId": ws.id,
-                      "startRowIndex": start_chg-1, "endRowIndex": end_chg,
-                      "startColumnIndex": 0, "endColumnIndex": len(change_header)},
-            "cell": {"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":1.0,"green":0.0,"blue":0.0}}}}},
-        "fields": "userEnteredFormat.textFormat.foregroundColor"
+            "range": {
+                "sheetId": ws.id,
+                "startRowIndex": start_chg-1,
+                "endRowIndex": end_chg,
+                "startColumnIndex": 0,
+                "endColumnIndex": len(change_header)
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "textFormat": {"foregroundColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}
+                }
+            },
+            # ✅ 여기도 repeatCell 내부로 이동
+            "fields": "userEnteredFormat.textFormat.foregroundColor"
+        }
     }
     batch_format(ws, [req])
+
     log(f"[압구정동] changes: 신규={len(added_keys)} 삭제={len(removed_keys)}")
 
 def main():
