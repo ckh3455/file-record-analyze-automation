@@ -303,31 +303,36 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     values_batch_update(ws, payload)
 
 def color_diff_line(ws, row_idx: int, diff_line: dict, header: List[str]):
-    hmap = {h:i+1 for i,h in enumerate(header)}
+    hmap = {h: i + 1 for i, h in enumerate(header)}
     reqs = []
     for k, v in diff_line.items():
-        if k not in hmap: 
+        if k not in hmap:
             continue
         if v == "" or v == "0":
             continue
-        r,g,b = (0.0,0.35,1.0) if str(v).startswith("+") else (1.0,0.0,0.0)
+        r, g, b = (0.0, 0.35, 1.0) if str(v).startswith("+") else (1.0, 0.0, 0.0)
         reqs.append({
             "repeatCell": {
                 "range": {
                     "sheetId": ws.id,
-                    "startRowIndex": row_idx-1, "endRowIndex": row_idx,
-                    "startColumnIndex": hmap[k]-1, "endColumnIndex": hmap[k]
+                    "startRowIndex": row_idx - 1,
+                    "endRowIndex": row_idx,
+                    "startColumnIndex": hmap[k] - 1,
+                    "endColumnIndex": hmap[k]
                 },
                 "cell": {
                     "userEnteredFormat": {
-                        "textFormat": {"foregroundColor": {"red": r, "green": g, "blue": b}}
+                        "textFormat": {
+                            "foregroundColor": {"red": r, "green": g, "blue": b}
+                        }
                     }
                 },
-                # ✅ fields는 repeatCell 내부에!
+                # fields 는 repeatCell 내부여야 합니다.
                 "fields": "userEnteredFormat.textFormat.foregroundColor"
             }
         })
     batch_format(ws, reqs)
+
 
 
 def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict, prev_counts: Optional[dict]):
