@@ -187,21 +187,33 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     return len(vals)+1
 
 def write_month_sheet(ws: gspread.Worksheet, date_label: str, header: List[str], values_by_colname: Dict[str,int]):
+    # 헤더 매핑(빈 헤더 제외)
     hmap = {str(h).strip(): idx+1 for idx,h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_label)
+
     payload = [{"range": f"A{row_idx}", "values": [[date_label]]}]
     total = 0
-    for h in header[1:]:  # 첫 열은 '날짜'
+
+    # 첫 열('날짜')/빈 헤더/총합계는 건너뛴다
+    for h in header[1:]:
+        if not h or not str(h).strip():
+            continue
         if h == "총합계":
+            continue
+        if h not in hmap:
             continue
         v = int(values_by_colname.get(h, 0))
         payload.append({"range": f"{a1_col(hmap[h])}{row_idx}", "values": [[v]]})
         total += v
+
+    # 총합계 열 처리(있을 때만)
     if "총합계" in hmap:
         payload.append({"range": f"{a1_col(hmap['총합계'])}{row_idx}", "values": [[total]]})
-    values_batch_update(ws, payload)
-    note_written(ws.title, ws.id, f"A{row_idx}:{a1_col(len(header))}{row_idx}")
-    log(f"[ws] {ws.title} -> {date_label} row={row_idx}")
+
+    if payload:
+        values_batch_update(ws, payload)
+        note_written(ws.title, ws.id, f"A{row_idx}:{a1_col(len(header))}{row_idx}")
+        log(f"[ws] {ws.title} -> {date_label} row={row_idx}")
 
 # ---------------- 메인 ----------------
 def main():
@@ -239,7 +251,6 @@ def main():
     # 오늘(한국시간) 날짜로 기록
     today = datetime.now().date()
     date_label = kdate_str(today)
-    log(f"[date] using today (KST) = {date_label}")
 
     # 파일 수집
     paths = sorted(Path(art_dir).rglob("전국 *.xlsx"))
@@ -279,9 +290,8 @@ def main():
             header_nat = _retry(ws_nat.row_values, 1)
             nat_row = {}
             for h in header_nat:
-                if not h or h in ("날짜","총합계"): 
+                if not h or h == "날짜" or h == "총합계":
                     continue
-                # 광역 헤더 그대로 매핑 (PROV_MAP은 집계 시에만 표준화)
                 nat_row[h] = int(nat_counts.get(h, 0))
             write_month_sheet(ws_nat, date_label, header_nat, nat_row)
         else:
@@ -292,7 +302,7 @@ def main():
             header_se = _retry(ws_se.row_values, 1)
             se_row = {}
             for h in header_se:
-                if not h or h in ("날짜","총합계"): 
+                if not h or h == "날짜" or h == "총합계":
                     continue
                 se_row[h] = int(se_counts.get(h, 0))  # 노원구 포함 25개 구 모두 헤더 기준 채움
             write_month_sheet(ws_se, date_label, header_se, se_row)
