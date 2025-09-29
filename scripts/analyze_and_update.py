@@ -85,7 +85,7 @@ def kdate_str(d: date) -> str:
     return f"{d.year}. {d.month}. {d.day}"
 
 def parse_filename(fname: str) -> Tuple[int,int,str,str,str]:
-    # '전국 2509_250928.xlsx' → (2025, 9, '전국 2025년 9월', '서울 2025년 9월', '25/9')
+    # '전국 2509_250928.xlsx' → (2025, 9, '전국 25년 9월', '서울 25년 9월', '25/9')
     m = re.search(r"(\d{2})(\d{2})_", fname)
     if not m:
         raise ValueError(f"unexpected filename: {fname}")
