@@ -767,11 +767,20 @@ def main():
             log("[압구정동] sheet not found (skip)")
 
     # ===== 예측(최근 3개월) =====
+        # ===== 예측(최근 3개월) =====
     if ws_sum:
-        # 월별 탭 모음
         month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
-
         today = datetime.now().date()
+
+        # yymm <-> (YYYY, M) 변환 유틸
+        def ym_to_yM(ym: str) -> Tuple[int,int]:
+            a, b = ym.split("/")
+            return 2000 + int(a), int(b)
+
+        def yM_to_ym(y: int, m: int) -> str:
+            return f"{str(y % 100).zfill(2)}/{m}"
+
+        # 모든 월 시트 맵
         ym_ws: Dict[str, gspread.Worksheet] = {}
         for ws in month_sheets:
             ym = yymm_from_title(ws.title)
@@ -779,32 +788,50 @@ def main():
                 ym_ws[ym] = ws
 
         if ym_ws:
+            # 정렬
             def ym_key(ym):
-                a, b = ym.split("/")
-                return (2000 + int(a), int(b))
+                y, m = ym_to_yM(ym)
+                return (y, m)
             yms_sorted = sorted(ym_ws.keys(), key=ym_key)
 
-            # 오늘 기준으로 존재 가능한 최근 3개월 (해당 월 <= today.year/today.month)
-            recent3 = [ym for ym in yms_sorted if (2000 + int(ym.split("/")[0]), int(ym.split("/")[1])) <= (today.year, today.month)]
-            recent3 = recent3[-3:] if len(recent3) >= 3 else recent3
+            # ── 최근 3개월(오늘 기준, "현재월 포함X") ─────────────────────────────
+            cur_y, cur_m = today.year, today.month
+            # recent3_end = (현재월 - 1), recent3 = (현재월-1, -2, -3)
+            def add_months(y, m, delta):
+                # delta는 음수 가능
+                nm = m + delta
+                y += (nm - 1) // 12
+                nm = ((nm - 1) % 12) + 1
+                return y, nm
 
-            # 학습월: 2024/10 ~ 2025/09 범위 중 최근3 제외
+            r3_end_y, r3_end_m = add_months(cur_y, cur_m, -1)  # 직전월
+            recent3_yM = [add_months(r3_end_y, r3_end_m, -i) for i in range(0, 3)]
+            recent3 = [yM_to_ym(y, m) for (y, m) in sorted(recent3_yM)]
+
+            # 시트가 실제로 있어야 예측 가능
+            recent3 = [ym for ym in recent3 if ym in ym_ws]
+
+            # ── 학습 구간: 2024-10 ~ (현재월 - 3개월) ────────────────────────────
+            learn_end_y, learn_end_m = add_months(cur_y, cur_m, -3)
+            def between_2024_10_and(y, m, end_y, end_m):
+                if (y, m) < (2024, 10):
+                    return False
+                if (y, m) > (end_y, end_m):
+                    return False
+                return True
+
             learn_yms = []
             for ym in yms_sorted:
-                y4 = 2000 + int(ym.split("/")[0])
-                m2 = int(ym.split("/")[1])
-                if (y4 > 2025) or (y4 == 2025 and m2 > 9):  # 안전필터
-                    continue
-                if (y4 < 2024) or (y4 == 2024 and m2 < 10):
-                    continue
-                if ym in recent3:
-                    continue
-                learn_yms.append(ym)
+                y, m = ym_to_yM(ym)
+                if between_2024_10_and(y, m, learn_end_y, learn_end_m):
+                    learn_yms.append(ym)
 
+            # 레벨별 처리: '전국 ...' 계열, '서울 ...' 계열을 각각
             for level_prefix in ["전국", "서울"]:
-                # 학습 프레임들 수집
-                learn_frames = []
-                region_cols_ref: Optional[List[str]] = None
+                # ── 1) 학습 프레임 수집 + 지역 우주(합집합) 만들기 ────────────────
+                learn_frames: List[Tuple[pd.DataFrame, pd.DataFrame, date]] = []
+                region_universe: set = set()
+
                 for ym in learn_yms:
                     ws = ym_ws.get(ym)
                     if not ws or not ws.title.startswith(level_prefix):
@@ -812,25 +839,28 @@ def main():
                     df_cum = month_sheet_to_frame(ws)
                     if df_cum.empty:
                         continue
-                    # 지역 컬럼 추출
-                    region_cols = [c for c in df_cum.columns if c != "date" and (c in SUMMARY_COLS or c == "총합계")]
-                    if not region_cols:
-                        continue
-                    region_cols_ref = region_cols
+
+                    # 이 월에서 관측되는 지역 컬럼들(누적 기록 테이블의 열들)
+                    cur_regions = [c for c in df_cum.columns if c != "date"]
+                    region_universe.update(cur_regions)
+
                     fday = first_data_date(ws)
                     if not fday:
                         continue
                     df_inc = daily_increments(df_cum)
                     learn_frames.append((df_cum, df_inc, fday))
 
+                # 거래요약의 열과 교집합만 예측: (존재하지 않는 지역은 빈값)
+                region_cols_ref = [c for c in SUMMARY_COLS if c in region_universe or c == "총합계"]
                 if not learn_frames or not region_cols_ref:
-                    log(f"[predict] skip: insufficient learn frames for '{level_prefix}'")
+                    log(f"[predict] skip: insufficient learn frames or no intersect columns for '{level_prefix}'")
                     continue
 
-                # 평균 완성도 곡선(최대 90일)
+                # ── 2) 평균 완성도 곡선(최대 90일) 구축 ───────────────────────────
                 horizon = 90
                 curves = {r: [0.0]*(horizon+1) for r in region_cols_ref}
                 counts = {r: [0]*(horizon+1) for r in region_cols_ref}
+
                 for (df_cum, df_inc, fday) in learn_frames:
                     cc = completion_curve(df_cum, region_cols_ref, fday, horizon_days=horizon)
                     for r in region_cols_ref:
@@ -839,6 +869,7 @@ def main():
                             if v > 0:
                                 curves[r][d] += v
                                 counts[r][d] += 1
+
                 for r in region_cols_ref:
                     for d in range(1, horizon+1):
                         if counts[r][d] > 0:
@@ -846,11 +877,12 @@ def main():
                         else:
                             curves[r][d] = 0.5  # 데이터 없으면 기본값
 
-                # 최근 3개월 예측 및 기록
+                # ── 3) 최근 3개월 예측(모든 SUMMARY_COLS에 대해) + 거래요약 기록 ───
                 for ym in recent3:
                     ws = ym_ws.get(ym)
                     if not ws or not ws.title.startswith(level_prefix):
                         continue
+
                     df_cum = month_sheet_to_frame(ws)
                     if df_cum.empty:
                         continue
@@ -858,31 +890,40 @@ def main():
                     lday = latest_data_date(ws)
                     if not fday or not lday:
                         continue
+
+                    # 관측치가 존재하는 지역
+                    observed_row = df_cum.iloc[-1] if len(df_cum) else pd.Series(dtype=object)
                     day_idx = (lday - fday).days + 1
-                    last_row = df_cum.iloc[-1]
+
                     pred_map: Dict[str, int] = {}
-                    for r in region_cols_ref:
-                        obs = int(float(last_row.get(r, 0)) or 0)
-                        curve = curves.get(r, [0.0]*(horizon+1))
-                        pred = blend_predict(obs, day_idx, curve)
-                        pred_map[r] = pred
+                    # 거래요약의 모든 열을 순회
+                    for region in SUMMARY_COLS:
+                        if region in region_cols_ref and region in observed_row.index:
+                            obs = int(float(observed_row.get(region, 0)) or 0)
+                            curve = curves.get(region, [0.0]*(horizon+1))
+                            pred = blend_predict(obs, day_idx, curve)
+                            pred_map[region] = pred
+                        else:
+                            # 이 레벨/월 탭에서 관측되지 않는 지역은 공란
+                            pred_map[region] = ""
+
                     write_predicted_line(ws_sum, ym, pred_map)
 
-                # 패턴 분석 시트(가장 최신 월, 대표 2~3개 지역)
-                if recent3:
-                    latest_ym = recent3[-1]
-                    ws_latest = ym_ws.get(latest_ym)
-                    if ws_latest and ws_latest.title.startswith(level_prefix):
-                        df_cum = month_sheet_to_frame(ws_latest)
-                        df_inc = daily_increments(df_cum)
-                        targets: List[str] = []
-                        if "총합계" in df_cum.columns: targets.append("총합계")
-                        for t in ["서울특별시", "강남구", "압구정동"]:
-                            if t in df_cum.columns and t not in targets:
-                                targets.append(t)
-                        if not targets:
-                            targets = [c for c in df_cum.columns if c != "date"][:3]
-                        render_pattern_analysis(sh, ws_latest.title, df_cum, df_inc, targets[:3])
+            # ── 4) 거래량 패턴분석 탭(차트 위치 오류 수정 포함) ───────────────────
+            if recent3:
+                latest_ym = sorted(recent3, key=ym_key)[-1]
+                ws_latest = ym_ws.get(latest_ym)
+                if ws_latest:
+                    df_cum = month_sheet_to_frame(ws_latest)
+                    df_inc = daily_increments(df_cum)
+                    targets: List[str] = []
+                    if "총합계" in df_cum.columns: targets.append("총합계")
+                    for t in ["서울특별시", "강남구", "압구정동"]:
+                        if t in df_cum.columns and t not in targets:
+                            targets.append(t)
+                    if not targets:
+                        targets = [c for c in df_cum.columns if c != "date"][:3]
+                    render_pattern_analysis(sh, ws_latest.title, df_cum, df_inc, targets[:3])
 
     log("[main] done")
 
