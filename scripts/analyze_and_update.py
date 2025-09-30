@@ -495,19 +495,6 @@ def main():
         # ===== 전국 탭 쓰기 =====
         ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
-            header_nat = _retry(ws_nat.row_values, 1)
-            # header 기준으로 값 매핑 (정식명 동일)
-            values_nat: Dict[str,int] = {}
-            for h in header_nat:
-                if not h or h=="날짜": 
-                    continue
-                if h == "총합계":
-                    values_nat["총합계"] = int(counts.get("전국",0))
-                else:
-                    if h in counts:
-                        values_nat[h] = int(counts[h])
-            # 날짜/합계 포함하여 기록
-            write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
         # ===== 서울 탭 쓰기 =====
         ws_se = fuzzy_ws(sh, se_title)
