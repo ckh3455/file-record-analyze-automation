@@ -117,34 +117,12 @@ def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     if not requests: return
     _retry(ws.spreadsheet.batch_update, {"requests": requests})
 
-def is_summary_sheet(ws: gspread.Worksheet) -> bool:
-    return re.sub(r"\s+","", ws.title) == re.sub(r"\s+","", SUMMARY_SHEET_NAME)
-
-# 월별 탭 제목 후보 생성 (25년/2025년 둘 다)
-def ym_from_filename(fname: str):
-    """
-    '전국 2509_250929.xlsx' ->
-      nat_candidates = ['전국 25년 9월','전국 2025년 9월']
-      se_candidates  = ['서울 25년 9월','서울 2025년 9월']
-      ym = '25/9'
-    """
-    m = re.search(r"(\d{2})(\d{2})_", fname)
-    if not m:
-        return [], [], None
-    yy2, mm = m.group(1), int(m.group(2))
-    yy4 = f"20{yy2}"
-    nat_candidates = [f"전국 {yy2}년 {mm}월", f"전국 {yy4}년 {mm}월"]
-    se_candidates  = [f"서울 {yy2}년 {mm}월", f"서울 {yy4}년 {mm}월"]
-    return nat_candidates, se_candidates, f"{yy2}/{mm}"
-
-def pick_ws(sh: gspread.Spreadsheet, candidates: List[str]) -> Optional[gspread.Worksheet]:
-    all_ws = {re.sub(r"\s+","", ws.title): ws for ws in sh.worksheets()}
-    for name in candidates:
-        key = re.sub(r"\s+","", name)
-        if key in all_ws:
-            log(f"[ws] matched: '{all_ws[key].title}' (wanted='{name}')")
-            return all_ws[key]
-    log(f"[ws] sheet not found for any: {candidates} (skip)")
+def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
+    tgt = re.sub(r"\s+","", wanted)
+    for ws in sh.worksheets():
+        if re.sub(r"\s+","", ws.title) == tgt:
+            log(f"[ws] matched: '{ws.title}'")
+            return ws
     return None
 
 # ===================== 파일/읽기/집계 =====================
@@ -241,7 +219,7 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
 
     # 알려진 헤더만 기록
     for col_name, val in values_by_colname.items():
-        if col_name in hmap:
+        if col_name in hmap:  # 모르는 헤더는 건드리지 않음
             c = hmap[col_name]
             payload.append({"range": f"{a1_col(c)}{row_idx}", "values": [[val]]})
 
@@ -258,6 +236,13 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
         log(f"[ws] {ws.title} -> {date_label} row={row_idx}")
 
 # ===================== 거래요약 =====================
+def ym_from_filename(fname: str):
+    # '전국 2509_250929.xlsx' → ('전국 25년 9월','서울 25년 9월','25/9')
+    m = re.search(r"(\d{2})(\d{2})_", fname)
+    if not m: return None, None, None
+    yy, mm = m.group(1), int(m.group(2))
+    return f"전국 20{yy}년 {mm}월", f"서울 20{yy}년 {mm}월", f"{yy}/{mm}"
+
 def prev_ym(ym: str) -> str:
     yy, mm = ym.split("/")
     y = int(yy); m = int(mm)
@@ -292,7 +277,37 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                             "values": [[line_map.get(c,"")]]})
     values_batch_update(ws, payload)
 
+# *** 수정 1: color_diff_line 안정화 (헤더 Optional) ***
 def color_diff_line(
+    ws: gspread.Worksheet,
+    row_idx: int,
+    diff_line: dict,
+    header: Optional[List[str]]
+) -> None:
+    # 헤더를 못 읽었으면 색칠만 건너뜀 (기록은 이미 완료됨)
+    if not header:
+        return
+    hmap = {h: i + 1 for i, h in enumerate(header)}
+    reqs = []
+    for k, v in diff_line.items():
+        if k not in hmap:
+            continue
+        if v == "" or v == "0":
+            continue
+        # +는 파란색, -는 빨간색
+        r, g, b = (0.0, 0.35, 1.0) if str(v).startswith("+") else (1.0, 0.0, 0.0)
+        reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row_idx - 1, "endRowIndex": row_idx,
+                    "startColumnIndex": hmap[k] - 1, "endColumnIndex": hmap[k]
+                },
+                "cell": {"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":r,"green":g,"blue":b}}}},
+                "fields": "userEnteredFormat.textFormat.foregroundColor"
+            }
+        })
+    batch_format(ws, reqs)
 
 def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict, prev_counts: Optional[dict]):
     ym = f"{str(y%100).zfill(2)}/{m}"
@@ -309,29 +324,21 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     put_summary_line(ws, r3, ym, "평균가(단위:억)", mean)
     log(f"[summary] {ym} 평균가 -> row={r3}")
 
-    # 전월대비 건수증감
-        # 전월대비 건수증감
+    # *** 수정 2: 전월대비 색칠 호출 시 헤더 안전 처리 ***
     if prev_counts:
         diffs = {}
         for c in SUMMARY_COLS:
-            cur = int(counts.get(c, 0) or 0)
-            prv = int(prev_counts.get(c, 0) or 0)
+            cur = int(counts.get(c,0) or 0)
+            prv = int(prev_counts.get(c,0) or 0)
             d = cur - prv
-            diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
+            diffs[c] = f"+{d}" if d>0 else (str(d) if d<0 else "0")
     else:
-        diffs = {c: "" for c in SUMMARY_COLS}
-
+        diffs = {c:"" for c in SUMMARY_COLS}
     r4 = find_summary_row(ws, ym, "전월대비 건수증감")
     put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
-
-    # 헤더 실패해도 크래시하지 않게 방어
-    header = _retry(ws.row_values, 1)
-    if not header:
-        header = []
+    header = _retry(ws.row_values, 1) or []
     color_diff_line(ws, r4, diffs, header)
     log(f"[summary] {ym} 전월대비 -> row={r4}")
-
-
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
 def _apgu_norm(v) -> str:
@@ -488,10 +495,10 @@ def main():
     apgu_all: List[pd.DataFrame] = []
 
     for p in files:
-        nat_cands, se_cands, ym = ym_from_filename(p.name)
+        nat_title, se_title, ym = ym_from_filename(p.name)
         if not ym:
             continue
-        log(f"[file] {p.name} -> nat={nat_cands} / seoul={se_cands} / ym={ym}")
+        log(f"[file] {p.name} -> nat='{nat_title}' / seoul='{se_title}' / ym={ym}")
 
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
@@ -499,30 +506,30 @@ def main():
         counts, med, mean = agg_all_stats(df)
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
-        # 월별 탭 기록 (요약형 시트는 제외)
-        ws_nat = pick_ws(sh, nat_cands)
-        if ws_nat and not is_summary_sheet(ws_nat):
+        # 월별 탭 기록 (있는 탭에만, 모르는 열 건드리지 않음)
+        ws_nat = fuzzy_ws(sh, nat_title)
+        if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
             values_nat = {}
             for h in header_nat:
                 if not h or h=="날짜":
                     continue
-                if h in ("총합계","합계"):
+                if h=="총합계":
                     values_nat[h] = int(counts.get("전국",0))
-                elif h in counts:
+                elif h in counts:              # ✅ 아는 열만 기록
                     values_nat[h] = int(counts[h])
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        ws_se = pick_ws(sh, se_cands)
-        if ws_se and not is_summary_sheet(ws_se):
+        ws_se = fuzzy_ws(sh, se_title)
+        if ws_se:
             header_se = _retry(ws_se.row_values, 1)
             values_se = {}
             for h in header_se:
                 if not h or h=="날짜":
                     continue
-                if h in ("총합계","합계"):
+                if h=="총합계":
                     values_se[h] = int(counts.get("서울",0))
-                elif h in counts:
+                elif h in counts:              # ✅ 아는 열만 기록
                     values_se[h] = int(counts[h])
             write_month_sheet(ws_se, today_label, header_se, values_se)
 
@@ -532,13 +539,7 @@ def main():
             apgu_all.append(ap)
 
     # 거래요약
-    ws_sum = None
-    for ws in sh.worksheets():
-        if is_summary_sheet(ws):
-            ws_sum = ws
-            log(f"[ws] matched: '{ws.title}'")
-            break
-
+    ws_sum = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
     if ws_sum and month_cache:
         def ym_key(ym):
             yy, mm = ym.split("/")
@@ -557,12 +558,7 @@ def main():
 
     # 압구정동 원본 그대로 + 변동요약
     if apgu_all:
-        ws_ap = None
-        for ws in sh.worksheets():
-            if re.sub(r"\s+","", ws.title) == re.sub(r"\s+","", "압구정동"):
-                ws_ap = ws
-                log(f"[ws] matched: '{ws.title}'")
-                break
+        ws_ap = fuzzy_ws(sh, "압구정동")
         if ws_ap:
             all_df = pd.concat(apgu_all, ignore_index=True)
             upsert_apgu_verbatim(ws_ap, all_df, run_day)
