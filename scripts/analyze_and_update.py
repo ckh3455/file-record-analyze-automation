@@ -292,25 +292,7 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                             "values": [[line_map.get(c,"")]]})
     values_batch_update(ws, payload)
 
-def color_diff_line(ws, row_idx: int, diff_line: dict, header: List[str]):
-    hmap = {h:i+1 for i,h in enumerate(header)}
-    reqs = []
-    for k, v in diff_line.items():
-        if k not in hmap: continue
-        if v == "" or v == "0": continue
-        r,g,b = (0.0,0.35,1.0) if str(v).startswith("+") else (1.0,0.0,0.0)
-        reqs.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": row_idx-1, "endRowIndex": row_idx,
-                    "startColumnIndex": hmap[k]-1, "endColumnIndex": hmap[k]
-                },
-                "cell": {"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":r,"green":g,"blue":b}}}},
-                "fields": "userEnteredFormat.textFormat.foregroundColor"
-            }
-        })
-    batch_format(ws, reqs)
+def color_diff_line(
 
 def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict, prev_counts: Optional[dict]):
     ym = f"{str(y%100).zfill(2)}/{m}"
@@ -337,11 +319,17 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
             diffs[c] = f"+{d}" if d>0 else (str(d) if d<0 else "0")
     else:
         diffs = {c:"" for c in SUMMARY_COLS}
+
     r4 = find_summary_row(ws, ym, "전월대비 건수증감")
     put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
+
+    # 헤더 실패해도 크래시하지 않게
     header = _retry(ws.row_values, 1)
+    if not header:
+        header = []
     color_diff_line(ws, r4, diffs, header)
     log(f"[summary] {ym} 전월대비 -> row={r4}")
+
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
 def _apgu_norm(v) -> str:
