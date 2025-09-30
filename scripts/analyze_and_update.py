@@ -33,21 +33,13 @@ SUMMARY_COLS = [
 # ===== 한국 공휴일 (2024-10 ~ 2025-09) =====
 KR_HOLIDAYS = {
     # 2024 Q4
-    "2024-10-03",  # 개천절
-    "2024-10-09",  # 한글날
-    "2024-12-25",  # 성탄절
+    "2024-10-03", "2024-10-09", "2024-12-25",
     # 2025 Q1~Q3
-    "2025-01-01",  # 신정
-    "2025-01-27",  # 설 연휴
-    "2025-01-28",
-    "2025-01-29",
-    "2025-01-30",
-    "2025-03-01",  # 삼일절(토)
-    "2025-03-03",  # 대체공휴일
-    "2025-05-05",  # 어린이날/부처님오신날
-    "2025-05-06",  # 대체공휴일
-    "2025-06-06",  # 현충일
-    "2025-08-15",  # 광복절
+    "2025-01-01", "2025-01-27", "2025-01-28", "2025-01-29", "2025-01-30",
+    "2025-03-01", "2025-03-03",
+    "2025-05-05", "2025-05-06",
+    "2025-06-06",
+    "2025-08-15",
 }
 
 # ===================== 로깅/리트라이 =====================
@@ -260,24 +252,6 @@ def daily_increments(df: pd.DataFrame) -> pd.DataFrame:
         inc[c] = inc[c].diff().fillna(inc[c]).astype(int)
         inc[c] = inc[c].clip(lower=0)
     return inc
-
-def group_stats(df: pd.DataFrame, key_col: str) -> Dict[str, dict]:
-    out = {}
-    if key_col not in df.columns:
-        return out
-    g = df.groupby(key_col, dropna=False)
-    for k, sub in g:
-        key = "" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
-        cnt = int(len(sub))
-        eok = eok_series(sub.get("거래금액(만원)", []))
-        if eok.empty:
-            med = ""
-            mean = ""
-        else:
-            med = float(f"{eok.median():.2f}")
-            mean = float(f"{eok.mean():.2f}")
-        out[key] = {"cnt": cnt, "med": med, "mean": mean}
-    return out
 
 def completion_curve(df: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90) -> Dict[str, List[float]]:
     out = {region: [None]*(horizon_days+1) for region in region_cols}
@@ -597,6 +571,7 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
     start_inc = len(cum_rows) + 2
     _retry(ws.update, inc_rows, f"A{start_inc}")
 
+    # 차트(oneof 충돌 방지: overlayPosition만 사용)
     nrows = len(cum_rows)
     series = []
     for j in range(len(targets)):
@@ -646,7 +621,7 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
                 "position": {"overlayPosition": {
                     "anchorCell": {"sheetId": ws.id, "rowIndex": 0, "columnIndex": 10},
                     "offsetXPixels": 0, "offsetYPixels": 0, "widthPixels": 800, "heightPixels": 320
-                 }}
+                }}
             }
         }
     }
@@ -687,7 +662,6 @@ def main():
     log(f"[collect] found {len(files)} xlsx files")
 
     month_cache = {}  # ym -> {counts, med, mean}
-    rank_cache = {}   # (미사용: 확장용)
     today_label = kdate(datetime.now())
     run_day = datetime.now().date()
     apgu_all: List[pd.DataFrame] = []
@@ -766,9 +740,7 @@ def main():
         else:
             log("[압구정동] sheet not found (skip)")
 
-    # ===== 예측(최근 3개월) =====
-        # ===== 예측(최근 3개월) =====
-        # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10~2025-06(9개월 고정) =====
+    # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10~2025-06(9개월 고정) =====
     if ws_sum:
         month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
         today = datetime.now().date()
@@ -777,10 +749,8 @@ def main():
         def ym_to_yM(ym: str) -> Tuple[int,int]:
             a, b = ym.split("/")
             return 2000 + int(a), int(b)
-
         def yM_to_ym(y: int, m: int) -> str:
             return f"{str(y % 100).zfill(2)}/{m}"
-
         def add_months(y, m, delta):
             nm = m + delta
             y += (nm - 1) // 12
@@ -795,24 +765,23 @@ def main():
                 ym_ws[ym] = ws
 
         if ym_ws:
-            def ym_key(ym): y, m = ym_to_yM(ym); return (y, m)
-            yms_sorted = sorted(ym_ws.keys(), key=ym_key)
+            def ym_key2(ym): y, m = ym_to_yM(ym); return (y, m)
 
-            # ── 학습 구간: 2024-10 ~ 2025-06 정확히 9개월 ──────────────────────
+            # 학습 구간: 2024-10 ~ 2025-06 (9개월 고정)
             TRAIN_START_Y, TRAIN_START_M = 2024, 10
             TRAIN_MONTHS = 9
             train_list_yM = [add_months(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
             learn_yms = [yM_to_ym(y, m) for (y, m) in train_list_yM if yM_to_ym(y, m) in ym_ws]
 
-            # ── 예측 구간: 현재월 포함 최근 3개월 (현재월, 현재월-1, 현재월-2) ───────
+            # 예측 구간: 현재월 포함 최근 3개월 (현재월, 현재월-1, 현재월-2)
             cur_y, cur_m = today.year, today.month
-            r3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
-            recent3 = [yM_to_ym(y, m) for (y, m) in r3_yM if yM_to_ym(y, m) in ym_ws]
-            recent3 = sorted(recent3, key=ym_key)  # 시간순 정렬
+            recent3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
+            recent3 = [yM_to_ym(y, m) for (y, m) in recent3_yM if yM_to_ym(y, m) in ym_ws]
+            recent3 = sorted(recent3, key=ym_key2)
 
-            # 레벨별 학습(전국, 서울) → 곡선 만들기
-            level_curves: Dict[str, Dict[str, List[float]]] = {}  # level -> {region: curve[0..90]}
-            level_obs_cols: Dict[str, set] = {}  # level -> 관측 가능 지역 집합
+            # 레벨별 학습(전국, 서울) → 곡선 생성
+            level_curves: Dict[str, Dict[str, List[float]]] = {}
+            level_obs_cols: Dict[str, set] = {}
 
             for level_prefix in ["전국", "서울"]:
                 learn_frames: List[Tuple[pd.DataFrame, pd.DataFrame, date]] = []
@@ -832,7 +801,6 @@ def main():
                     df_inc = daily_increments(df_cum)
                     learn_frames.append((df_cum, df_inc, fday))
 
-                # 거래요약의 전체 열 중, 이 레벨에서 관측 가능한 열만 대상으로 곡선 생성
                 region_cols_ref = [c for c in SUMMARY_COLS if c in region_universe]
                 level_obs_cols[level_prefix] = set(region_cols_ref)
 
@@ -860,17 +828,12 @@ def main():
 
                 level_curves[level_prefix] = curves
 
-            # ── 최근 3개월 각각에 대해: 두 레벨의 예측을 병합해 한 번만 기록 ────────
+            # 최근 3개월 각각에 대해: 두 레벨의 예측을 병합해 “예상건수” 한 번만 기록
             for ym in recent3:
-                # 초기 맵: 모든 SUMMARY_COLS를 공란으로
                 merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
 
-                # 전국/서울 각각에서 관측 누적→예측
                 for level_prefix in ["전국", "서울"]:
-                    ws = ym_ws.get(ym)
-                    # 해당 ym의 해당 레벨 탭이 없을 수도 있으니 다시 찾아보기
-                    # (동일 ym에 "전국 ...", "서울 ..." 2개가 있어야 이상적)
-                    # 현재 ws는 하나뿐일 수 있어 level별로 다시 선택
+                    # 해당 ym의 해당 레벨 탭 찾기
                     ws_level = None
                     for cand in [w for w in sh.worksheets() if re.search(rf"^{level_prefix}\s+\d{{4}}년\s+\d{{1,2}}월$", w.title)]:
                         if yymm_from_title(cand.title) == ym:
@@ -899,13 +862,11 @@ def main():
                         pred = blend_predict(obs, day_idx, curve)
                         merged_pred[region] = pred  # 이 레벨에서 관측되는 지역 채움
 
-                # “예상건수” 한 번만 기록 (두 레벨 병합 결과)
                 write_predicted_line(ws_sum, ym, merged_pred)
 
-            # ── 패턴 분석 탭: 가장 최신 월(보통 현재월)로 표+그래프 ──────────────
+            # 패턴 분석 탭: 가장 최신(보통 현재월)로 표+그래프
             if recent3:
-                latest_ym = sorted(recent3, key=ym_key)[-1]
-                # 우선순위: 현재월의 "서울 ..." 있으면 그걸로, 없으면 "전국 ..." 사용
+                latest_ym = sorted(recent3, key=ym_key2)[-1]
                 ws_latest = None
                 for pref in ["서울", "전국"]:
                     for cand in [w for w in sh.worksheets() if re.search(rf"^{pref}\s+\d{{4}}년\s+\d{{1,2}}월$", w.title)]:
@@ -924,7 +885,6 @@ def main():
                     if not targets:
                         targets = [c for c in df_cum.columns if c != "date"][:3]
                     render_pattern_analysis(sh, ws_latest.title, df_cum, df_inc, targets[:3])
-
 
     log("[main] done")
 
