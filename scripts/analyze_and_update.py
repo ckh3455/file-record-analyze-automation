@@ -101,7 +101,10 @@ def _retry(fn, *a, **kw):
                 continue
             raise
 
-# ===================== gspread 헬퍼 =====================
+# ===================== 유틸 =====================
+def ns(s: str) -> str:
+    return re.sub(r"\s+", "", str(s or "")).strip()
+
 def a1_col(n: int) -> str:
     s = ""
     while n > 0:
@@ -118,10 +121,10 @@ def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     _retry(ws.spreadsheet.batch_update, {"requests": requests})
 
 def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
-    tgt = re.sub(r"\s+","", wanted)
+    tgt = ns(wanted)
     for ws in sh.worksheets():
-        if re.sub(r"\s+","", ws.title) == tgt:
-            log(f"[ws] matched: '{ws.title}'")
+        if ns(ws.title) == tgt:
+            log(f"[ws] matched: '{ws.title}' (wanted='{wanted}')")
             return ws
     return None
 
@@ -207,29 +210,68 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
             return i
     return len(vals)+1
 
-def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname: Dict[str,int]):
+def header_to_count_key_map(header: List[str]) -> Dict[int, Optional[str]]:
     """
-    - '알려진 열'에만 값을 씁니다. 모르는 열(예: '예상거래건수')은 절대 손대지 않음.
-    - 총합계/합계는 있으면 채움.
+    각 헤더(열제목)를 counts 키로 매핑한다.
+    - '총합계'와 '합계'는 None으로 둔다(별도 처리)
+    - 나머지는 PROV_MAP 및 정규화로 역매핑
     """
-    hmap = {str(h).strip(): idx+1 for idx,h in enumerate(header) if str(h).strip()}
+    # 역매핑 준비 (정규화 기반)
+    rev_map = {ns(k): v for k, v in PROV_MAP.items()}
+    # counts에 있는 키(그대로 쓰는 경우)도 허용
+    valid_count_keys = {ns(k): k for k in SUMMARY_COLS}
+
+    out: Dict[int, Optional[str]] = {}
+    for idx, h in enumerate(header, start=1):
+        HH = str(h).strip()
+        nH = ns(HH)
+        if not nH:
+            out[idx] = None
+            continue
+        if HH in ("날짜", "년월", "구분"):
+            out[idx] = None
+            continue
+        if HH in ("총합계","합계"):
+            out[idx] = "__TOTAL__"      # 합계는 별도 처리 신호
+            continue
+
+        # 1) counts에 그대로 있는 열명
+        if nH in valid_count_keys:
+            out[idx] = valid_count_keys[nH]
+            continue
+        # 2) PROV_MAP 역매핑 (부산광역시→부산 등)
+        if nH in rev_map and rev_map[nH] in SUMMARY_COLS:
+            out[idx] = rev_map[nH]
+            continue
+        # 3) 기타는 매핑 불가 → None (기록 안 함)
+        out[idx] = None
+    return out
+
+def write_month_sheet(ws, date_label: str, header: List[str], counts_map: Dict[str,int], total_from: str):
+    """
+    - 헤더→counts 키 매핑으로 '아는 열'에만 값을 씀
+    - 총합계/합계는 total_from 키로 채움
+    """
+    col_map = header_to_count_key_map(header)
     row_idx = find_or_append_date_row(ws, date_label)
 
     payload = [{"range": f"A{row_idx}", "values": [[date_label]]}]
 
-    # 알려진 헤더만 기록
-    for col_name, val in values_by_colname.items():
-        if col_name in hmap:  # 모르는 헤더는 건드리지 않음
-            c = hmap[col_name]
-            payload.append({"range": f"{a1_col(c)}{row_idx}", "values": [[val]]})
-
-    # 총합계 보정(있으면)
-    for possible in ("총합계","합계"):
-        if possible in hmap:
-            v = values_by_colname.get("전국", None)
-            if v is not None:
-                payload.append({"range": f"{a1_col(hmap[possible])}{row_idx}", "values": [[int(v)]]})
-            break
+    for idx, key in col_map.items():
+        if key is None:
+            continue
+        if key == "__TOTAL__":
+            # 합계
+            v = counts_map.get(total_from, None)
+            if v is None: 
+                continue
+            payload.append({"range": f"{a1_col(idx)}{row_idx}", "values": [[int(v)]]})
+        else:
+            # 일반 값
+            v = counts_map.get(key, None)
+            if v is None: 
+                continue
+            payload.append({"range": f"{a1_col(idx)}{row_idx}", "values": [[int(v)]]})
 
     if payload:
         values_batch_update(ws, payload)
@@ -277,24 +319,14 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                             "values": [[line_map.get(c,"")]]})
     values_batch_update(ws, payload)
 
-# *** 수정 1: color_diff_line 안정화 (헤더 Optional) ***
-def color_diff_line(
-    ws: gspread.Worksheet,
-    row_idx: int,
-    diff_line: dict,
-    header: Optional[List[str]]
-) -> None:
-    # 헤더를 못 읽었으면 색칠만 건너뜀 (기록은 이미 완료됨)
+def color_diff_line(ws, row_idx: int, diff_line: dict, header: Optional[List[str]]) -> None:
     if not header:
         return
     hmap = {h: i + 1 for i, h in enumerate(header)}
     reqs = []
     for k, v in diff_line.items():
-        if k not in hmap:
-            continue
-        if v == "" or v == "0":
-            continue
-        # +는 파란색, -는 빨간색
+        if k not in hmap: continue
+        if v == "" or v == "0": continue
         r, g, b = (0.0, 0.35, 1.0) if str(v).startswith("+") else (1.0, 0.0, 0.0)
         reqs.append({
             "repeatCell": {
@@ -324,7 +356,6 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     put_summary_line(ws, r3, ym, "평균가(단위:억)", mean)
     log(f"[summary] {ym} 평균가 -> row={r3}")
 
-    # *** 수정 2: 전월대비 색칠 호출 시 헤더 안전 처리 ***
     if prev_counts:
         diffs = {}
         for c in SUMMARY_COLS:
@@ -506,32 +537,16 @@ def main():
         counts, med, mean = agg_all_stats(df)
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
-        # 월별 탭 기록 (있는 탭에만, 모르는 열 건드리지 않음)
+        # 월별 탭 기록 (있는 탭에만) — 헤더/집계키 매핑을 사용
         ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
-            values_nat = {}
-            for h in header_nat:
-                if not h or h=="날짜":
-                    continue
-                if h=="총합계":
-                    values_nat[h] = int(counts.get("전국",0))
-                elif h in counts:              # ✅ 아는 열만 기록
-                    values_nat[h] = int(counts[h])
-            write_month_sheet(ws_nat, today_label, header_nat, values_nat)
+            write_month_sheet(ws_nat, today_label, header_nat, counts, total_from="전국")
 
         ws_se = fuzzy_ws(sh, se_title)
         if ws_se:
             header_se = _retry(ws_se.row_values, 1)
-            values_se = {}
-            for h in header_se:
-                if not h or h=="날짜":
-                    continue
-                if h=="총합계":
-                    values_se[h] = int(counts.get("서울",0))
-                elif h in counts:              # ✅ 아는 열만 기록
-                    values_se[h] = int(counts[h])
-            write_month_sheet(ws_se, today_label, header_se, values_se)
+            write_month_sheet(ws_se, today_label, header_se, counts, total_from="서울")
 
         # 압구정동 원본 누적
         ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
