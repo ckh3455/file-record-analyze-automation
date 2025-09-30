@@ -493,36 +493,30 @@ def main():
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
         # ===== 전국 탭 쓰기 =====
-        ws_nat = fuzzy_ws(sh, nat_title)
+                ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
-            # header 기준으로 값 매핑 (정식명 동일)
-            values_nat: Dict[str,int] = {}
+
+            # 전국 탭 헤더에서만 쓰는 별칭 매핑
+            # - 시트 헤더 '서울특별시'  → 집계 키 '서울'
+            alias_for_counts = {
+                "서울특별시": "서울",
+            }
+
+            values_nat: Dict[str, int] = {}
             for h in header_nat:
-                if not h or h=="날짜": 
+                if not h or h == "날짜":
                     continue
                 if h == "총합계":
-                    values_nat["총합계"] = int(counts.get("전국",0))
+                    values_nat["총합계"] = int(counts.get("전국", 0))
                 else:
-                    if h in counts:
-                        values_nat[h] = int(counts[h])
+                    key = alias_for_counts.get(h, h)
+                    if key in counts:
+                        values_nat[h] = int(counts.get(key, 0))
+
             # 날짜/합계 포함하여 기록
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        # ===== 서울 탭 쓰기 =====
-        ws_se = fuzzy_ws(sh, se_title)
-        if ws_se:
-            header_se = _retry(ws_se.row_values, 1)
-            values_se: Dict[str,int] = {}
-            for h in header_se:
-                if not h or h=="날짜":
-                    continue
-                if h == "총합계":
-                    values_se["총합계"] = int(counts.get("서울",0))
-                else:
-                    if h in counts:
-                        values_se[h] = int(counts[h])
-            write_month_sheet(ws_se, today_label, header_se, values_se)
 
         # 압구정동 원본 누적
         ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
