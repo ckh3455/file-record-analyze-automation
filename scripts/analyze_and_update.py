@@ -643,10 +643,10 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
                         "headerCount": 1
                     }
                 },
-                "position": {"newSheet": False, "overlayPosition": {
+                "position": {"overlayPosition": {
                     "anchorCell": {"sheetId": ws.id, "rowIndex": 0, "columnIndex": 10},
                     "offsetXPixels": 0, "offsetYPixels": 0, "widthPixels": 800, "heightPixels": 320
-                }}
+                 }}
             }
         }
     }
