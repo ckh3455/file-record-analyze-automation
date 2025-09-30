@@ -11,6 +11,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
+from zoneinfo import ZoneInfo
 
 # ===================== 설정 =====================
 LOG_DIR = Path("analyze_report")
@@ -58,6 +59,21 @@ APGU_BASE_COLS = [
     "중개사소재지","등기일자","주택유형"
 ]
 
+# 시트 헤더 → 카운트 키 매핑(시트 별 표기 차이 대응)
+HEADER_ALIAS = {
+    "서울특별시":"서울", "세종특별자치시":"세종시",
+    "강원특별자치도":"강원도",
+    "부산광역시":"부산","대구광역시":"대구","광주광역시":"광주",
+    "대전광역시":"대전","울산광역시":"울산",
+    "전북특별자치도":"전북","전라남도":"전남",
+    "경상남도":"경남","경상북도":"경북",
+    "충청남도":"충남","충청북도":"충북",
+}
+
+def map_header_to_counts_key(h: str) -> str:
+    h = str(h).strip()
+    return HEADER_ALIAS.get(h, h)
+
 # ===================== 로깅/리트라이 =====================
 def _ensure_logdir():
     try:
@@ -71,7 +87,7 @@ _ensure_logdir()
 RUN_LOG = LOG_DIR / "latest.log"
 
 def log(msg: str):
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    line = f"[{datetime.now(ZoneInfo('Asia/Seoul')).strftime('%H:%M:%S')}] {msg}"
     print(line)
     try:
         with RUN_LOG.open("a", encoding="utf-8") as f:
@@ -125,11 +141,18 @@ def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet
             return ws
     return None
 
+# 후보들 중 있는 탭 찾기
+def find_ws_by_candidates(sh: gspread.Spreadsheet, names: List[str]) -> Optional[gspread.Worksheet]:
+    for name in names:
+        ws = fuzzy_ws(sh, name)
+        if ws:
+            return ws
+    return None
+
 # ===================== 파일/읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="data", dtype=str)
     df = df.fillna("")
-    # 숫자형
     for c in ["계약년","계약월","계약일","거래금액(만원)"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -195,9 +218,6 @@ def agg_all_stats(df: pd.DataFrame):
     return counts, med, mean
 
 # ===================== 탭 기록 (전국/서울) =====================
-def kdate(d: datetime) -> str:
-    return f"{d.year}. {d.month}. {d.day}"
-
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     vals = _retry(ws.get_all_values)
     if not vals:
@@ -208,26 +228,20 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     return len(vals)+1
 
 def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname: Dict[str,int]):
-    """
-    ⚠️ 변경 포인트:
-    - '알려진 열'에만 값을 씁니다. 모르는 열(예: '예상거래건수')은 절대 손대지 않음.
-    - 총합계/합계는 있으면 채움.
-    """
+    # 알려진 열만 기록 (예상거래건수 등은 손대지 않음)
     hmap = {str(h).strip(): idx+1 for idx,h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_label)
 
     payload = [{"range": f"A{row_idx}", "values": [[date_label]]}]
-
-    # 알려진 헤더만 기록
     for col_name, val in values_by_colname.items():
-        if col_name in hmap:  # 모르는 헤더는 건드리지 않음
+        if col_name in hmap:
             c = hmap[col_name]
             payload.append({"range": f"{a1_col(c)}{row_idx}", "values": [[val]]})
 
-    # 총합계 보정(있으면)
+    # 총합계/합계 있으면 채움
     for possible in ("총합계","합계"):
         if possible in hmap:
-            v = values_by_colname.get("전국", None)
+            v = values_by_colname.get("전국", None)  # 전국 탭은 전국, 서울 탭은 아래에서 서울로 넘겨짐
             if v is not None:
                 payload.append({"range": f"{a1_col(hmap[possible])}{row_idx}", "values": [[int(v)]]})
             break
@@ -237,12 +251,16 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
         log(f"[ws] {ws.title} -> {date_label} row={row_idx}")
 
 # ===================== 거래요약 =====================
-def ym_from_filename(fname: str):
-    # '전국 2509_250929.xlsx' → ('전국 25년 9월','서울 25년 9월','25/9')
+def titles_from_filename(fname: str):
+    # '전국 2509_250929.xlsx' → nat=['전국 25년 9월','전국 2025년 9월'], se=['서울 25년 9월','서울 2025년 9월'], ym='25/9'
     m = re.search(r"(\d{2})(\d{2})_", fname)
-    if not m: return None, None, None
-    yy, mm = m.group(1), int(m.group(2))
-    return f"전국 20{yy}년 {mm}월", f"서울 20{yy}년 {mm}월", f"{yy}/{mm}"
+    if not m:
+        return [], [], None
+    yy2, mm = m.group(1), int(m.group(2))
+    yy4 = f"20{yy2}"
+    nat_candidates = [f"전국 {yy2}년 {mm}월", f"전국 {yy4}년 {mm}월"]
+    seoul_candidates = [f"서울 {yy2}년 {mm}월", f"서울 {yy4}년 {mm}월"]
+    return nat_candidates, seoul_candidates, f"{yy2}/{mm}"
 
 def prev_ym(ym: str) -> str:
     yy, mm = ym.split("/")
@@ -354,18 +372,15 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
         log("[압구정동] no rows")
         return
 
-    # 필수 컬럼 채우기
     for c in APGU_BASE_COLS:
         if c not in df.columns:
             df[c] = ""
 
-    # 오래된 → 최신
     for c in ["계약년","계약월","계약일"]:
         if c not in df.columns:
             df[c] = ""
     df = df.sort_values(["계약년","계약월","계약일"], ascending=[True,True,True], kind="mergesort")
 
-    # 헤더 고정
     vals = _retry(ws.get_all_values) or []
     if not vals:
         _retry(ws.update, [APGU_BASE_COLS], "A1")
@@ -375,7 +390,6 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
         _retry(ws.update, [APGU_BASE_COLS], "A1")
         header = APGU_BASE_COLS
 
-    # 기존 본표 행(변동 블록 제외)
     all_now = _retry(ws.get_all_values) or [header]
     body = all_now[1:]
     base_rows_old: List[List[str]] = []
@@ -384,12 +398,10 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
             break
         base_rows_old.append((r + [""]*len(header))[:len(header)])
 
-    # 오늘 본표 (원본 그대로)
     base_rows_new: List[List[str]] = []
     for _, row in df.iterrows():
         base_rows_new.append([_apgu_norm(row.get(c, "")) for c in APGU_BASE_COLS])
 
-    # 본표 덮어쓰기
     start = 2
     end = start + len(base_rows_new) - 1
     if end < start: end = start
@@ -429,7 +441,6 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     _ensure_rows(ws, end_chg)
     _retry(ws.update, change_rows, f"A{start_chg}:{a1_col(len(change_header))}{end_chg}")
 
-    # 빨간 글씨
     req = {
         "repeatCell": {
             "range": {
@@ -448,7 +459,6 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
 
 # ===================== 메인 =====================
 def main():
-    # 로그 초기화
     try: RUN_LOG.write_text("", encoding="utf-8")
     except Exception: pass
 
@@ -474,20 +484,20 @@ def main():
     sh = _retry(gc.open_by_key, os.environ.get("SHEET_ID","").strip())
     log("[gspread] spreadsheet opened")
 
-    # 파일 수집
     files = sorted(Path(ARTIFACTS_DIR).rglob("전국 *.xlsx"))
     log(f"[collect] found {len(files)} xlsx files")
 
     month_cache = {}  # ym -> {counts, med, mean}
-    today_label = kdate(datetime.now())
-    run_day = datetime.now().date()
+    today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    today_label = f"{today_kst.year}. {today_kst.month}. {today_kst.day}"
+    run_day = today_kst
     apgu_all: List[pd.DataFrame] = []
 
     for p in files:
-        nat_title, se_title, ym = ym_from_filename(p.name)
-        if not ym: 
+        nat_candidates, seoul_candidates, ym = titles_from_filename(p.name)
+        if not ym:
             continue
-        log(f"[file] {p.name} -> nat='{nat_title}' / seoul='{se_title}' / ym={ym}")
+        log(f"[file] {p.name} -> nat={nat_candidates} / seoul={seoul_candidates}")
 
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
@@ -496,30 +506,32 @@ def main():
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
         # 월별 탭 기록 (있는 탭에만, 모르는 열 건드리지 않음)
-        ws_nat = fuzzy_ws(sh, nat_title)
+        ws_nat = find_ws_by_candidates(sh, nat_candidates)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
             values_nat = {}
             for h in header_nat:
-                if not h or h=="날짜": 
+                if not h or h=="날짜":
                     continue
-                if h=="총합계":
+                key = map_header_to_counts_key(h)
+                if h in ("총합계","합계"):
                     values_nat[h] = int(counts.get("전국",0))
-                elif h in counts:              # ✅ 아는 열만 기록
-                    values_nat[h] = int(counts[h])
+                elif key in counts:
+                    values_nat[h] = int(counts[key])
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        ws_se = fuzzy_ws(sh, se_title)
+        ws_se = find_ws_by_candidates(sh, seoul_candidates)
         if ws_se:
             header_se = _retry(ws_se.row_values, 1)
             values_se = {}
             for h in header_se:
                 if not h or h=="날짜":
                     continue
-                if h=="총합계":
+                key = map_header_to_counts_key(h)
+                if h in ("총합계","합계"):
                     values_se[h] = int(counts.get("서울",0))
-                elif h in counts:              # ✅ 아는 열만 기록
-                    values_se[h] = int(counts[h])
+                elif key in counts:
+                    values_se[h] = int(counts[key])
             write_month_sheet(ws_se, today_label, header_se, values_se)
 
         # 압구정동 원본 누적
@@ -530,7 +542,7 @@ def main():
     # 거래요약
     ws_sum = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
     if ws_sum and month_cache:
-        def ym_key(ym): 
+        def ym_key(ym):
             yy, mm = ym.split("/")
             return (int(yy), int(mm))
         for ym in sorted(month_cache.keys(), key=ym_key):
