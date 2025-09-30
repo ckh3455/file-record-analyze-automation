@@ -493,23 +493,40 @@ def main():
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
         # ===== 전국 탭 쓰기 =====
-        ws_nat = fuzzy_ws(sh, nat_title)
-        if ws_nat:
+        # 월별 탭 기록 (있는 탭에만, 모르는 열 건드리지 않음)
+ws_nat = fuzzy_ws(sh, nat_title)
+if ws_nat:
+    header_nat = _retry(ws_nat.row_values, 1)
 
-        # ===== 서울 탭 쓰기 =====
-        ws_se = fuzzy_ws(sh, se_title)
-        if ws_se:
-            header_se = _retry(ws_se.row_values, 1)
-            values_se: Dict[str,int] = {}
-            for h in header_se:
-                if not h or h=="날짜":
-                    continue
-                if h == "총합계":
-                    values_se["총합계"] = int(counts.get("서울",0))
-                else:
-                    if h in counts:
-                        values_se[h] = int(counts[h])
-            write_month_sheet(ws_se, today_label, header_se, values_se)
+    # 전국 탭 헤더 보정: 전국 집계 딕셔너리(counts)는 '서울' 키만 갖고 있으므로
+    # 전국 시트의 '서울특별시' 열과 매칭되도록 미러 키를 추가한다.
+    nat_counts = counts.copy()
+    nat_counts["서울특별시"] = int(counts.get("서울", 0))
+
+    values_nat: Dict[str, int] = {}
+    for h in header_nat:
+        if not h or h == "날짜":
+            continue
+        if h == "총합계":
+            values_nat[h] = int(counts.get("전국", 0))
+        elif h in nat_counts:            # 전국 탭은 정식 광역명(서울특별시 등)
+            values_nat[h] = int(nat_counts[h])
+    write_month_sheet(ws_nat, today_label, header_nat, values_nat)
+
+ws_se = fuzzy_ws(sh, se_title)
+if ws_se:
+    header_se = _retry(ws_se.row_values, 1)
+
+    values_se: Dict[str, int] = {}
+    for h in header_se:
+        if not h or h == "날짜":
+            continue
+        if h == "총합계":
+            values_se[h] = int(counts.get("서울", 0))
+        elif h in counts:                 # 서울 탭은 자치구/압구정동 키 그대로 사용
+            values_se[h] = int(counts[h])
+    write_month_sheet(ws_se, today_label, header_se, values_se)
+
 
         # 압구정동 원본 누적
         ap = df[(df.get("광역","")=="서울특별시") & (df.get("법정동","")=="압구정동")].copy()
