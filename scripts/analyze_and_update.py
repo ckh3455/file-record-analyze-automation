@@ -310,25 +310,27 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     log(f"[summary] {ym} 평균가 -> row={r3}")
 
     # 전월대비 건수증감
+        # 전월대비 건수증감
     if prev_counts:
         diffs = {}
         for c in SUMMARY_COLS:
-            cur = int(counts.get(c,0) or 0)
-            prv = int(prev_counts.get(c,0) or 0)
+            cur = int(counts.get(c, 0) or 0)
+            prv = int(prev_counts.get(c, 0) or 0)
             d = cur - prv
-            diffs[c] = f"+{d}" if d>0 else (str(d) if d<0 else "0")
+            diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
     else:
-        diffs = {c:"" for c in SUMMARY_COLS}
+        diffs = {c: "" for c in SUMMARY_COLS}
 
     r4 = find_summary_row(ws, ym, "전월대비 건수증감")
     put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
 
-    # 헤더 실패해도 크래시하지 않게
+    # 헤더 실패해도 크래시하지 않게 방어
     header = _retry(ws.row_values, 1)
     if not header:
         header = []
     color_diff_line(ws, r4, diffs, header)
     log(f"[summary] {ym} 전월대비 -> row={r4}")
+
 
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
