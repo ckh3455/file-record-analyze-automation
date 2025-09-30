@@ -768,17 +768,24 @@ def main():
 
     # ===== 예측(최근 3개월) =====
         # ===== 예측(최근 3개월) =====
+        # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10~2025-06(9개월 고정) =====
     if ws_sum:
         month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
         today = datetime.now().date()
 
-        # yymm <-> (YYYY, M) 변환 유틸
+        # 유틸
         def ym_to_yM(ym: str) -> Tuple[int,int]:
             a, b = ym.split("/")
             return 2000 + int(a), int(b)
 
         def yM_to_ym(y: int, m: int) -> str:
             return f"{str(y % 100).zfill(2)}/{m}"
+
+        def add_months(y, m, delta):
+            nm = m + delta
+            y += (nm - 1) // 12
+            nm = ((nm - 1) % 12) + 1
+            return y, nm
 
         # 모든 월 시트 맵
         ym_ws: Dict[str, gspread.Worksheet] = {}
@@ -788,47 +795,26 @@ def main():
                 ym_ws[ym] = ws
 
         if ym_ws:
-            # 정렬
-            def ym_key(ym):
-                y, m = ym_to_yM(ym)
-                return (y, m)
+            def ym_key(ym): y, m = ym_to_yM(ym); return (y, m)
             yms_sorted = sorted(ym_ws.keys(), key=ym_key)
 
-            # ── 최근 3개월(오늘 기준, "현재월 포함X") ─────────────────────────────
+            # ── 학습 구간: 2024-10 ~ 2025-06 정확히 9개월 ──────────────────────
+            TRAIN_START_Y, TRAIN_START_M = 2024, 10
+            TRAIN_MONTHS = 9
+            train_list_yM = [add_months(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
+            learn_yms = [yM_to_ym(y, m) for (y, m) in train_list_yM if yM_to_ym(y, m) in ym_ws]
+
+            # ── 예측 구간: 현재월 포함 최근 3개월 (현재월, 현재월-1, 현재월-2) ───────
             cur_y, cur_m = today.year, today.month
-            # recent3_end = (현재월 - 1), recent3 = (현재월-1, -2, -3)
-            def add_months(y, m, delta):
-                # delta는 음수 가능
-                nm = m + delta
-                y += (nm - 1) // 12
-                nm = ((nm - 1) % 12) + 1
-                return y, nm
+            r3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
+            recent3 = [yM_to_ym(y, m) for (y, m) in r3_yM if yM_to_ym(y, m) in ym_ws]
+            recent3 = sorted(recent3, key=ym_key)  # 시간순 정렬
 
-            r3_end_y, r3_end_m = add_months(cur_y, cur_m, -1)  # 직전월
-            recent3_yM = [add_months(r3_end_y, r3_end_m, -i) for i in range(0, 3)]
-            recent3 = [yM_to_ym(y, m) for (y, m) in sorted(recent3_yM)]
+            # 레벨별 학습(전국, 서울) → 곡선 만들기
+            level_curves: Dict[str, Dict[str, List[float]]] = {}  # level -> {region: curve[0..90]}
+            level_obs_cols: Dict[str, set] = {}  # level -> 관측 가능 지역 집합
 
-            # 시트가 실제로 있어야 예측 가능
-            recent3 = [ym for ym in recent3 if ym in ym_ws]
-
-            # ── 학습 구간: 2024-10 ~ (현재월 - 3개월) ────────────────────────────
-            learn_end_y, learn_end_m = add_months(cur_y, cur_m, -3)
-            def between_2024_10_and(y, m, end_y, end_m):
-                if (y, m) < (2024, 10):
-                    return False
-                if (y, m) > (end_y, end_m):
-                    return False
-                return True
-
-            learn_yms = []
-            for ym in yms_sorted:
-                y, m = ym_to_yM(ym)
-                if between_2024_10_and(y, m, learn_end_y, learn_end_m):
-                    learn_yms.append(ym)
-
-            # 레벨별 처리: '전국 ...' 계열, '서울 ...' 계열을 각각
             for level_prefix in ["전국", "서울"]:
-                # ── 1) 학습 프레임 수집 + 지역 우주(합집합) 만들기 ────────────────
                 learn_frames: List[Tuple[pd.DataFrame, pd.DataFrame, date]] = []
                 region_universe: set = set()
 
@@ -839,24 +825,22 @@ def main():
                     df_cum = month_sheet_to_frame(ws)
                     if df_cum.empty:
                         continue
-
-                    # 이 월에서 관측되는 지역 컬럼들(누적 기록 테이블의 열들)
-                    cur_regions = [c for c in df_cum.columns if c != "date"]
-                    region_universe.update(cur_regions)
-
+                    region_universe.update([c for c in df_cum.columns if c != "date"])
                     fday = first_data_date(ws)
                     if not fday:
                         continue
                     df_inc = daily_increments(df_cum)
                     learn_frames.append((df_cum, df_inc, fday))
 
-                # 거래요약의 열과 교집합만 예측: (존재하지 않는 지역은 빈값)
-                region_cols_ref = [c for c in SUMMARY_COLS if c in region_universe or c == "총합계"]
+                # 거래요약의 전체 열 중, 이 레벨에서 관측 가능한 열만 대상으로 곡선 생성
+                region_cols_ref = [c for c in SUMMARY_COLS if c in region_universe]
+                level_obs_cols[level_prefix] = set(region_cols_ref)
+
                 if not learn_frames or not region_cols_ref:
-                    log(f"[predict] skip: insufficient learn frames or no intersect columns for '{level_prefix}'")
+                    log(f"[predict] '{level_prefix}' 학습 데이터 부족: skip")
+                    level_curves[level_prefix] = {}
                     continue
 
-                # ── 2) 평균 완성도 곡선(최대 90일) 구축 ───────────────────────────
                 horizon = 90
                 curves = {r: [0.0]*(horizon+1) for r in region_cols_ref}
                 counts = {r: [0]*(horizon+1) for r in region_cols_ref}
@@ -872,47 +856,63 @@ def main():
 
                 for r in region_cols_ref:
                     for d in range(1, horizon+1):
-                        if counts[r][d] > 0:
-                            curves[r][d] /= counts[r][d]
-                        else:
-                            curves[r][d] = 0.5  # 데이터 없으면 기본값
+                        curves[r][d] = (curves[r][d] / counts[r][d]) if counts[r][d] > 0 else 0.5
 
-                # ── 3) 최근 3개월 예측(모든 SUMMARY_COLS에 대해) + 거래요약 기록 ───
-                for ym in recent3:
+                level_curves[level_prefix] = curves
+
+            # ── 최근 3개월 각각에 대해: 두 레벨의 예측을 병합해 한 번만 기록 ────────
+            for ym in recent3:
+                # 초기 맵: 모든 SUMMARY_COLS를 공란으로
+                merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
+
+                # 전국/서울 각각에서 관측 누적→예측
+                for level_prefix in ["전국", "서울"]:
                     ws = ym_ws.get(ym)
-                    if not ws or not ws.title.startswith(level_prefix):
+                    # 해당 ym의 해당 레벨 탭이 없을 수도 있으니 다시 찾아보기
+                    # (동일 ym에 "전국 ...", "서울 ..." 2개가 있어야 이상적)
+                    # 현재 ws는 하나뿐일 수 있어 level별로 다시 선택
+                    ws_level = None
+                    for cand in [w for w in sh.worksheets() if re.search(rf"^{level_prefix}\s+\d{{4}}년\s+\d{{1,2}}월$", w.title)]:
+                        if yymm_from_title(cand.title) == ym:
+                            ws_level = cand
+                            break
+                    if not ws_level:
                         continue
 
-                    df_cum = month_sheet_to_frame(ws)
+                    df_cum = month_sheet_to_frame(ws_level)
                     if df_cum.empty:
                         continue
-                    fday = first_data_date(ws)
-                    lday = latest_data_date(ws)
+                    fday = first_data_date(ws_level)
+                    lday = latest_data_date(ws_level)
                     if not fday or not lday:
                         continue
 
-                    # 관측치가 존재하는 지역
-                    observed_row = df_cum.iloc[-1] if len(df_cum) else pd.Series(dtype=object)
+                    last_row = df_cum.iloc[-1]
                     day_idx = (lday - fday).days + 1
 
-                    pred_map: Dict[str, int] = {}
-                    # 거래요약의 모든 열을 순회
-                    for region in SUMMARY_COLS:
-                        if region in region_cols_ref and region in observed_row.index:
-                            obs = int(float(observed_row.get(region, 0)) or 0)
-                            curve = curves.get(region, [0.0]*(horizon+1))
-                            pred = blend_predict(obs, day_idx, curve)
-                            pred_map[region] = pred
-                        else:
-                            # 이 레벨/월 탭에서 관측되지 않는 지역은 공란
-                            pred_map[region] = ""
+                    curves = level_curves.get(level_prefix, {})
+                    obs_cols = level_obs_cols.get(level_prefix, set())
 
-                    write_predicted_line(ws_sum, ym, pred_map)
+                    for region in (obs_cols & set(last_row.index)):
+                        obs = int(float(last_row.get(region, 0)) or 0)
+                        curve = curves.get(region, [0.0]*91)
+                        pred = blend_predict(obs, day_idx, curve)
+                        merged_pred[region] = pred  # 이 레벨에서 관측되는 지역 채움
 
-            # ── 4) 거래량 패턴분석 탭(차트 위치 오류 수정 포함) ───────────────────
+                # “예상건수” 한 번만 기록 (두 레벨 병합 결과)
+                write_predicted_line(ws_sum, ym, merged_pred)
+
+            # ── 패턴 분석 탭: 가장 최신 월(보통 현재월)로 표+그래프 ──────────────
             if recent3:
                 latest_ym = sorted(recent3, key=ym_key)[-1]
-                ws_latest = ym_ws.get(latest_ym)
+                # 우선순위: 현재월의 "서울 ..." 있으면 그걸로, 없으면 "전국 ..." 사용
+                ws_latest = None
+                for pref in ["서울", "전국"]:
+                    for cand in [w for w in sh.worksheets() if re.search(rf"^{pref}\s+\d{{4}}년\s+\d{{1,2}}월$", w.title)]:
+                        if yymm_from_title(cand.title) == latest_ym:
+                            ws_latest = cand
+                            break
+                    if ws_latest: break
                 if ws_latest:
                     df_cum = month_sheet_to_frame(ws_latest)
                     df_inc = daily_increments(df_cum)
@@ -924,6 +924,7 @@ def main():
                     if not targets:
                         targets = [c for c in df_cum.columns if c != "date"][:3]
                     render_pattern_analysis(sh, ws_latest.title, df_cum, df_inc, targets[:3])
+
 
     log("[main] done")
 
