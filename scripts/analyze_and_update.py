@@ -19,7 +19,7 @@ ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 SUMMARY_SHEET_NAME = "거래요약"
 
 # 거래요약에 기록할 열 (시트 열명과 동일, 정식표기)
-# 주의: 여기에는 '서울'도 포함돼 있지만, 실제 "거래요약" 헤더 생성/기록 시에는 '서울'을 절대 쓰지 않도록 아래 로직에서 차단함
+# 주의: 리스트에 '서울'이 있어도 실제 기록/헤더에서는 절대 사용하지 않고 모두 '서울특별시'로 강제됨
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
     "강남구", "압구정동",
@@ -393,26 +393,25 @@ def _norm_colname(s: str) -> str:
 def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     header = _retry(ws.row_values, 1)
     if not header:
-        # ▼ 기본 헤더 생성 시 '서울' 제외 (새 컬럼 방지)
+        # 기본 헤더 생성 시 '서울' 제외 (새 컬럼 방지)
         default_cols = [c for c in SUMMARY_COLS if c != "서울"]
         _retry(ws.update, [["년월", "구분"] + default_cols], "A1")
         header = ["년월", "구분"] + default_cols
 
-    hmap_norm = {_norm_colname(h): i + 1 for i, h in enumerate(header)}
     sheet_prefix = f"'{ws.title}'!"
+
+    # line_map에서 '서울' 키는 절대 쓰지 않도록 '서울특별시'로 강제 매핑
+    safe_line_map = {}
+    for k_raw, v in (line_map or {}).items():
+        k = "서울특별시" if k_raw == "서울" else k_raw
+        safe_line_map[k] = v
+
+    hmap_norm = {_norm_colname(h): i + 1 for i, h in enumerate(header)}
 
     payload = [
         {"range": f"{sheet_prefix}A{row_idx}", "values": [[ym]]},
         {"range": f"{sheet_prefix}B{row_idx}", "values": [[label]]},
     ]
-
-    # line_map에서 '서울' 키는 절대 쓰지 않도록 '서울특별시'로 강제 매핑
-    safe_line_map = {}
-    for k_raw, v in (line_map or {}).items():
-        k = k_raw
-        if k == "서울":
-            k = "서울특별시"
-        safe_line_map[k] = v
 
     for k_raw, v in safe_line_map.items():
         k = _norm_colname(k_raw)
@@ -422,6 +421,7 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                 "values": [[v]]
             })
 
+    # 총합계/합계 처리 (없으면 0)
     for possible in ("총합계", "합계"):
         pn = _norm_colname(possible)
         if pn in hmap_norm:
@@ -474,7 +474,6 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     if prev_counts:
         diffs = {}
         for c in SUMMARY_COLS:
-            # '서울'은 비교 대상에서 제외하고 '서울특별시'만 사용
             key = "서울특별시" if c == "서울" else c
             cur = int(counts.get(key, 0) or 0)
             prv = int(prev_counts.get(key, 0) or 0)
@@ -493,7 +492,9 @@ def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     r = find_summary_row(ws_sum, ym, "예상건수")
     # 안전망: pred_map에 '서울' 키가 있으면 '서울특별시'로 이동
     if pred_map and "서울" in pred_map:
-        pred_map["서울특별시"] = pred_map.pop("서울")
+        if (pred_map.get("서울특별시") in ("", None)) and (pred_map["서울"] not in ("", None)):
+            pred_map["서울특별시"] = pred_map["서울"]
+        pred_map.pop("서울", None)
 
     put_summary_line(ws_sum, r, ym, "예상건수", pred_map)
     header = _retry(ws_sum.row_values, 1)
@@ -939,7 +940,7 @@ def main():
                     counts = {}
                     for k_n, v in merged_n.items():
                         human = next((orig for orig in SUMMARY_COLS if _norm(orig) == k_n), k_n)
-                        if human == "서울":  # '서울' 금지
+                        if human == "서울":
                             human = "서울특별시"
                         counts[human] = v
 
@@ -1167,12 +1168,22 @@ def main():
                     filled_local += 1
 
                 # 총합계도 동일 방식으로 폴백 계산
+                sum_series = None
                 if TOTAL_N in df_idx.columns:
-                    s_sum = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
-                    nz_sum = s_sum.to_numpy().nonzero()[0]
+                    # (a) 총합계 열이 있을 때: 그걸로 사용
+                    sum_series = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
+                else:
+                    # (b) 총합계 열이 없을 때: 서울이면 구들의 합으로 총합계 시리즈 생성
+                    if level == "서울":
+                        gu_cols = [c for c in df_idx.columns if c != "date" and c in SEOUL_SET_N]
+                        if gu_cols:
+                            sum_series = pd.to_numeric(df_idx[gu_cols], errors="coerce").fillna(0).astype(int).sum(axis=1)
+
+                if sum_series is not None:
+                    nz_sum = sum_series.to_numpy().nonzero()[0]
                     if len(nz_sum) > 0:
                         last_nz_i = int(nz_sum[-1])
-                        obs_sum = int(s_sum.iloc[last_nz_i])
+                        obs_sum = int(sum_series.iloc[last_nz_i])
                         obs_date_sum = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
                         day_idx_sum = (obs_date_sum - fday).days + 1
                         if day_idx_sum < 1:
@@ -1189,15 +1200,22 @@ def main():
                         if level == "전국":
                             merged_pred["전국"] = sum_pred
                         if level == "서울":
-                            # '서울' 컬럼 금지, '서울특별시'만 기록
+                            # ★ 서울 총합계를 '서울특별시'에 반드시 기록
                             merged_pred["서울특별시"] = sum_pred
                         filled_local += 1
+                else:
+                    dbg(f"[predict] {level} {ym}: 총합계/구합 생성 실패")
 
                 dbg(f"[predict] {level} {ym}: filled_local={filled_local}")
 
-            # 안전망: 혹시 남아있다면 '서울' -> '서울특별시'
+            # ★ 마지막 안전망: '서울'이 남아있으면 '서울특별시'로 합치기
             if "서울" in merged_pred:
-                merged_pred["서울특별시"] = merged_pred.pop("서울")
+                if (merged_pred.get("서울특별시") in ("", None)) and (merged_pred["서울"] not in ("", None)):
+                    merged_pred["서울특별시"] = merged_pred["서울"]
+                merged_pred.pop("서울", None)
+
+            # 디버그: 이번 ym에서 서울특별시 예측값 확인
+            dbg(f"[predict] {ym} 서울특별시 pred={merged_pred.get('서울특별시', None)}")
 
             write_predicted_line(ws_sum, ym, merged_pred)
 
