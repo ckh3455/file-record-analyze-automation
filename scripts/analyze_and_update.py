@@ -127,7 +127,9 @@ def read_month_df(path: Path) -> pd.DataFrame:
     return df
 
 def eok_series(ser) -> pd.Series:
-    s = pd.to_numeric(ser, errors="coerce").dropna()
+    # list/ndarray도 안전히 처리
+    s = pd.Series(ser)
+    s = pd.to_numeric(s, errors="coerce").dropna()
     if s.empty:
         return pd.Series([], dtype=float)
     return s / 10000.0
@@ -642,13 +644,24 @@ def read_counts_from_month_sheet(ws: gspread.Worksheet) -> Dict[str, int]:
                 out[col] = int(float(last[col] or 0))
             except Exception:
                 out[col] = 0
-    # 월 시트의 '총합계'가 있으면 전국/서울 합계로 보정
+    # 월 시트의 '총합계'가 있으면 전국 합계로 보정
     if "총합계" in last.index:
         try:
             out["전국"] = int(float(last["총합계"] or out.get("전국", 0)))
         except Exception:
             pass
     return out
+
+# ===== 추가: 무자료 달(엑셀 비거나 숫자 없음) 판정 =====
+def is_no_data_month(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return True
+    need = {"계약년", "계약월"}
+    if not need.issubset(set(df.columns)):
+        return True
+    yy = pd.to_numeric(df["계약년"], errors="coerce")
+    mm = pd.to_numeric(df["계약월"], errors="coerce")
+    return (yy.dropna().empty or mm.dropna().empty)
 
 # ===================== 메인 =====================
 def main():
@@ -697,17 +710,50 @@ def main():
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
 
+        # ===== 무자료 달: 0 기록 처리 =====
+        if is_no_data_month(df):
+            log(f"[no-data] {p.name} -> 0건으로 기록")
+            zero_counts = {c: 0 for c in SUMMARY_COLS}
+            empty_med   = {c: "" for c in SUMMARY_COLS}
+            empty_mean  = {c: "" for c in SUMMARY_COLS}
+            month_cache[ym] = {"counts": zero_counts, "med": empty_med, "mean": empty_mean}
+
+            # 전국 탭 0 기록
+            ws_nat = fuzzy_ws(sh, nat_title)
+            if ws_nat:
+                header_nat = _retry(ws_nat.row_values, 1)
+                values_nat = {}
+                for h in header_nat:
+                    if not h or h == "날짜": continue
+                    if h == "총합계": values_nat["총합계"] = 0
+                    elif h in zero_counts: values_nat[h] = 0
+                write_month_sheet(ws_nat, today_label, header_nat, values_nat)
+
+            # 서울 탭 0 기록
+            ws_se = fuzzy_ws(sh, se_title)
+            if ws_se:
+                header_se = _retry(ws_se.row_values, 1)
+                values_se = {}
+                for h in header_se:
+                    if not h or h == "날짜": continue
+                    if h == "총합계": values_se["총합계"] = 0
+                    elif h in zero_counts: values_se[h] = 0
+                write_month_sheet(ws_se, today_label, header_se, values_se)
+
+            # 압구정 누적은 건너뜀
+            continue
+
+        # ===== 정상 달 처리 =====
         counts, med, mean = agg_all_stats(df)
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
-        # ===== 전국 탭 쓰기 =====
+        # 전국 탭 쓰기
         ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
             values_nat: Dict[str, int] = {}
             for h in header_nat:
-                if not h or h == "날짜":
-                    continue
+                if not h or h == "날짜": continue
                 if h == "총합계":
                     values_nat["총합계"] = int(counts.get("전국", 0))
                 else:
@@ -715,14 +761,13 @@ def main():
                         values_nat[h] = int(counts[h])
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        # ===== 서울 탭 쓰기 =====
+        # 서울 탭 쓰기
         ws_se = fuzzy_ws(sh, se_title)
         if ws_se:
             header_se = _retry(ws_se.row_values, 1)
             values_se: Dict[str, int] = {}
             for h in header_se:
-                if not h or h == "날짜":
-                    continue
+                if not h or h == "날짜": continue
                 if h == "총합계":
                     values_se["총합계"] = int(counts.get("서울", 0))
                 else:
@@ -738,7 +783,7 @@ def main():
     # ===== 거래요약 =====
     ws_sum = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
     if ws_sum:
-        # (1) 원본 파일로 확보된 월들 먼저 기록
+        # (1) 원본 파일/무자료 처리로 확보된 월들 먼저 기록
         if month_cache:
             def ym_key(ym):
                 yy, mm = ym.split("/")
@@ -834,7 +879,6 @@ def main():
 
             # 실제 쓰기: counts가 있으면 거래건수/전월대비는 항상 덮어쓰기
             if counts:
-                # 거래건수
                 r_cnt = find_summary_row(ws_sum, ym, "거래건수")
                 put_summary_line(ws_sum, r_cnt, ym, "거래건수", counts)
 
@@ -963,7 +1007,7 @@ def main():
 
                 level_curves[level_prefix] = curves
 
-            # 최근 3개월 각각에 대해: 두 레벨의 예측을 병합해 “예상건수” 한 번만 기록
+            # 최근 3개월 각각: 두 레벨의 예측을 병합해 “예상건수” 한 번만 기록
             for ym in recent3:
                 merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
 
@@ -994,11 +1038,11 @@ def main():
                         obs = int(float(last_row.get(region, 0)) or 0)
                         curve = curves.get(region, [0.0]*91)
                         pred = blend_predict(obs, day_idx, curve)
-                        merged_pred[region] = pred  # 이 레벨에서 관측되는 지역 채움
+                        merged_pred[region] = pred
 
                 write_predicted_line(ws_sum, ym, merged_pred)
 
-            # 패턴 분석 탭: 가장 최신(보통 현재월)로 표+그래프
+            # 패턴 분석 탭: 최신 월 표+그래프
             if recent3:
                 latest_ym = sorted(recent3, key=ym_key2)[-1]
                 ws_latest = None
