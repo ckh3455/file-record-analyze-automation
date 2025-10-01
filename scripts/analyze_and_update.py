@@ -30,7 +30,7 @@ SUMMARY_COLS = [
     "강원특별자치도", "경상남도", "경상북도", "전라남도", "전북특별자치도", "충청남도", "충청북도", "제주특별자치도"
 ]
 
-# 서울/전국 탭의 지역 열(사용자 지정)
+# 서울/전국 탭의 지역 열
 SEOUL_REGIONS = [
     "강남구","강동구","강북구","강서구","관악구","광진구","구로구","금천구","노원구","도봉구",
     "동대문구","동작구","마포구","서대문구","서초구","성동구","성북구","송파구","양천구","영등포구",
@@ -72,6 +72,10 @@ def log(msg: str):
             f.write(line + "\n")
     except Exception:
         pass
+
+def dbg(msg: str):
+    # 디버깅 강화를 위해 별도 prefix
+    log(f"[DBG] {msg}")
 
 _LAST = 0.0
 def _throttle(sec=0.60):  # RPS 완화
@@ -490,7 +494,8 @@ def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     }]
     batch_format(ws_sum, reqs)
     filled = sum(1 for v in (pred_map or {}).values() if (isinstance(v, int) and v > 0))
-    log(f"[summary] {ym} 예상건수 -> row={r} (green bold) filled={filled}")
+    nonempty = sum(1 for v in (pred_map or {}).values() if (v != "" and v is not None))
+    log(f"[summary] {ym} 예상건수 -> row={r} (green bold) filled={filled}, nonempty={nonempty}")
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
 APGU_BASE_COLS = [
@@ -969,7 +974,7 @@ def main():
         else:
             log("[압구정동] sheet not found (skip)")
 
-    # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10 이후 '존재하는 모든 월' =====
+    # ===== 예측(현재월 포함 최근 3개월) : 2024-10 이후 '존재하는 모든 월'로 학습 =====
     if ws_sum:
         sheets = list_month_sheets(sh)
         if not sheets["서울"] and not sheets["전국"]:
@@ -999,12 +1004,15 @@ def main():
             for ym, ws in sorted(pool.items(), key=lambda kv: ym_to_key(kv[0])):
                 df_cum = month_sheet_to_frame(ws)
                 if df_cum.empty:
+                    dbg(f"[predict] {level} {ym} df_cum empty")
                     continue
                 fday = first_data_date(ws)
                 if not fday:
+                    dbg(f"[predict] {level} {ym} first-day missing")
                     continue
                 region_universe.update([c for c in df_cum.columns if c != "date"])
                 learn_frames.append((df_cum, fday))
+                dbg(f"[predict] {level} {ym} learn rows={len(df_cum)} regions={len(region_universe)}")
 
             if not learn_frames:
                 log(f"[predict] '{level}' 학습 데이터 부족: skip")
@@ -1044,6 +1052,7 @@ def main():
             level_curves[level] = curves
             if level == "전국":
                 national_curves_ref = curves  # 서울 백업용
+            dbg(f"[predict] {level} learned regions={len(region_cols)}")
 
         # 최근 3개월(현재월 포함)
         today = datetime.now().date()
@@ -1058,6 +1067,7 @@ def main():
         targets = [key_to_ym(*add_months(cur_y, cur_m, -i)) for i in range(0, 3)]
         targets = [ym for ym in targets if ym in sheets["전국"] or ym in sheets["서울"]]
         targets = sorted(set(targets), key=lambda ym: (2000 + int(ym.split("/")[0]), int(ym.split("/")[1])))
+        dbg(f"[predict] targets={targets}")
 
         for ym in targets:
             # 초기화: 거래요약의 모든 열을 ""로 두고, 예측이 나오면 숫자로 덮어씀
@@ -1066,79 +1076,98 @@ def main():
             for level in ["전국", "서울"]:
                 ws_level = sheets[level].get(ym)
                 if not ws_level:
+                    dbg(f"[predict] skip {level} {ym}: no ws")
                     continue
 
                 df_cum = month_sheet_to_frame(ws_level)
                 if df_cum.empty:
+                    dbg(f"[predict] skip {level} {ym}: df_cum empty")
                     continue
                 fday = first_data_date(ws_level)
                 lday = latest_data_date(ws_level)
                 if not fday or not lday:
+                    dbg(f"[predict] skip {level} {ym}: fday/lday missing fday={fday} lday={lday}")
                     continue
 
-                # 누적 데이터프레임에서 각 지역의 마지막 “0이 아닌” 누적값을 관측치로 사용
-# 관측치 날짜(=해당 누적값이 기록된 마지막 날짜)로 day_idx 산출
-df_idx = df_cum[["date"] + list(use_cols)].copy()
+                # 학습에서 얻은 지역 집합
+                trained_cols = level_obs_cols.get(level, set())
+                # 타깃 시트 실제 컬럼
+                actual_cols = set(df_cum.columns) - {"date"}
+                # 허용 지역(서울=구들, 전국=광역시·도) + 총합계
+                allow_set = (SEOUL_SET_N if level == "서울" else NATION_SET_N) | {TOTAL_N}
 
-for region_n in use_cols:
-    # 해당 지역의 누적 시계열
-    if region_n not in df_idx.columns:
-        continue
-    s = pd.to_numeric(df_idx[region_n], errors="coerce").fillna(0).astype(int)
+                # 사용할 지역: (학습집합 있으면 그것, 없으면 타깃 컬럼) ∩ 허용집합
+                use_cols = ((trained_cols or actual_cols) & allow_set)
+                if not use_cols:
+                    dbg(f"[predict] skip {level} {ym}: use_cols empty")
+                    continue
 
-    # 마지막 0이 아닌 값의 인덱스 찾기
-    nz = s.to_numpy().nonzero()[0]
-    if len(nz) == 0:
-        # 전부 0이면 이번 지역은 스킵
-        continue
+                dbg(f"[predict] {level} {ym}: use_cols={len(use_cols)} fday={fday} lday={lday} rows={len(df_cum)}")
 
-    last_nz_i = int(nz[-1])
-    obs = int(s.iloc[last_nz_i])
-    obs_date = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
+                # 지역별 관측값 = "마지막 0이 아닌 누적"
+                df_idx = df_cum[["date"] + list(use_cols)].copy()
 
-    # 관측일 기준 day_idx
-    day_idx = (obs_date - fday).days + 1
-    if day_idx < 1:
-        day_idx = 1
+                # 레벨 곡선
+                curves = level_curves.get(level, {})
 
-    # 곡선: 레벨 곡선 → 전국 백업 → 기본곡선
-    curve = curves.get(region_n)
-    if curve is None and national_curves_ref:
-        curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
-    if curve is None:
-        curve = [0.0] + [0.5] * 90  # horizon=90
+                filled_local = 0
+                for region_n in use_cols:
+                    if region_n not in df_idx.columns:
+                        continue
+                    s = pd.to_numeric(df_idx[region_n], errors="coerce").fillna(0).astype(int)
+                    nz = s.to_numpy().nonzero()[0]
+                    if len(nz) == 0:
+                        continue
 
-    pred = blend_predict(obs, day_idx, curve)
+                    last_nz_i = int(nz[-1])
+                    obs = int(s.iloc[last_nz_i])
+                    obs_date = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
 
-    # 거래요약 표의 원래 열명으로 역매핑(정규명→원표기)
-    human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
-    merged_pred[human_key] = pred
+                    day_idx = (obs_date - fday).days + 1
+                    if day_idx < 1:
+                        day_idx = 1
 
-# 총합계도 동일한 방식으로 계산 (있을 때만)
-if TOTAL_N in df_idx.columns:
-    s_sum = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
-    nz_sum = s_sum.to_numpy().nonzero()[0]
-    if len(nz_sum) > 0:
-        last_nz_i = int(nz_sum[-1])
-        obs_sum = int(s_sum.iloc[last_nz_i])
-        obs_date_sum = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
-        day_idx_sum = (obs_date_sum - fday).days + 1
-        if day_idx_sum < 1:
-            day_idx_sum = 1
+                    # 곡선: 레벨 → 전국 백업 → 기본
+                    curve = curves.get(region_n)
+                    if curve is None and national_curves_ref:
+                        curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
+                    if curve is None:
+                        curve = [0.0] + [0.5] * 90
 
-        sum_curve = curves.get(TOTAL_N)
-        if sum_curve is None and national_curves_ref:
-            sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
-        if sum_curve is None:
-            sum_curve = [0.0] + [0.5] * 90
+                    pred = blend_predict(obs, day_idx, curve)
 
-        sum_pred = blend_predict(obs_sum, day_idx_sum, sum_curve)
-        merged_pred["총합계"] = sum_pred
-        if level == "전국":
-            merged_pred["전국"] = sum_pred
-        if level == "서울":
-            merged_pred["서울"] = sum_pred
+                    # 거래요약 표의 원래 열명으로 역매핑(정규명→원표기)
+                    human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
+                    merged_pred[human_key] = pred
+                    filled_local += 1
 
+                # 총합계도 동일 방식으로 폴백 계산
+                if TOTAL_N in df_idx.columns:
+                    s_sum = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
+                    nz_sum = s_sum.to_numpy().nonzero()[0]
+                    if len(nz_sum) > 0:
+                        last_nz_i = int(nz_sum[-1])
+                        obs_sum = int(s_sum.iloc[last_nz_i])
+                        obs_date_sum = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
+                        day_idx_sum = (obs_date_sum - fday).days + 1
+                        if day_idx_sum < 1:
+                            day_idx_sum = 1
+
+                        sum_curve = curves.get(TOTAL_N)
+                        if sum_curve is None and national_curves_ref:
+                            sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
+                        if sum_curve is None:
+                            sum_curve = [0.0] + [0.5] * 90
+
+                        sum_pred = blend_predict(obs_sum, day_idx_sum, sum_curve)
+                        merged_pred["총합계"] = sum_pred
+                        if level == "전국":
+                            merged_pred["전국"] = sum_pred
+                        if level == "서울":
+                            merged_pred["서울"] = sum_pred
+                        filled_local += 1
+
+                dbg(f"[predict] {level} {ym}: filled_local={filled_local}")
 
             write_predicted_line(ws_sum, ym, merged_pred)
 
