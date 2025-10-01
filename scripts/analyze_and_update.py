@@ -6,6 +6,7 @@ import os, re, json, time, random
 from pathlib import Path
 from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional
+from typing import Union  # <-- 최상단 import 섹션에 둡니다 (for 루프 안 X)
 
 import pandas as pd
 import gspread
@@ -1072,14 +1073,14 @@ def main():
 # ...
 for ym in targets:
     # 초기화: 거래요약 컬럼 전부 "" 로 세팅 (예측 채우면서 숫자로 덮어씀)
+    for ym in targets:
+    # 초기화: 거래요약의 모든 열을 ""로 두고, 예측이 나오면 숫자로 덮어씁니다.
     merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
 
     for level in ["전국", "서울"]:
         ws_level = sheets[level].get(ym)
         if not ws_level:
             continue
-        # 이하 동일...
-
 
         df_cum = month_sheet_to_frame(ws_level)
         if df_cum.empty:
@@ -1094,53 +1095,43 @@ for ym in targets:
         if day_idx < 1:
             day_idx = 1
 
-        # 1) 학습에서 얻은 지역 집합
+        # 학습에서 얻은 지역 집합
         trained_cols = level_obs_cols.get(level, set())
-
-        # 2) 타깃 시트 실제 컬럼
+        # 타깃 시트 실제 컬럼
         actual_cols = set(last_row.index)
+        # 허용 지역(서울=구들, 전국=광역시·도) + 총합계
+        allow_set = (SEOUL_SET_N if level == "서울" else NATION_SET_N) | {TOTAL_N}
 
-        # 3) 허용 지역 세트 (서울/전국별)
-        allow_set = SEOUL_SET_N if level == "서울" else NATION_SET_N
-        allow_set = set(allow_set) | {TOTAL_N}  # 총합계 포함
-
-        # 4) 사용할 지역 = (학습집합이 있으면 그걸, 아니면 타깃의 실제컬럼) ∩ 허용집합
-        if trained_cols:
-            use_cols = (trained_cols & actual_cols & allow_set)
-        else:
-            # ★ 백업: 학습이 비었으면 타깃 컬럼으로 예측 강행
-            use_cols = (actual_cols & allow_set)
-
+        # 사용할 지역: (학습집합 있으면 그것, 없으면 타깃 컬럼) ∩ 허용집합
+        use_cols = (trained_cols or actual_cols) & allow_set
         if not use_cols:
-            # 그래도 없으면 스킵
             continue
 
         curves = level_curves.get(level, {})
         for region_n in use_cols:
-            # 관측치
             obs = int(float(last_row.get(region_n, 0)) or 0)
 
-            # 곡선: 레벨 → (전국 백업) → 기본
+            # 곡선: 레벨 곡선 → 전국 백업 → 기본곡선
             curve = curves.get(region_n)
             if curve is None and national_curves_ref:
                 curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
             if curve is None:
-                curve = [0.0] + [0.5]*90  # horizon 90과 맞춘 기본곡선
+                curve = [0.0] + [0.5] * 90
 
             pred = blend_predict(obs, day_idx, curve)
 
-            # 거래요약의 사람용 키로 매핑(정규명→원표기)
+            # 거래요약에 쓰는 사람용 키로 역매핑(정규명→원표기)
             human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
             merged_pred[human_key] = pred
 
-        # 총합계 → '전국'/'서울' 컬럼에도 기록
+        # 총합계 → '전국'/'서울' 컬럼도 채움
         if TOTAL_N in last_row.index:
             obs_sum = int(float(last_row.get(TOTAL_N, 0)) or 0)
             sum_curve = curves.get(TOTAL_N)
             if sum_curve is None and national_curves_ref:
                 sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
             if sum_curve is None:
-                sum_curve = [0.0] + [0.5]*90
+                sum_curve = [0.0] + [0.5] * 90
             sum_pred = blend_predict(obs_sum, day_idx, sum_curve)
             merged_pred["총합계"] = sum_pred
             if level == "전국":
@@ -1149,6 +1140,7 @@ for ym in targets:
                 merged_pred["서울"] = sum_pred
 
     write_predicted_line(ws_sum, ym, merged_pred)
+
 
 
         # 패턴 분석 탭: 최신 월 표+그래프
