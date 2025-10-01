@@ -1067,12 +1067,19 @@ def main():
         targets = sorted(set(targets), key=lambda ym: ym_to_key(ym))
 
         for ym in targets:
-    merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
+    from typing import Union  # 파일 상단에 이미 없다면 추가
+
+# ...
+for ym in targets:
+    # 초기화: 거래요약 컬럼 전부 "" 로 세팅 (예측 채우면서 숫자로 덮어씀)
+    merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
 
     for level in ["전국", "서울"]:
         ws_level = sheets[level].get(ym)
         if not ws_level:
             continue
+        # 이하 동일...
+
 
         df_cum = month_sheet_to_frame(ws_level)
         if df_cum.empty:
