@@ -19,6 +19,7 @@ ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 SUMMARY_SHEET_NAME = "거래요약"
 
 # 거래요약에 기록할 열 (시트 열명과 동일, 정식표기)
+# 주의: 여기에는 '서울'도 포함돼 있지만, 실제 "거래요약" 헤더 생성/기록 시에는 '서울'을 절대 쓰지 않도록 아래 로직에서 차단함
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
     "강남구", "압구정동",
@@ -74,7 +75,6 @@ def log(msg: str):
         pass
 
 def dbg(msg: str):
-    # 디버깅 강화를 위해 별도 prefix
     log(f"[DBG] {msg}")
 
 _LAST = 0.0
@@ -393,8 +393,10 @@ def _norm_colname(s: str) -> str:
 def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     header = _retry(ws.row_values, 1)
     if not header:
-        _retry(ws.update, [["년월", "구분"] + SUMMARY_COLS], "A1")
-        header = ["년월", "구분"] + SUMMARY_COLS
+        # ▼ 기본 헤더 생성 시 '서울' 제외 (새 컬럼 방지)
+        default_cols = [c for c in SUMMARY_COLS if c != "서울"]
+        _retry(ws.update, [["년월", "구분"] + default_cols], "A1")
+        header = ["년월", "구분"] + default_cols
 
     hmap_norm = {_norm_colname(h): i + 1 for i, h in enumerate(header)}
     sheet_prefix = f"'{ws.title}'!"
@@ -404,7 +406,15 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
         {"range": f"{sheet_prefix}B{row_idx}", "values": [[label]]},
     ]
 
+    # line_map에서 '서울' 키는 절대 쓰지 않도록 '서울특별시'로 강제 매핑
+    safe_line_map = {}
     for k_raw, v in (line_map or {}).items():
+        k = k_raw
+        if k == "서울":
+            k = "서울특별시"
+        safe_line_map[k] = v
+
+    for k_raw, v in safe_line_map.items():
         k = _norm_colname(k_raw)
         if k in hmap_norm:
             payload.append({
@@ -415,7 +425,9 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     for possible in ("총합계", "합계"):
         pn = _norm_colname(possible)
         if pn in hmap_norm:
-            vv = line_map.get("총합계", line_map.get("전국", line_map.get("서울", "")))
+            vv = safe_line_map.get("총합계",
+                 safe_line_map.get("전국",
+                 safe_line_map.get("서울특별시", "")))
             payload.append({"range": f"{sheet_prefix}{a1_col(hmap_norm[pn])}{row_idx}", "values": [[vv if vv != "" else 0]]})
             break
 
@@ -462,12 +474,14 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     if prev_counts:
         diffs = {}
         for c in SUMMARY_COLS:
-            cur = int(counts.get(c, 0) or 0)
-            prv = int(prev_counts.get(c, 0) or 0)
+            # '서울'은 비교 대상에서 제외하고 '서울특별시'만 사용
+            key = "서울특별시" if c == "서울" else c
+            cur = int(counts.get(key, 0) or 0)
+            prv = int(prev_counts.get(key, 0) or 0)
             d = cur - prv
-            diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
+            diffs[key] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
     else:
-        diffs = {c: "" for c in SUMMARY_COLS}
+        diffs = {("서울특별시" if c == "서울" else c): "" for c in SUMMARY_COLS}
     r4 = find_summary_row(ws, ym, "전월대비 건수증감")
     put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
     header = _retry(ws.row_values, 1)
@@ -477,6 +491,10 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
 # ===== 거래요약: '예상건수' 라인 (초록 Bold) =====
 def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     r = find_summary_row(ws_sum, ym, "예상건수")
+    # 안전망: pred_map에 '서울' 키가 있으면 '서울특별시'로 이동
+    if pred_map and "서울" in pred_map:
+        pred_map["서울특별시"] = pred_map.pop("서울")
+
     put_summary_line(ws_sum, r, ym, "예상건수", pred_map)
     header = _retry(ws_sum.row_values, 1)
     reqs = [{
@@ -921,6 +939,8 @@ def main():
                     counts = {}
                     for k_n, v in merged_n.items():
                         human = next((orig for orig in SUMMARY_COLS if _norm(orig) == k_n), k_n)
+                        if human == "서울":  # '서울' 금지
+                            human = "서울특별시"
                         counts[human] = v
 
                     ym_prev = prev_ym(ym)
@@ -940,6 +960,8 @@ def main():
                         prv_counts = {}
                         for k_n, v in prv_merged.items():
                             human = next((orig for orig in SUMMARY_COLS if _norm(orig) == k_n), k_n)
+                            if human == "서울":
+                                human = "서울특별시"
                             prv_counts[human] = v
 
             if counts:
@@ -954,12 +976,13 @@ def main():
                 if prv_counts:
                     diffs = {}
                     for c in SUMMARY_COLS:
-                        cur = int(counts.get(c, 0) or 0)
-                        prv = int(prv_counts.get(c, 0) or 0)
+                        key = "서울특별시" if c == "서울" else c
+                        cur = int(counts.get(key, 0) or 0)
+                        prv = int(prv_counts.get(key, 0) or 0)
                         d = cur - prv
-                        diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
+                        diffs[key] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
                 else:
-                    diffs = {c: "" for c in SUMMARY_COLS}
+                    diffs = {("서울특별시" if c == "서울" else c): "" for c in SUMMARY_COLS}
                 r_diff = find_summary_row(ws_sum, ym, "전월대비 건수증감")
                 put_summary_line(ws_sum, r_diff, ym, "전월대비 건수증감", diffs)
                 header_sum = _retry(ws_sum.row_values, 1)
@@ -1138,6 +1161,8 @@ def main():
 
                     # 거래요약 표의 원래 열명으로 역매핑(정규명→원표기)
                     human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
+                    if human_key == "서울":  # '서울' 금지
+                        human_key = "서울특별시"
                     merged_pred[human_key] = pred
                     filled_local += 1
 
@@ -1164,10 +1189,15 @@ def main():
                         if level == "전국":
                             merged_pred["전국"] = sum_pred
                         if level == "서울":
-                            merged_pred["서울"] = sum_pred
+                            # '서울' 컬럼 금지, '서울특별시'만 기록
+                            merged_pred["서울특별시"] = sum_pred
                         filled_local += 1
 
                 dbg(f"[predict] {level} {ym}: filled_local={filled_local}")
+
+            # 안전망: 혹시 남아있다면 '서울' -> '서울특별시'
+            if "서울" in merged_pred:
+                merged_pred["서울특별시"] = merged_pred.pop("서울")
 
             write_predicted_line(ws_sum, ym, merged_pred)
 
