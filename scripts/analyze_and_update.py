@@ -628,6 +628,28 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
     _retry(ws.spreadsheet.batch_update, {"requests": [add_chart]})
     log("[pattern] 분석 탭 작성 및 차트 추가")
 
+# ===== 추가: 월 시트 누적으로 거래건수 읽기 =====
+def read_counts_from_month_sheet(ws: gspread.Worksheet) -> Dict[str, int]:
+    """월 시트(전국/서울 ...)에서 마지막 누적행을 읽어 SUMMARY_COLS 기준으로 count dict 생성"""
+    df_cum = month_sheet_to_frame(ws)
+    if df_cum.empty:
+        return {}
+    last = df_cum.iloc[-1]
+    out = {}
+    for col in SUMMARY_COLS:
+        if col in last.index:
+            try:
+                out[col] = int(float(last[col] or 0))
+            except Exception:
+                out[col] = 0
+    # 월 시트의 '총합계'가 있으면 전국/서울 합계로 보정
+    if "총합계" in last.index:
+        try:
+            out["전국"] = int(float(last["총합계"] or out.get("전국", 0)))
+        except Exception:
+            pass
+    return out
+
 # ===================== 메인 =====================
 def main():
     try:
@@ -715,21 +737,129 @@ def main():
 
     # ===== 거래요약 =====
     ws_sum = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
-    if ws_sum and month_cache:
-        def ym_key(ym):
-            yy, mm = ym.split("/")
-            return (int(yy), int(mm))
-        for ym in sorted(month_cache.keys(), key=ym_key):
-            cur = month_cache[ym]
-            prv = month_cache.get(prev_ym(ym))
-            write_month_summary(
-                ws_sum,
-                2000 + int(ym.split("/")[0]),
-                int(ym.split("/")[1]),
-                cur["counts"], cur["med"], cur["mean"],
-                prv["counts"] if prv else None
-            )
-            time.sleep(0.15)
+    if ws_sum:
+        # (1) 원본 파일로 확보된 월들 먼저 기록
+        if month_cache:
+            def ym_key(ym):
+                yy, mm = ym.split("/")
+                return (int(yy), int(mm))
+            for ym in sorted(month_cache.keys(), key=ym_key):
+                cur = month_cache[ym]
+                prv = month_cache.get(prev_ym(ym))
+                write_month_summary(
+                    ws_sum,
+                    2000 + int(ym.split("/")[0]),
+                    int(ym.split("/")[1]),
+                    cur["counts"], cur["med"], cur["mean"],
+                    prv["counts"] if prv else None
+                )
+                time.sleep(0.15)
+
+        # (2) 최근 12개월은 월 시트 누적으로라도 거래건수를 강제 갱신
+        month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
+
+        # ym -> ws 매핑
+        ym_ws: Dict[str, gspread.Worksheet] = {}
+        for ws in month_sheets:
+            ym = yymm_from_title(ws.title)  # "25/9"
+            if ym:
+                ym_ws[ym] = ws
+
+        today = datetime.now().date()
+
+        def ym_to_yM(ym: str) -> Tuple[int,int]:
+            a, b = ym.split("/")
+            return 2000 + int(a), int(b)
+        def yM_to_ym(y: int, m: int) -> str:
+            return f"{str(y % 100).zfill(2)}/{m}"
+        def add_months(y, m, delta):
+            nm = m + delta
+            y += (nm - 1) // 12
+            nm = ((nm - 1) % 12) + 1
+            return y, nm
+
+        # 최근 12개월(현재월 포함)
+        cur_y, cur_m = today.year, today.month
+        last12_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 12)]
+        last12_ym = [yM_to_ym(y, m) for (y, m) in last12_yM]
+
+        for ym in last12_ym:
+            counts = None
+            med = None
+            mean = None
+            prv_counts = None
+
+            if ym in month_cache:
+                counts = month_cache[ym]["counts"]
+                med = month_cache[ym]["med"]
+                mean = month_cache[ym]["mean"]
+                prv = month_cache.get(prev_ym(ym))
+                prv_counts = prv["counts"] if prv else None
+            else:
+                # 월 시트에서 누적값으로 거래건수만이라도 채움
+                ws_nat = None
+                ws_se = None
+                for w in sh.worksheets():
+                    if re.search(r"^전국\s+\d{4}년\s+\d{1,2}월$", w.title) and yymm_from_title(w.title) == ym:
+                        ws_nat = w
+                    if re.search(r"^서울\s+\d{4}년\s+\d{1,2}월$", w.title) and yymm_from_title(w.title) == ym:
+                        ws_se = w
+                c_nat = read_counts_from_month_sheet(ws_nat) if ws_nat else {}
+                c_se  = read_counts_from_month_sheet(ws_se) if ws_se else {}
+
+                if c_nat or c_se:
+                    merged = {k: c_nat.get(k, 0) for k in SUMMARY_COLS}
+                    for k in SUMMARY_COLS:
+                        if k in c_se:
+                            merged[k] = c_se[k]
+                    counts = merged
+
+                    # 전월 대비도 월 시트로 계산 시도
+                    ym_prev = prev_ym(ym)
+                    ws_nat_prev = None
+                    ws_se_prev = None
+                    for w in sh.worksheets():
+                        if re.search(r"^전국\s+\d{4}년\s+\d{1,2}월$", w.title) and yymm_from_title(w.title) == ym_prev:
+                            ws_nat_prev = w
+                        if re.search(r"^서울\s+\d{4}년\s+\d{1,2}월$", w.title) and yymm_from_title(w.title) == ym_prev:
+                            ws_se_prev = w
+                    if ws_nat_prev or ws_se_prev:
+                        c_nat_prev = read_counts_from_month_sheet(ws_nat_prev) if ws_nat_prev else {}
+                        c_se_prev  = read_counts_from_month_sheet(ws_se_prev) if ws_se_prev else {}
+                        prv_merged = {k: c_nat_prev.get(k, 0) for k in SUMMARY_COLS}
+                        for k in SUMMARY_COLS:
+                            if k in c_se_prev:
+                                prv_merged[k] = c_se_prev[k]
+                        prv_counts = prv_merged
+
+            # 실제 쓰기: counts가 있으면 거래건수/전월대비는 항상 덮어쓰기
+            if counts:
+                # 거래건수
+                r_cnt = find_summary_row(ws_sum, ym, "거래건수")
+                put_summary_line(ws_sum, r_cnt, ym, "거래건수", counts)
+
+                # 중앙값/평균은 원본 파일 있을 때만 갱신
+                if med:
+                    r_med = find_summary_row(ws_sum, ym, "중앙값(단위:억)")
+                    put_summary_line(ws_sum, r_med, ym, "중앙값(단위:억)", med)
+                if mean:
+                    r_mean = find_summary_row(ws_sum, ym, "평균가(단위:억)")
+                    put_summary_line(ws_sum, r_mean, ym, "평균가(단위:억)", mean)
+
+                # 전월대비 건수증감
+                if prv_counts:
+                    diffs = {}
+                    for c in SUMMARY_COLS:
+                        cur = int(counts.get(c, 0) or 0)
+                        prv = int(prv_counts.get(c, 0) or 0)
+                        d = cur - prv
+                        diffs[c] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
+                else:
+                    diffs = {c: "" for c in SUMMARY_COLS}
+                r_diff = find_summary_row(ws_sum, ym, "전월대비 건수증감")
+                put_summary_line(ws_sum, r_diff, ym, "전월대비 건수증감", diffs)
+                header_sum = _retry(ws_sum.row_values, 1)
+                color_diff_line(ws_sum, r_diff, diffs, header_sum)
 
     # ===== 압구정동 =====
     if apgu_all:
@@ -770,12 +900,17 @@ def main():
             # 학습 구간: 2024-10 ~ 2025-06 (9개월 고정)
             TRAIN_START_Y, TRAIN_START_M = 2024, 10
             TRAIN_MONTHS = 9
-            train_list_yM = [add_months(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
+            def add_months2(y, m, delta):
+                nm = m + delta
+                y += (nm - 1) // 12
+                nm = ((nm - 1) % 12) + 1
+                return y, nm
+            train_list_yM = [add_months2(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
             learn_yms = [yM_to_ym(y, m) for (y, m) in train_list_yM if yM_to_ym(y, m) in ym_ws]
 
-            # 예측 구간: 현재월 포함 최근 3개월 (현재월, 현재월-1, 현재월-2)
+            # 예측 구간: 현재월 포함 최근 3개월
             cur_y, cur_m = today.year, today.month
-            recent3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
+            recent3_yM = [add_months2(cur_y, cur_m, -i) for i in range(0, 3)]
             recent3 = [yM_to_ym(y, m) for (y, m) in recent3_yM if yM_to_ym(y, m) in ym_ws]
             recent3 = sorted(recent3, key=ym_key2)
 
@@ -833,7 +968,6 @@ def main():
                 merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
 
                 for level_prefix in ["전국", "서울"]:
-                    # 해당 ym의 해당 레벨 탭 찾기
                     ws_level = None
                     for cand in [w for w in sh.worksheets() if re.search(rf"^{level_prefix}\s+\d{{4}}년\s+\d{{1,2}}월$", w.title)]:
                         if yymm_from_title(cand.title) == ym:
