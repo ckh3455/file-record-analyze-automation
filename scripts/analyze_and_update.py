@@ -5,8 +5,7 @@ from __future__ import annotations
 import os, re, json, time, random
 from pathlib import Path
 from datetime import datetime, date
-from typing import Dict, List, Tuple, Optional
-from typing import Union  # <-- 최상단 import 섹션에 둡니다 (for 루프 안 X)
+from typing import Dict, List, Tuple, Optional, Union
 
 import pandas as pd
 import gspread
@@ -45,9 +44,7 @@ NATION_REGIONS = [
 
 # ===== 한국 공휴일 (2024-10 ~ 2025-09) =====
 KR_HOLIDAYS = {
-    # 2024 Q4
     "2024-10-03", "2024-10-09", "2024-12-25",
-    # 2025 Q1~Q3
     "2025-01-01", "2025-01-27", "2025-01-28", "2025-01-29", "2025-01-30",
     "2025-03-01", "2025-03-03",
     "2025-05-05", "2025-05-06",
@@ -110,7 +107,6 @@ TOTAL_N = _norm("총합계"); SEOUL_N = _norm("서울"); NATION_N = _norm("전�
 
 # ------- Sheets read cache (ws.id -> values) -------
 _WS_VALUES_CACHE: Dict[int, List[List[str]]] = {}
-
 def _get_all_values_cached(ws: gspread.Worksheet) -> List[List[str]]:
     if ws.id in _WS_VALUES_CACHE:
         return _WS_VALUES_CACHE[ws.id]
@@ -360,7 +356,7 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
         values_batch_update(ws, payload)
         log(f"[ws] {ws.title} -> {date_label} row={row_idx} (wrote {len(payload)} cells incl. date)")
 
-# ===================== 거래요약 =====================
+# ===================== 거래요약 집계/기록 =====================
 def ym_from_filename(fname: str):
     m = re.search(r"(\d{2})(\d{2})_", fname)
     if not m:
@@ -636,7 +632,6 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
     start_inc = len(cum_rows) + 2
     _retry(ws.update, inc_rows, f"A{start_inc}")
 
-    # 차트(oneof 충돌 방지: overlayPosition만 사용)
     nrows = len(cum_rows)
     series = []
     for j in range(len(targets)):
@@ -706,7 +701,6 @@ def read_counts_from_month_sheet(ws: gspread.Worksheet) -> Dict[str, int]:
                 out[col] = int(float(last[col] or 0))
             except Exception:
                 out[col] = 0
-    # 총합계 → 전국 보정
     if TOTAL_N in last.index:
         try:
             out[NATION_N] = int(float(last[TOTAL_N] or out.get(NATION_N, 0)))
@@ -915,14 +909,12 @@ def main():
                 c_nat = read_counts_from_month_sheet(ws_nat) if ws_nat else {}
                 c_se  = read_counts_from_month_sheet(ws_se) if ws_se else {}
                 if c_nat or c_se:
-                    merged = {k: c_nat.get(k, 0) for k in SUMMARY_COLS_N}
+                    merged_n = {k: c_nat.get(k, 0) for k in SUMMARY_COLS_N}
                     for k in SUMMARY_COLS_N:
                         if k in c_se:
-                            merged[k] = c_se[k]
-                    # 역정규화 키로 변환
+                            merged_n[k] = c_se[k]
                     counts = {}
-                    for k_n, v in merged.items():
-                        # 가능한 한 원래 표기와 맞추기
+                    for k_n, v in merged_n.items():
                         human = next((orig for orig in SUMMARY_COLS if _norm(orig) == k_n), k_n)
                         counts[human] = v
 
@@ -1065,83 +1057,76 @@ def main():
         cur_y, cur_m = today.year, today.month
         targets = [key_to_ym(*add_months(cur_y, cur_m, -i)) for i in range(0, 3)]
         targets = [ym for ym in targets if ym in sheets["전국"] or ym in sheets["서울"]]
-        targets = sorted(set(targets), key=lambda ym: ym_to_key(ym))
+        targets = sorted(set(targets), key=lambda ym: (2000 + int(ym.split("/")[0]), int(ym.split("/")[1])))
 
         for ym in targets:
-    from typing import Union  # 파일 상단에 이미 없다면 추가
+            # 초기화: 거래요약의 모든 열을 ""로 두고, 예측이 나오면 숫자로 덮어씀
+            merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
 
-# ...
-for ym in targets:
-    # 초기화: 거래요약 컬럼 전부 "" 로 세팅 (예측 채우면서 숫자로 덮어씀)
-    for ym in targets:
-    # 초기화: 거래요약의 모든 열을 ""로 두고, 예측이 나오면 숫자로 덮어씁니다.
-    merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
+            for level in ["전국", "서울"]:
+                ws_level = sheets[level].get(ym)
+                if not ws_level:
+                    continue
 
-    for level in ["전국", "서울"]:
-        ws_level = sheets[level].get(ym)
-        if not ws_level:
-            continue
+                df_cum = month_sheet_to_frame(ws_level)
+                if df_cum.empty:
+                    continue
+                fday = first_data_date(ws_level)
+                lday = latest_data_date(ws_level)
+                if not fday or not lday:
+                    continue
 
-        df_cum = month_sheet_to_frame(ws_level)
-        if df_cum.empty:
-            continue
-        fday = first_data_date(ws_level)
-        lday = latest_data_date(ws_level)
-        if not fday or not lday:
-            continue
+                last_row = df_cum.iloc[-1]
+                day_idx = (lday - fday).days + 1
+                if day_idx < 1:
+                    day_idx = 1
 
-        last_row = df_cum.iloc[-1]
-        day_idx = (lday - fday).days + 1
-        if day_idx < 1:
-            day_idx = 1
+                # 학습에서 얻은 지역 집합
+                trained_cols = level_obs_cols.get(level, set())
+                # 타깃 시트 실제 컬럼
+                actual_cols = set(last_row.index)
+                # 허용 지역(서울=구들, 전국=광역시·도) + 총합계
+                allow_set = (SEOUL_SET_N if level == "서울" else NATION_SET_N) | {TOTAL_N}
 
-        # 학습에서 얻은 지역 집합
-        trained_cols = level_obs_cols.get(level, set())
-        # 타깃 시트 실제 컬럼
-        actual_cols = set(last_row.index)
-        # 허용 지역(서울=구들, 전국=광역시·도) + 총합계
-        allow_set = (SEOUL_SET_N if level == "서울" else NATION_SET_N) | {TOTAL_N}
+                # 사용할 지역: (학습집합 있으면 그것, 없으면 타깃 컬럼) ∩ 허용집합
+                use_cols = ((trained_cols or actual_cols) & allow_set)
+                if not use_cols:
+                    continue
 
-        # 사용할 지역: (학습집합 있으면 그것, 없으면 타깃 컬럼) ∩ 허용집합
-        use_cols = (trained_cols or actual_cols) & allow_set
-        if not use_cols:
-            continue
+                curves = level_curves.get(level, {})
+                for region_n in use_cols:
+                    # 관측 누적
+                    obs = int(float(last_row.get(region_n, 0)) or 0)
 
-        curves = level_curves.get(level, {})
-        for region_n in use_cols:
-            obs = int(float(last_row.get(region_n, 0)) or 0)
+                    # 곡선: 레벨 곡선 → 전국 백업 → 기본곡선
+                    curve = curves.get(region_n)
+                    if curve is None and national_curves_ref:
+                        curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
+                    if curve is None:
+                        curve = [0.0] + [0.5] * 90  # horizon=90
 
-            # 곡선: 레벨 곡선 → 전국 백업 → 기본곡선
-            curve = curves.get(region_n)
-            if curve is None and national_curves_ref:
-                curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
-            if curve is None:
-                curve = [0.0] + [0.5] * 90
+                    pred = blend_predict(obs, day_idx, curve)
 
-            pred = blend_predict(obs, day_idx, curve)
+                    # 거래요약 표의 원래 열명으로 역매핑(정규명→원표기)
+                    human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
+                    merged_pred[human_key] = pred
 
-            # 거래요약에 쓰는 사람용 키로 역매핑(정규명→원표기)
-            human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
-            merged_pred[human_key] = pred
+                # 총합계 → '전국'/'서울' 컬럼도 채움
+                if TOTAL_N in last_row.index:
+                    obs_sum = int(float(last_row.get(TOTAL_N, 0)) or 0)
+                    sum_curve = curves.get(TOTAL_N)
+                    if sum_curve is None and national_curves_ref:
+                        sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
+                    if sum_curve is None:
+                        sum_curve = [0.0] + [0.5] * 90
+                    sum_pred = blend_predict(obs_sum, day_idx, sum_curve)
+                    merged_pred["총합계"] = sum_pred
+                    if level == "전국":
+                        merged_pred["전국"] = sum_pred
+                    if level == "서울":
+                        merged_pred["서울"] = sum_pred
 
-        # 총합계 → '전국'/'서울' 컬럼도 채움
-        if TOTAL_N in last_row.index:
-            obs_sum = int(float(last_row.get(TOTAL_N, 0)) or 0)
-            sum_curve = curves.get(TOTAL_N)
-            if sum_curve is None and national_curves_ref:
-                sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
-            if sum_curve is None:
-                sum_curve = [0.0] + [0.5] * 90
-            sum_pred = blend_predict(obs_sum, day_idx, sum_curve)
-            merged_pred["총합계"] = sum_pred
-            if level == "전국":
-                merged_pred["전국"] = sum_pred
-            if level == "서울":
-                merged_pred["서울"] = sum_pred
-
-    write_predicted_line(ws_sum, ym, merged_pred)
-
-
+            write_predicted_line(ws_sum, ym, merged_pred)
 
         # 패턴 분석 탭: 최신 월 표+그래프
         if targets:
