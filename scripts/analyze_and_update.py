@@ -255,28 +255,63 @@ def daily_increments(df: pd.DataFrame) -> pd.DataFrame:
         inc[c] = inc[c].clip(lower=0)
     return inc
 
-def completion_curve(df: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90) -> Dict[str, List[float]]:
-    out = {region: [None]*(horizon_days+1) for region in region_cols}
-    if df.empty:
+# ===== (A) 완료곡선: 90일 최종치 기준 진행률 =====
+def completion_curve(df_cum: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90) -> Dict[str, List[float]]:
+    """
+    최초일(first_day) 기준 90일(3개월) 완료를 분모로 한 진행률 곡선 생성.
+    out[r][d] = d일차(1-indexed) 진행률 in [0,1] (0일차는 0.0)
+    """
+    out = {region: [0.0] * (horizon_days + 1) for region in region_cols}
+    if df_cum.empty:
         return out
-    idx = pd.date_range(first_day, first_day + pd.Timedelta(days=horizon_days-1), freq="D")
-    aligned = df.set_index("date").reindex(idx, method="ffill").fillna(0)
+
+    idx = pd.date_range(first_day, first_day + pd.Timedelta(days=horizon_days - 1), freq="D")
+    aligned = df_cum.set_index("date").reindex(idx, method="ffill").fillna(0)
+
     for region in region_cols:
-        final = float(df[region].max() if region in df.columns else 0)
-        if final <= 0:
-            out[region] = [0.0]*(horizon_days+1)
+        if region not in aligned.columns:
             continue
-        ratios = (aligned[region].astype(float) / final).clip(0,1.0)
-        out[region] = [0.0] + [float(ratios.iloc[i-1]) for i in range(1, horizon_days+1)]
+
+        series = pd.to_numeric(aligned[region], errors="coerce").fillna(0)
+        final_90 = float(series.iloc[min(89, len(series) - 1)]) if len(series) > 0 else 0.0
+        if final_90 <= 0:
+            out[region] = [0.0] * (horizon_days + 1)
+            continue
+
+        ratios = [0.0]  # day0
+        for d in range(1, horizon_days + 1):
+            idx_day = min(d - 1, len(series) - 1)
+            r = float(series.iloc[idx_day]) / final_90
+            if r < 0:
+                r = 0.0
+            elif r > 1:
+                r = 1.0
+            ratios.append(r)
+        out[region] = ratios
     return out
 
+# ===== (B) 예측 변환: 하한/상한 캡 적용 =====
 def blend_predict(observed: int, day_idx: int, curve: List[float]) -> int:
-    if day_idx < 1: day_idx = 1
-    if day_idx >= len(curve): day_idx = len(curve)-1
-    comp = curve[day_idx] if curve[day_idx] and curve[day_idx] > 0 else 0.5
-    est = observed / comp if comp > 0 else observed
-    lo, hi = observed, max(observed, int(round(observed*1.8)))
+    """
+    관측 누적(observed)과 'd일차 진행률'로 90일 최종치를 역산.
+    진행률 하한 0.05 적용, 예측은 [observed, observed*1.8]로 캡핑.
+    """
+    if day_idx < 1:
+        day_idx = 1
+    if day_idx >= len(curve):
+        day_idx = len(curve) - 1
+
+    comp = curve[day_idx] if (day_idx >= 0 and day_idx < len(curve)) else 0.0
+    comp = max(float(comp or 0.0), 0.05)  # 하한선
+
+    est = observed / comp
+    lo = float(observed)
+    hi = max(lo, lo * 1.8)
     return int(round(min(max(est, lo), hi)))
+
+def completion_curve_legacy(df: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90):
+    # (미사용; 호환용 자리표시자)
+    return completion_curve(df, region_cols, first_day, horizon_days)
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     vals = _retry(ws.get_all_values)
@@ -919,7 +954,6 @@ def main():
         month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
         today = datetime.now().date()
 
-        # 유틸
         def ym_to_yM(ym: str) -> Tuple[int,int]:
             a, b = ym.split("/")
             return 2000 + int(a), int(b)
@@ -944,21 +978,16 @@ def main():
             # 학습 구간: 2024-10 ~ 2025-06 (9개월 고정)
             TRAIN_START_Y, TRAIN_START_M = 2024, 10
             TRAIN_MONTHS = 9
-            def add_months2(y, m, delta):
-                nm = m + delta
-                y += (nm - 1) // 12
-                nm = ((nm - 1) % 12) + 1
-                return y, nm
-            train_list_yM = [add_months2(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
+            train_list_yM = [add_months(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
             learn_yms = [yM_to_ym(y, m) for (y, m) in train_list_yM if yM_to_ym(y, m) in ym_ws]
 
             # 예측 구간: 현재월 포함 최근 3개월
             cur_y, cur_m = today.year, today.month
-            recent3_yM = [add_months2(cur_y, cur_m, -i) for i in range(0, 3)]
+            recent3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
             recent3 = [yM_to_ym(y, m) for (y, m) in recent3_yM if yM_to_ym(y, m) in ym_ws]
             recent3 = sorted(recent3, key=ym_key2)
 
-            # 레벨별 학습(전국, 서울) → 곡선 생성
+            # 레벨별(전국/서울) 학습 → 지역별 평균 진행률 곡선
             level_curves: Dict[str, Dict[str, List[float]]] = {}
             level_obs_cols: Dict[str, set] = {}
 
@@ -967,16 +996,17 @@ def main():
                 region_universe: set = set()
 
                 for ym in learn_yms:
-                    ws = ym_ws.get(ym)
-                    if not ws or not ws.title.startswith(level_prefix):
+                    ws_level = ym_ws.get(ym)
+                    if not ws_level or not ws_level.title.startswith(level_prefix):
                         continue
-                    df_cum = month_sheet_to_frame(ws)
+                    df_cum = month_sheet_to_frame(ws_level)
                     if df_cum.empty:
                         continue
-                    region_universe.update([c for c in df_cum.columns if c != "date"])
-                    fday = first_data_date(ws)
+                    fday = first_data_date(ws_level)
                     if not fday:
                         continue
+
+                    region_universe.update([c for c in df_cum.columns if c != "date"])
                     df_inc = daily_increments(df_cum)
                     learn_frames.append((df_cum, df_inc, fday))
 
@@ -989,25 +1019,26 @@ def main():
                     continue
 
                 horizon = 90
-                curves = {r: [0.0]*(horizon+1) for r in region_cols_ref}
-                counts = {r: [0]*(horizon+1) for r in region_cols_ref}
+                curves = {r: [0.0] * (horizon + 1) for r in region_cols_ref}
+                counts = {r: [0] * (horizon + 1) for r in region_cols_ref}
 
-                for (df_cum, df_inc, fday) in learn_frames:
+                for (df_cum, _df_inc, fday) in learn_frames:
                     cc = completion_curve(df_cum, region_cols_ref, fday, horizon_days=horizon)
                     for r in region_cols_ref:
-                        for d in range(1, horizon+1):
-                            v = cc[r][d] if cc[r][d] is not None else 0.0
+                        for d in range(1, horizon + 1):
+                            v = cc[r][d]
                             if v > 0:
                                 curves[r][d] += v
                                 counts[r][d] += 1
 
+                # 평균 진행률
                 for r in region_cols_ref:
-                    for d in range(1, horizon+1):
+                    for d in range(1, horizon + 1):
                         curves[r][d] = (curves[r][d] / counts[r][d]) if counts[r][d] > 0 else 0.5
 
                 level_curves[level_prefix] = curves
 
-            # 최근 3개월 각각: 두 레벨의 예측을 병합해 “예상건수” 한 번만 기록
+            # 최근 3개월: 월 시트의 관측 누적을 90일 최종치로 역산 → "거래요약/예상건수" 기록
             for ym in recent3:
                 merged_pred: Dict[str, int] = {col: "" for col in SUMMARY_COLS}
 
@@ -1030,13 +1061,16 @@ def main():
 
                     last_row = df_cum.iloc[-1]
                     day_idx = (lday - fday).days + 1
+                    if day_idx < 1:
+                        day_idx = 1
 
                     curves = level_curves.get(level_prefix, {})
                     obs_cols = level_obs_cols.get(level_prefix, set())
 
+                    # 월 시트에 실제로 존재하는 지역만 예측
                     for region in (obs_cols & set(last_row.index)):
                         obs = int(float(last_row.get(region, 0)) or 0)
-                        curve = curves.get(region, [0.0]*91)
+                        curve = curves.get(region, [0.0] * 91)
                         pred = blend_predict(obs, day_idx, curve)
                         merged_pred[region] = pred
 
