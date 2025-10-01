@@ -127,7 +127,6 @@ def read_month_df(path: Path) -> pd.DataFrame:
     return df
 
 def eok_series(ser) -> pd.Series:
-    # list/ndarray도 안전히 처리
     s = pd.Series(ser)
     s = pd.to_numeric(s, errors="coerce").dropna()
     if s.empty:
@@ -255,7 +254,7 @@ def daily_increments(df: pd.DataFrame) -> pd.DataFrame:
         inc[c] = inc[c].clip(lower=0)
     return inc
 
-# ===== (A) 완료곡선: 90일 최종치 기준 진행률 =====
+# ===== 완료곡선: 90일(3개월) 최종치 기준 진행률 =====
 def completion_curve(df_cum: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90) -> Dict[str, List[float]]:
     """
     최초일(first_day) 기준 90일(3개월) 완료를 분모로 한 진행률 곡선 생성.
@@ -290,7 +289,7 @@ def completion_curve(df_cum: pd.DataFrame, region_cols: List[str], first_day: da
         out[region] = ratios
     return out
 
-# ===== (B) 예측 변환: 하한/상한 캡 적용 =====
+# ===== 예측 변환: 하한/상한 캡 적용 =====
 def blend_predict(observed: int, day_idx: int, curve: List[float]) -> int:
     """
     관측 누적(observed)과 'd일차 진행률'로 90일 최종치를 역산.
@@ -310,7 +309,6 @@ def blend_predict(observed: int, day_idx: int, curve: List[float]) -> int:
     return int(round(min(max(est, lo), hi)))
 
 def completion_curve_legacy(df: pd.DataFrame, region_cols: List[str], first_day: date, horizon_days=90):
-    # (미사용; 호환용 자리표시자)
     return completion_curve(df, region_cols, first_day, horizon_days)
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
@@ -348,7 +346,7 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
         values_batch_update(ws, payload)
         log(f"[ws] {ws.title} -> {date_label} row={row_idx} (wrote {len(payload)} cells incl. date)")
 
-# ===================== 거래요약 =====================
+# ===================== 거래요약 공통 =====================
 def ym_from_filename(fname: str):
     m = re.search(r"(\d{2})(\d{2})_", fname)
     if not m:
@@ -375,25 +373,41 @@ def find_summary_row(ws, ym: str, label: str) -> int:
             return i
     return len(vals) + 1
 
+def _norm_colname(s: str) -> str:
+    return re.sub(r"\s+", "", str(s or "").strip())
+
 def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     header = _retry(ws.row_values, 1)
     if not header:
         _retry(ws.update, [["년월", "구분"] + SUMMARY_COLS], "A1")
         header = ["년월", "구분"] + SUMMARY_COLS
-    hmap = {h: i + 1 for i, h in enumerate(header)}
 
+    hmap_norm = {_norm_colname(h): i + 1 for i, h in enumerate(header)}
     sheet_prefix = f"'{ws.title}'!"
+
     payload = [
         {"range": f"{sheet_prefix}A{row_idx}", "values": [[ym]]},
         {"range": f"{sheet_prefix}B{row_idx}", "values": [[label]]},
     ]
-    for c in SUMMARY_COLS:
-        if c in hmap:
+
+    for k_raw, v in (line_map or {}).items():
+        k = _norm_colname(k_raw)
+        if k in hmap_norm:
             payload.append({
-                "range": f"{sheet_prefix}{a1_col(hmap[c])}{row_idx}",
-                "values": [[line_map.get(c, "")]]
+                "range": f"{sheet_prefix}{a1_col(hmap_norm[k])}{row_idx}",
+                "values": [[v]]
             })
-    values_batch_update(ws, payload)
+
+    # 총합계가 있으면 해당 열 또는 전국/서울 보정
+    for possible in ("총합계", "합계"):
+        pn = _norm_colname(possible)
+        if pn in hmap_norm:
+            vv = line_map.get("총합계", line_map.get("전국", line_map.get("서울", "")))
+            payload.append({"range": f"{sheet_prefix}{a1_col(hmap_norm[pn])}{row_idx}", "values": [[vv if vv != "" else 0]]})
+            break
+
+    if payload:
+        values_batch_update(ws, payload)
 
 def color_diff_line(ws, row_idx: int, diff_line: dict, header: List[str]):
     hmap = {h: i + 1 for i, h in enumerate(header)}
@@ -466,7 +480,8 @@ def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
         }
     }]
     batch_format(ws_sum, reqs)
-    log(f"[summary] {ym} 예상건수 -> row={r} (green bold)")
+    filled = sum(1 for v in (pred_map or {}).values() if (isinstance(v, int) and v > 0))
+    log(f"[summary] {ym} 예상건수 -> row={r} (green bold) filled={filled}")
 
 # ===================== 압구정동 (원본 그대로 + 변동요약) =====================
 APGU_BASE_COLS = [
@@ -949,7 +964,7 @@ def main():
         else:
             log("[압구정동] sheet not found (skip)")
 
-    # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10~2025-06(9개월 고정) =====
+    # ===== 예측(현재월 포함 최근 3개월) : 학습=2024-10 이후 '존재하는 모든 월' =====
     if ws_sum:
         month_sheets = [ws for ws in sh.worksheets() if re.search(r"\d{4}년\s*\d{1,2}월", ws.title)]
         today = datetime.now().date()
@@ -975,13 +990,11 @@ def main():
         if ym_ws:
             def ym_key2(ym): y, m = ym_to_yM(ym); return (y, m)
 
-            # 학습 구간: 2024-10 ~ 2025-06 (9개월 고정)
-            TRAIN_START_Y, TRAIN_START_M = 2024, 10
-            TRAIN_MONTHS = 9
-            train_list_yM = [add_months(TRAIN_START_Y, TRAIN_START_M, i) for i in range(TRAIN_MONTHS)]
-            learn_yms = [yM_to_ym(y, m) for (y, m) in train_list_yM if yM_to_ym(y, m) in ym_ws]
+            # 학습 시작: 2024-10
+            START_Y, START_M = 2024, 10
+            start_key = (START_Y, START_M)
 
-            # 예측 구간: 현재월 포함 최근 3개월
+            # 최근 3개월(현재월 포함) 대상
             cur_y, cur_m = today.year, today.month
             recent3_yM = [add_months(cur_y, cur_m, -i) for i in range(0, 3)]
             recent3 = [yM_to_ym(y, m) for (y, m) in recent3_yM if yM_to_ym(y, m) in ym_ws]
@@ -990,14 +1003,25 @@ def main():
             # 레벨별(전국/서울) 학습 → 지역별 평균 진행률 곡선
             level_curves: Dict[str, Dict[str, List[float]]] = {}
             level_obs_cols: Dict[str, set] = {}
+            national_curves_ref: Dict[str, List[float]] = {}
 
             for level_prefix in ["전국", "서울"]:
+                # 2024-10 이후 존재하는 모든 월 수집
+                learn_yms = []
+                for ym, ws in ym_ws.items():
+                    if not ws.title.startswith(level_prefix):
+                        continue
+                    y, m = ym_to_yM(ym)
+                    if (y, m) >= start_key:
+                        learn_yms.append(ym)
+                learn_yms = sorted(set(learn_yms), key=ym_key2)
+
                 learn_frames: List[Tuple[pd.DataFrame, pd.DataFrame, date]] = []
                 region_universe: set = set()
 
                 for ym in learn_yms:
                     ws_level = ym_ws.get(ym)
-                    if not ws_level or not ws_level.title.startswith(level_prefix):
+                    if not ws_level:
                         continue
                     df_cum = month_sheet_to_frame(ws_level)
                     if df_cum.empty:
@@ -1011,6 +1035,10 @@ def main():
                     learn_frames.append((df_cum, df_inc, fday))
 
                 region_cols_ref = [c for c in SUMMARY_COLS if c in region_universe]
+                # 총합계는 SUMMARY_COLS엔 없을 수 있으므로 별도 처리
+                if "총합계" in region_universe and "총합계" not in region_cols_ref:
+                    region_cols_ref.append("총합계")
+
                 level_obs_cols[level_prefix] = set(region_cols_ref)
 
                 if not learn_frames or not region_cols_ref:
@@ -1037,6 +1065,8 @@ def main():
                         curves[r][d] = (curves[r][d] / counts[r][d]) if counts[r][d] > 0 else 0.5
 
                 level_curves[level_prefix] = curves
+                if level_prefix == "전국":
+                    national_curves_ref = curves  # 서울 레벨의 백업용
 
             # 최근 3개월: 월 시트의 관측 누적을 90일 최종치로 역산 → "거래요약/예상건수" 기록
             for ym in recent3:
@@ -1067,13 +1097,32 @@ def main():
                     curves = level_curves.get(level_prefix, {})
                     obs_cols = level_obs_cols.get(level_prefix, set())
 
-                    # 월 시트에 실제로 존재하는 지역만 예측
+                    # 월 시트 실제 존재 열만 예측
                     for region in (obs_cols & set(last_row.index)):
                         obs = int(float(last_row.get(region, 0)) or 0)
-                        curve = curves.get(region, [0.0] * 91)
+                        curve = curves.get(region)
+                        # 서울 레벨 곡선 없으면 전국 곡선으로 백업
+                        if (curve is None) and national_curves_ref:
+                            curve = national_curves_ref.get(region) or national_curves_ref.get("전국") or [0.5] * 91
                         pred = blend_predict(obs, day_idx, curve)
                         merged_pred[region] = pred
 
+                    # 총합계 → 거래요약의 '전국'/'서울' 컬럼도 함께 채움
+                    if "총합계" in last_row.index:
+                        obs_sum = int(float(last_row.get("총합계", 0)) or 0)
+                        sum_curve = (curves.get("총합계")
+                                     or (national_curves_ref.get("총합계") if national_curves_ref else None)
+                                     or [0.5] * 91)
+                        sum_pred = blend_predict(obs_sum, day_idx, sum_curve)
+                        merged_pred["총합계"] = sum_pred
+                        if level_prefix == "전국":
+                            merged_pred["전국"] = sum_pred
+                        if level_prefix == "서울":
+                            merged_pred["서울"] = sum_pred
+
+                # 얼마나 채웠는지 로깅
+                filled = sum(1 for v in merged_pred.values() if isinstance(v, int) and v > 0)
+                log(f"[summary] {ym} 예상건수 filled={filled}")
                 write_predicted_line(ws_sum, ym, merged_pred)
 
             # 패턴 분석 탭: 최신 월 표+그래프
