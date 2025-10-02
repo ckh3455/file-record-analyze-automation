@@ -18,7 +18,7 @@ ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 
 SUMMARY_SHEET_NAME = "거래요약"
 
-# 거래요약 헤더 대상
+# 거래요약 헤더 대상 (이미 존재하는 헤더 기준으로만 씀. '서울'은 쓰지 않는다)
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
     "강남구", "압구정동",
@@ -106,7 +106,7 @@ SUMMARY_COLS_N = [_norm(c) for c in SUMMARY_COLS]
 SUMMARY_SET_N = set(SUMMARY_COLS_N)
 SEOUL_SET_N = set(_norm(c) for c in SEOUL_REGIONS)
 NATION_SET_N = set(_norm(c) for c in NATION_REGIONS)
-TOTAL_N = _norm("총합계"); SEOUL_N = _norm("서울"); NATION_N = _norm("전국")
+TOTAL_N = _norm("총합계"); NATION_N = _norm("전국")
 
 # ------- Sheets read cache (ws.id -> values) -------
 _WS_VALUES_CACHE: Dict[int, List[List[str]]] = {}
@@ -313,34 +313,46 @@ def completion_curve(df_cum: pd.DataFrame, region_cols: List[str], first_day: da
         out[region] = ratios
     return out
 
-# ===== 예측 변환: 하한/상한 캡 적용 =====
+# ===== 성숙 달 판정 (학습에 포함할지) =====
+def is_mature_month(ws: gspread.Worksheet, min_days: int = 85) -> bool:
+    f = first_data_date(ws); l = latest_data_date(ws)
+    if not f or not l: return False
+    return ((l - f).days + 1) >= min_days
+
+# ===== 예측 변환: 동적 상한 + comp 하한 =====
+def _cap_mult_for_day(day_idx: int) -> float:
+    if day_idx <= 2:   return 3.2
+    if day_idx <= 5:   return 3.0
+    if day_idx <= 10:  return 2.5
+    if day_idx <= 20:  return 2.1
+    if day_idx <= 45:  return 1.9
+    return 1.8
+
 def blend_predict(observed: int, day_idx: int, curve: List[float]) -> int:
     if day_idx < 1: day_idx = 1
     if day_idx >= len(curve): day_idx = len(curve)-1
-    comp = curve[day_idx] if (0 <= day_idx < len(curve)) else 0.0
-    comp = max(float(comp or 0.0), 0.05)  # 하한선
+    comp = float(curve[day_idx] or 0.0)
+    comp_floor = 0.03 if day_idx <= 3 else (0.04 if day_idx <= 7 else 0.05)
+    comp = max(comp, comp_floor)
     est = observed / comp
-    lo = float(observed)
-    hi = max(lo, lo * 1.8)
+    lo  = float(observed)
+    hi  = max(lo * _cap_mult_for_day(day_idx), est * 1.10)  # cap이 est를 깎지 않게
     return int(round(min(max(est, lo), hi)))
 
 # ===== 모멘텀 보정 (최근 k일 vs 직전 k일 증가합) =====
-def momentum_factor_from_increments(df_cum: pd.DataFrame, region_col_n: str, day_idx: int, k: int = 3, gamma: float = 0.25) -> float:
+def momentum_factor_from_increments(df_cum: pd.DataFrame, region_col_n: str, day_idx_for_window: int, k: int = 3, gamma: float = 0.20) -> float:
     if region_col_n not in df_cum.columns:
         return 1.0
     s = pd.to_numeric(df_cum[region_col_n], errors="coerce").fillna(0).astype(int)
     inc = s.diff().fillna(s).clip(lower=0)
-
-    end = max(1, min(day_idx, len(inc)))
+    end = max(1, min(day_idx_for_window, len(inc)))
     start_recent = max(1, end - k + 1)
     start_prev   = max(1, start_recent - k)
-
     recent_sum = float(inc.iloc[start_recent-1:end].sum()) if end >= start_recent else 0.0
     prev_sum   = float(inc.iloc[start_prev-1:start_recent-1].sum()) if start_recent-1 >= start_prev else 0.0
-
     momentum = (recent_sum - prev_sum) / max(prev_sum, 1.0)
     factor = 1.0 + gamma * momentum
-    return float(max(0.8, min(1.2, factor)))  # 과민 방지
+    return float(max(0.8, min(1.2, factor)))  # ±20%
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     vals = _get_all_values_cached(ws)
@@ -356,23 +368,19 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_label)
     sheet_prefix = f"'{ws.title}'!"
-
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_label]]}]
-
     for col_name, val in values_by_colname.items():
         if col_name in hmap:
             c = hmap[col_name]
             payload.append({"range": f"{sheet_prefix}{a1_col(c)}{row_idx}", "values": [[val]]})
-
     for possible in ("총합계", "합계"):
         if possible in hmap:
             v = values_by_colname.get("총합계", None)
             if v is None:
-                v = values_by_colname.get("전국", values_by_colname.get("서울", None))
+                v = values_by_colname.get("전국", values_by_colname.get("서울특별시", None))
             if v is not None:
                 payload.append({"range": f"{sheet_prefix}{a1_col(hmap[possible])}{row_idx}", "values": [[int(v)]]})
             break
-
     if payload:
         values_batch_update(ws, payload)
         log(f"[ws] {ws.title} -> {date_label} row={row_idx} (wrote {len(payload)} cells incl. date)")
@@ -404,9 +412,6 @@ def find_summary_row(ws, ym: str, label: str) -> int:
             return i
     return len(vals) + 1
 
-def _norm_colname(s: str) -> str:
-    return _norm(s)
-
 def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     header = _retry(ws.row_values, 1)
     if not header:
@@ -414,38 +419,30 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
         _retry(ws.update, [["년월", "구분"] + default_cols], "A1")
         header = ["년월", "구분"] + default_cols
 
+    # 거래요약 실제 헤더에만 씀 (새 열 생성 금지)
+    hmap_norm = {_norm(h): i + 1 for i, h in enumerate(header)}
     sheet_prefix = f"'{ws.title}'!"
-
-    # '서울' 키는 절대 금지 → '서울특별시'로
-    safe_line_map = {}
-    for k_raw, v in (line_map or {}).items():
-        k = "서울특별시" if k_raw == "서울" else k_raw
-        safe_line_map[k] = v
-
-    hmap_norm = {_norm_colname(h): i + 1 for i, h in enumerate(header)}
-
     payload = [
         {"range": f"{sheet_prefix}A{row_idx}", "values": [[ym]]},
         {"range": f"{sheet_prefix}B{row_idx}", "values": [[label]]},
     ]
-
-    for k_raw, v in safe_line_map.items():
-        k = _norm_colname(k_raw)
-        if k in hmap_norm:
+    for k_raw, v in (line_map or {}).items():
+        k = "서울특별시" if k_raw == "서울" else k_raw
+        if _norm(k) in hmap_norm:
             payload.append({
-                "range": f"{sheet_prefix}{a1_col(hmap_norm[k])}{row_idx}",
+                "range": f"{sheet_prefix}{a1_col(hmap_norm[_norm(k)])}{row_idx}",
                 "values": [[v]]
             })
-
+    # 총합계 칸 있으면 채우기
     for possible in ("총합계", "합계"):
-        pn = _norm_colname(possible)
+        pn = _norm(possible)
         if pn in hmap_norm:
-            vv = safe_line_map.get("총합계",
-                 safe_line_map.get("전국",
-                 safe_line_map.get("서울특별시", "")))
+            vv = (line_map.get("총합계", "")
+                  if isinstance(line_map, dict) else "")
+            if vv == "":
+                vv = line_map.get("전국", line_map.get("서울특별시", ""))
             payload.append({"range": f"{sheet_prefix}{a1_col(hmap_norm[pn])}{row_idx}", "values": [[vv if vv != "" else 0]]})
             break
-
     if payload:
         values_batch_update(ws, payload)
 
@@ -473,18 +470,9 @@ def color_diff_line(ws, row_idx: int, diff_line: dict, header: List[str]):
 
 def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict, prev_counts: Optional[dict]):
     ym = f"{str(y % 100).zfill(2)}/{m}"
-
-    r1 = find_summary_row(ws, ym, "거래건수")
-    put_summary_line(ws, r1, ym, "거래건수", counts)
-    log(f"[summary] {ym} 거래건수 -> row={r1}")
-
-    r2 = find_summary_row(ws, ym, "중앙값(단위:억)")
-    put_summary_line(ws, r2, ym, "중앙값(단위:억)", med)
-    log(f"[summary] {ym} 중앙값 -> row={r2}")
-
-    r3 = find_summary_row(ws, ym, "평균가(단위:억)")
-    put_summary_line(ws, r3, ym, "평균가(단위:억)", mean)
-    log(f"[summary] {ym} 평균가 -> row={r3}")
+    r1 = find_summary_row(ws, ym, "거래건수"); put_summary_line(ws, r1, ym, "거래건수", counts); log(f"[summary] {ym} 거래건수 -> row={r1}")
+    r2 = find_summary_row(ws, ym, "중앙값(단위:억)"); put_summary_line(ws, r2, ym, "중앙값(단위:억)", med); log(f"[summary] {ym} 중앙값 -> row={r2}")
+    r3 = find_summary_row(ws, ym, "평균가(단위:억)"); put_summary_line(ws, r3, ym, "평균가(단위:억)", mean); log(f"[summary] {ym} 평균가 -> row={r3}")
 
     if prev_counts:
         diffs = {}
@@ -496,11 +484,32 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
             diffs[key] = f"+{d}" if d > 0 else (str(d) if d < 0 else "0")
     else:
         diffs = {("서울특별시" if c == "서울" else c): "" for c in SUMMARY_COLS}
-    r4 = find_summary_row(ws, ym, "전월대비 건수증감")
-    put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
-    header = _retry(ws.row_values, 1)
-    color_diff_line(ws, r4, diffs, header)
-    log(f"[summary] {ym} 전월대비 -> row={r4}")
+    r4 = find_summary_row(ws, ym, "전월대비 건수증감"); put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
+    header = _retry(ws.row_values, 1); color_diff_line(ws, r4, diffs, header); log(f"[summary] {ym} 전월대비 -> row={r4}")
+
+# ===== 거래요약: 기존 '거래건수' 행 읽기 =====
+def read_summary_counts_row(ws_sum: gspread.Worksheet, ym: str, label="거래건수") -> Dict[str, int]:
+    vals = _retry(ws_sum.get_all_values) or []
+    if len(vals) < 2: return {}
+    header = [str(h).strip() for h in vals[0]]
+    target = None
+    for r in vals[1:]:
+        if len(r) >= 2 and str(r[0]).strip() == ym and str(r[1]).strip() == label:
+            target = r; break
+    if not target: return {}
+    hmap = { _norm(h): idx for idx, h in enumerate(header) }
+    out = {}
+    for h, idx in hmap.items():
+        if h in (_norm("년월"), _norm("구분")): continue
+        val = str(target[idx]).strip() if idx < len(target) else "0"
+        try:
+            v = int(float(val or "0"))
+        except Exception:
+            v = 0
+        human = next((orig for orig in SUMMARY_COLS if _norm(orig) == h), h)
+        if human == "서울": human = "서울특별시"
+        out[human] = v
+    return out
 
 # ===== 거래요약: '예상건수' 라인 (초록 Bold) =====
 def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
@@ -651,78 +660,33 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
 def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: pd.DataFrame, df_inc: pd.DataFrame, targets: List[str]):
     ws = get_or_create_ws(sh, "거래량 패턴분석", rows=1000, cols=40)
     _retry(ws.clear)
-
     header1 = ["[누적] 날짜"] + targets
     header2 = ["[일증분] 날짜"] + targets
-    cum_rows = [header1]
-    inc_rows = [header2]
-
+    cum_rows = [header1]; inc_rows = [header2]
     for i in range(len(df_cum)):
-        d = df_cum.iloc[i]["date"]
-        row = [d.strftime("%Y-%m-%d")] + [int(df_cum.iloc[i].get(_norm(t), 0)) for t in targets]
-        cum_rows.append(row)
+        d = df_cum.iloc[i]["date"]; row = [d.strftime("%Y-%m-%d")] + [int(df_cum.iloc[i].get(_norm(t), 0)) for t in targets]; cum_rows.append(row)
     for i in range(len(df_inc)):
-        d = df_inc.iloc[i]["date"]
-        row = [d.strftime("%Y-%m-%d")] + [int(df_inc.iloc[i].get(_norm(t), 0)) for t in targets]
-        inc_rows.append(row)
-
-    _retry(ws.update, cum_rows, "A1")
-    start_inc = len(cum_rows) + 2
-    _retry(ws.update, inc_rows, f"A{start_inc}")
-
+        d = df_inc.iloc[i]["date"]; row = [d.strftime("%Y-%m-%d")] + [int(df_inc.iloc[i].get(_norm(t), 0)) for t in targets]; inc_rows.append(row)
+    _retry(ws.update, cum_rows, "A1"); start_inc = len(cum_rows) + 2; _retry(ws.update, inc_rows, f"A{start_inc}")
     nrows = len(cum_rows)
     series = []
     for j in range(len(targets)):
         series.append({
-            "series": {
-                "sourceRange": {
-                    "sources": [{
-                        "sheetId": ws.id,
-                        "startRowIndex": 1,
-                        "endRowIndex": nrows,
-                        "startColumnIndex": 1+j,
-                        "endColumnIndex": 2+j
-                    }]
-                }
-            },
+            "series": {"sourceRange": {"sources": [{
+                "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows, "startColumnIndex": 1+j, "endColumnIndex": 2+j
+            }]}},
             "targetAxis": "LEFT_AXIS"
         })
-    add_chart = {
-        "addChart": {
-            "chart": {
-                "spec": {
-                    "title": f"{month_title} - 누적 등록 추이",
-                    "basicChart": {
-                        "chartType": "LINE",
-                        "legendPosition": "BOTTOM_LEGEND",
-                        "axis": [
-                            {"position": "BOTTOM_AXIS", "title": "Date"},
-                            {"position": "LEFT_AXIS", "title": "Cumulative"}
-                        ],
-                        "domains": [{
-                            "domain": {
-                                "sourceRange": {
-                                    "sources": [{
-                                        "sheetId": ws.id,
-                                        "startRowIndex": 1,
-                                        "endRowIndex": nrows,
-                                        "startColumnIndex": 0,
-                                        "endColumnIndex": 1
-                                    }]
-                                }
-                            }
-                        }],
-                        "series": series,
-                        "headerCount": 1
-                    }
-                },
-                "position": {"overlayPosition": {
-                    "anchorCell": {"sheetId": ws.id, "rowIndex": 0, "columnIndex": 10},
-                    "offsetXPixels": 0, "offsetYPixels": 0, "widthPixels": 800, "heightPixels": 320
-                }}
-            }
-        }
-    }
+    add_chart = {"addChart": {"chart": {"spec": {
+        "title": f"{month_title} - 누적 등록 추이",
+        "basicChart": {
+            "chartType": "LINE", "legendPosition": "BOTTOM_LEGEND",
+            "axis": [{"position": "BOTTOM_AXIS", "title": "Date"}, {"position": "LEFT_AXIS", "title": "Cumulative"}],
+            "domains": [{"domain": {"sourceRange": {"sources": [{
+                "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows, "startColumnIndex": 0, "endColumnIndex": 1
+            }]}}}], "series": series, "headerCount": 1
+        }},"position":{"overlayPosition":{"anchorCell":{"sheetId":ws.id,"rowIndex":0,"columnIndex":10},
+        "offsetXPixels":0,"offsetYPixels":0,"widthPixels":800,"heightPixels":320}}}}}
     _retry(ws.spreadsheet.batch_update, {"requests": [add_chart]})
     log("[pattern] 분석 탭 작성 및 차트 추가")
 
@@ -823,7 +787,6 @@ def main():
             empty_mean  = {c: "" for c in SUMMARY_COLS}
             month_cache[ym] = {"counts": zero_counts, "med": empty_med, "mean": empty_mean}
 
-            # 전국 탭 0 기록
             ws_nat = fuzzy_ws(sh, nat_title)
             if ws_nat:
                 header_nat = _retry(ws_nat.row_values, 1)
@@ -834,7 +797,6 @@ def main():
                     elif h in zero_counts: values_nat[h] = 0
                 write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-            # 서울 탭 0 기록
             ws_se = fuzzy_ws(sh, se_title)
             if ws_se:
                 header_se = _retry(ws_se.row_values, 1)
@@ -844,14 +806,12 @@ def main():
                     if h == "총합계": values_se["총합계"] = 0
                     elif h in zero_counts: values_se[h] = 0
                 write_month_sheet(ws_se, today_label, header_se, values_se)
-
             continue
 
         # ===== 정상 달 처리 =====
         counts, med, mean = agg_all_stats(df)
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
-        # 전국 탭 쓰기
         ws_nat = fuzzy_ws(sh, nat_title)
         if ws_nat:
             header_nat = _retry(ws_nat.row_values, 1)
@@ -865,7 +825,6 @@ def main():
                         values_nat[h] = int(counts[h])
             write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        # 서울 탭 쓰기
         ws_se = fuzzy_ws(sh, se_title)
         if ws_se:
             header_se = _retry(ws_se.row_values, 1)
@@ -873,13 +832,13 @@ def main():
             for h in header_se:
                 if not h or h == "날짜": continue
                 if h == "총합계":
+                    # '서울' 대신 '서울특별시' 총합계를 우선 사용 (없으면 '서울')
                     values_se["총합계"] = int(counts.get("서울", 0))
                 else:
                     if h in counts:
                         values_se[h] = int(counts[h])
             write_month_sheet(ws_se, today_label, header_se, values_se)
 
-        # 압구정동 원본 누적
         ap = df[(df.get("광역", "") == "서울특별시") & (df.get("법정동", "") == "압구정동")].copy()
         if not ap.empty:
             apgu_all.append(ap)
@@ -1012,7 +971,7 @@ def main():
         else:
             log("[압구정동] sheet not found (skip)")
 
-    # ===== 예측(현재월 포함 최근 3개월) : 2024-10 이후 '존재하는 모든 월'로 학습 =====
+    # ===== 예측(현재월 포함 최근 3개월) =====
     if ws_sum:
         sheets = list_month_sheets(sh)
         if not sheets["서울"] and not sheets["전국"]:
@@ -1040,6 +999,10 @@ def main():
             learn_frames: List[Tuple[pd.DataFrame, date]] = []
 
             for ym, ws in sorted(pool.items(), key=lambda kv: ym_to_key(kv[0])):
+                # 성숙 달만 학습
+                if not is_mature_month(ws, min_days=85):
+                    dbg(f"[predict] skip learning {level} {ym}: immature (<85d)")
+                    continue
                 df_cum = month_sheet_to_frame(ws)
                 if df_cum.empty:
                     dbg(f"[predict] {level} {ym} df_cum empty")
@@ -1108,6 +1071,8 @@ def main():
 
         for ym in targets:
             merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
+            sum_counts = read_summary_counts_row(ws_sum, ym, label="거래건수")  # 거래요약 누적(더 최신일 수 있음)
+            observed_cache: Dict[str, int] = {}
 
             for level in ["전국", "서울"]:
                 ws_level = sheets[level].get(ym)
@@ -1120,10 +1085,12 @@ def main():
                     dbg(f"[predict] skip {level} {ym}: df_cum empty")
                     continue
                 fday = first_data_date(ws_level)
-                lday = latest_data_date(ws_level)
-                if not fday or not lday:
-                    dbg(f"[predict] skip {level} {ym}: fday/lday missing fday={fday} lday={lday}")
+                if not fday:
+                    dbg(f"[predict] skip {level} {ym}: fday missing")
                     continue
+
+                # 오늘 기준 일차 (월 시트가 느려도 오늘 기준 진행률 사용)
+                day_idx_today = min((today - fday).days + 1, 90)
 
                 trained_cols = level_obs_cols.get(level, set())
                 actual_cols = set(df_cum.columns) - {"date"}
@@ -1133,27 +1100,22 @@ def main():
                     dbg(f"[predict] skip {level} {ym}: use_cols empty")
                     continue
 
-                dbg(f"[predict] {level} {ym}: use_cols={len(use_cols)} fday={fday} lday={lday} rows={len(df_cum)}")
+                dbg(f"[predict] {level} {ym}: use_cols={len(use_cols)} fday={fday} day_idx_today={day_idx_today} rows={len(df_cum)}")
 
                 df_idx = df_cum[["date"] + list(use_cols)].copy()
                 curves = level_curves.get(level, {})
 
-                filled_local = 0
                 for region_n in use_cols:
                     if region_n not in df_idx.columns:
                         continue
                     s = pd.to_numeric(df_idx[region_n], errors="coerce").fillna(0).astype(int)
                     nz = s.to_numpy().nonzero()[0]
-                    if len(nz) == 0:
-                        continue
+                    obs_sheet = int(s.iloc[int(nz[-1])]) if len(nz) else 0
 
-                    last_nz_i = int(nz[-1])
-                    obs = int(s.iloc[last_nz_i])
-                    obs_date = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
-
-                    day_idx = (obs_date - fday).days + 1
-                    if day_idx < 1:
-                        day_idx = 1
+                    human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
+                    if human_key == "서울": human_key = "서울특별시"
+                    obs = max(obs_sheet, int(sum_counts.get(human_key, 0)))  # 월시트 vs 요약의 최대
+                    observed_cache[human_key] = max(observed_cache.get(human_key, 0), obs)
 
                     curve = curves.get(region_n)
                     if curve is None and national_curves_ref:
@@ -1161,20 +1123,15 @@ def main():
                     if curve is None:
                         curve = [0.0] + [0.5] * 90
 
-                    pred = blend_predict(obs, day_idx, curve)
+                    pred = blend_predict(obs, day_idx_today, curve)
 
-                    # ▼▼ 모멘텀 보정(최근 3일, 감도 0.25, ±20% 이내 + 초기 7일은 약간 가중)
-                    mf = momentum_factor_from_increments(df_cum, region_n, day_idx, k=3, gamma=0.25)
-                    early_boost = 1.0 + min(0.2, max(0.0, (7 - (day_idx - 1)) / 7.0 * 0.1))
-                    pred = int(round(pred * min(1.25, mf * early_boost)))
+                    # 모멘텀 보정(가볍게)
+                    mf = momentum_factor_from_increments(df_cum, region_n, min(day_idx_today, len(df_cum)), k=3, gamma=0.20)
+                    pred = int(round(pred * min(1.25, mf)))
 
-                    human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
-                    if human_key == "서울":
-                        human_key = "서울특별시"
                     merged_pred[human_key] = pred
-                    filled_local += 1
 
-                # 총합계 폴백
+                # 총합계 처리: 시트의 총합계 있으면 사용, 없으면 구합
                 sum_series = None
                 if TOTAL_N in df_idx.columns:
                     sum_series = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
@@ -1186,44 +1143,29 @@ def main():
 
                 if sum_series is not None:
                     nz_sum = sum_series.to_numpy().nonzero()[0]
-                    if len(nz_sum) > 0:
-                        last_nz_i = int(nz_sum[-1])
-                        obs_sum = int(sum_series.iloc[last_nz_i])
-                        obs_date_sum = pd.to_datetime(df_idx["date"].iloc[last_nz_i]).date()
-                        day_idx_sum = (obs_date_sum - fday).days + 1
-                        if day_idx_sum < 1:
-                            day_idx_sum = 1
+                    obs_sum_sheet = int(sum_series.iloc[int(nz_sum[-1])]) if len(nz_sum) else 0
+                    obs_sum = max(obs_sum_sheet, int(sum_counts.get("서울특별시" if level=="서울" else "전국", 0)))
+                    observed_cache["서울특별시" if level=="서울" else "전국"] = max(observed_cache.get("서울특별시" if level=="서울" else "전국", 0), obs_sum)
 
-                        sum_curve = curves.get(TOTAL_N)
-                        if sum_curve is None and national_curves_ref:
-                            sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
-                        if sum_curve is None:
-                            sum_curve = [0.0] + [0.5] * 90
+                    sum_curve = curves.get(TOTAL_N)
+                    if sum_curve is None and national_curves_ref:
+                        sum_curve = national_curves_ref.get(TOTAL_N) or national_curves_ref.get(NATION_N)
+                    if sum_curve is None:
+                        sum_curve = [0.0] + [0.5] * 90
 
-                        sum_pred = blend_predict(obs_sum, day_idx_sum, sum_curve)
+                    sum_pred = blend_predict(obs_sum, day_idx_today, sum_curve)
+                    mf_sum = momentum_factor_from_increments(df_cum, TOTAL_N if TOTAL_N in df_idx.columns else list(use_cols)[0], min(day_idx_today, len(df_cum)), k=3, gamma=0.20)
+                    sum_pred = int(round(sum_pred * min(1.25, mf_sum)))
 
-                        # 총합계에도 동일 모멘텀 보정 적용
-                        mf_sum = momentum_factor_from_increments(df_cum, TOTAL_N if TOTAL_N in df_idx.columns else region_n, day_idx_sum, k=3, gamma=0.25)
-                        early_boost_sum = 1.0 + min(0.2, max(0.0, (7 - (day_idx_sum - 1)) / 7.0 * 0.1))
-                        sum_pred = int(round(sum_pred * min(1.25, mf_sum * early_boost_sum)))
+                    merged_pred["총합계"] = sum_pred
+                    if level == "전국":
+                        merged_pred["전국"] = sum_pred
+                    if level == "서울":
+                        merged_pred["서울특별시"] = sum_pred
 
-                        merged_pred["총합계"] = sum_pred
-                        if level == "전국":
-                            merged_pred["전국"] = sum_pred
-                        if level == "서울":
-                            merged_pred["서울특별시"] = sum_pred
-                        filled_local += 1
-                else:
-                    dbg(f"[predict] {level} {ym}: 총합계/구합 생성 실패")
+                dbg(f"[predict] {level} {ym}: done regions={len(use_cols)}")
 
-                dbg(f"[predict] {level} {ym}: filled_local={filled_local}")
-
-            if "서울" in merged_pred:
-                if (merged_pred.get("서울특별시") in ("", None)) and (merged_pred["서울"] not in ("", None)):
-                    merged_pred["서울특별시"] = merged_pred["서울"]
-                merged_pred.pop("서울", None)
-
-            dbg(f"[predict] {ym} 서울특별시 pred={merged_pred.get('서울특별시', None)}")
+            # '서울' 키 제거 및 서울특별시 보강은 put 단계에서 처리됨
             write_predicted_line(ws_sum, ym, merged_pred)
 
         # 패턴 분석 탭: 최신 월 표+그래프
