@@ -18,8 +18,7 @@ ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 
 SUMMARY_SHEET_NAME = "거래요약"
 
-# 거래요약에 기록할 열 (시트 열명과 동일, 정식표기)
-# 주의: 리스트에 '서울'이 있어도 실제 기록/헤더에서는 절대 사용하지 않고 모두 '서울특별시'로 강제됨
+# 거래요약 헤더 대상
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
     "강남구", "압구정동",
@@ -265,7 +264,7 @@ def month_sheet_to_frame(ws: gspread.Worksheet) -> pd.DataFrame:
     col_map: Dict[int, str] = {}
     for i, h in enumerate(raw_header[1:], start=1):
         if not h: continue
-        col_map[i] = _norm(h)  # 정규화된 컬럼명
+        col_map[i] = _norm(h)
 
     for r in vals[1:]:
         if not r or not r[0]: continue
@@ -324,6 +323,24 @@ def blend_predict(observed: int, day_idx: int, curve: List[float]) -> int:
     lo = float(observed)
     hi = max(lo, lo * 1.8)
     return int(round(min(max(est, lo), hi)))
+
+# ===== 모멘텀 보정 (최근 k일 vs 직전 k일 증가합) =====
+def momentum_factor_from_increments(df_cum: pd.DataFrame, region_col_n: str, day_idx: int, k: int = 3, gamma: float = 0.25) -> float:
+    if region_col_n not in df_cum.columns:
+        return 1.0
+    s = pd.to_numeric(df_cum[region_col_n], errors="coerce").fillna(0).astype(int)
+    inc = s.diff().fillna(s).clip(lower=0)
+
+    end = max(1, min(day_idx, len(inc)))
+    start_recent = max(1, end - k + 1)
+    start_prev   = max(1, start_recent - k)
+
+    recent_sum = float(inc.iloc[start_recent-1:end].sum()) if end >= start_recent else 0.0
+    prev_sum   = float(inc.iloc[start_prev-1:start_recent-1].sum()) if start_recent-1 >= start_prev else 0.0
+
+    momentum = (recent_sum - prev_sum) / max(prev_sum, 1.0)
+    factor = 1.0 + gamma * momentum
+    return float(max(0.8, min(1.2, factor)))  # 과민 방지
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
     vals = _get_all_values_cached(ws)
@@ -393,14 +410,13 @@ def _norm_colname(s: str) -> str:
 def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
     header = _retry(ws.row_values, 1)
     if not header:
-        # 기본 헤더 생성 시 '서울' 제외 (새 컬럼 방지)
         default_cols = [c for c in SUMMARY_COLS if c != "서울"]
         _retry(ws.update, [["년월", "구분"] + default_cols], "A1")
         header = ["년월", "구분"] + default_cols
 
     sheet_prefix = f"'{ws.title}'!"
 
-    # line_map에서 '서울' 키는 절대 쓰지 않도록 '서울특별시'로 강제 매핑
+    # '서울' 키는 절대 금지 → '서울특별시'로
     safe_line_map = {}
     for k_raw, v in (line_map or {}).items():
         k = "서울특별시" if k_raw == "서울" else k_raw
@@ -421,7 +437,6 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                 "values": [[v]]
             })
 
-    # 총합계/합계 처리 (없으면 0)
     for possible in ("총합계", "합계"):
         pn = _norm_colname(possible)
         if pn in hmap_norm:
@@ -490,7 +505,6 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
 # ===== 거래요약: '예상건수' 라인 (초록 Bold) =====
 def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     r = find_summary_row(ws_sum, ym, "예상건수")
-    # 안전망: pred_map에 '서울' 키가 있으면 '서울특별시'로 이동
     if pred_map and "서울" in pred_map:
         if (pred_map.get("서울특별시") in ("", None)) and (pred_map["서울"] not in ("", None)):
             pred_map["서울특별시"] = pred_map["서울"]
@@ -1044,7 +1058,6 @@ def main():
                 level_obs_cols[level] = set()
                 continue
 
-            # 사용할 지역 목록
             if level == "서울":
                 region_cols = [c for c in region_universe if c in SEOUL_SET_N or c == TOTAL_N]
             else:
@@ -1075,7 +1088,7 @@ def main():
 
             level_curves[level] = curves
             if level == "전국":
-                national_curves_ref = curves  # 서울 백업용
+                national_curves_ref = curves
             dbg(f"[predict] {level} learned regions={len(region_cols)}")
 
         # 최근 3개월(현재월 포함)
@@ -1094,7 +1107,6 @@ def main():
         dbg(f"[predict] targets={targets}")
 
         for ym in targets:
-            # 초기화: 거래요약의 모든 열을 ""로 두고, 예측이 나오면 숫자로 덮어씀
             merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
 
             for level in ["전국", "서울"]:
@@ -1113,14 +1125,9 @@ def main():
                     dbg(f"[predict] skip {level} {ym}: fday/lday missing fday={fday} lday={lday}")
                     continue
 
-                # 학습에서 얻은 지역 집합
                 trained_cols = level_obs_cols.get(level, set())
-                # 타깃 시트 실제 컬럼
                 actual_cols = set(df_cum.columns) - {"date"}
-                # 허용 지역(서울=구들, 전국=광역시·도) + 총합계
                 allow_set = (SEOUL_SET_N if level == "서울" else NATION_SET_N) | {TOTAL_N}
-
-                # 사용할 지역: (학습집합 있으면 그것, 없으면 타깃 컬럼) ∩ 허용집합
                 use_cols = ((trained_cols or actual_cols) & allow_set)
                 if not use_cols:
                     dbg(f"[predict] skip {level} {ym}: use_cols empty")
@@ -1128,10 +1135,7 @@ def main():
 
                 dbg(f"[predict] {level} {ym}: use_cols={len(use_cols)} fday={fday} lday={lday} rows={len(df_cum)}")
 
-                # 지역별 관측값 = "마지막 0이 아닌 누적"
                 df_idx = df_cum[["date"] + list(use_cols)].copy()
-
-                # 레벨 곡선
                 curves = level_curves.get(level, {})
 
                 filled_local = 0
@@ -1151,7 +1155,6 @@ def main():
                     if day_idx < 1:
                         day_idx = 1
 
-                    # 곡선: 레벨 → 전국 백업 → 기본
                     curve = curves.get(region_n)
                     if curve is None and national_curves_ref:
                         curve = national_curves_ref.get(region_n) or national_curves_ref.get(NATION_N)
@@ -1160,20 +1163,22 @@ def main():
 
                     pred = blend_predict(obs, day_idx, curve)
 
-                    # 거래요약 표의 원래 열명으로 역매핑(정규명→원표기)
+                    # ▼▼ 모멘텀 보정(최근 3일, 감도 0.25, ±20% 이내 + 초기 7일은 약간 가중)
+                    mf = momentum_factor_from_increments(df_cum, region_n, day_idx, k=3, gamma=0.25)
+                    early_boost = 1.0 + min(0.2, max(0.0, (7 - (day_idx - 1)) / 7.0 * 0.1))
+                    pred = int(round(pred * min(1.25, mf * early_boost)))
+
                     human_key = next((orig for orig in SUMMARY_COLS if _norm(orig) == region_n), region_n)
-                    if human_key == "서울":  # '서울' 금지
+                    if human_key == "서울":
                         human_key = "서울특별시"
                     merged_pred[human_key] = pred
                     filled_local += 1
 
-                # 총합계도 동일 방식으로 폴백 계산
+                # 총합계 폴백
                 sum_series = None
                 if TOTAL_N in df_idx.columns:
-                    # (a) 총합계 열이 있을 때: 그걸로 사용
                     sum_series = pd.to_numeric(df_idx[TOTAL_N], errors="coerce").fillna(0).astype(int)
                 else:
-                    # (b) 총합계 열이 없을 때: 서울이면 구들의 합으로 총합계 시리즈 생성
                     if level == "서울":
                         gu_cols = [c for c in df_idx.columns if c != "date" and c in SEOUL_SET_N]
                         if gu_cols:
@@ -1196,11 +1201,16 @@ def main():
                             sum_curve = [0.0] + [0.5] * 90
 
                         sum_pred = blend_predict(obs_sum, day_idx_sum, sum_curve)
+
+                        # 총합계에도 동일 모멘텀 보정 적용
+                        mf_sum = momentum_factor_from_increments(df_cum, TOTAL_N if TOTAL_N in df_idx.columns else region_n, day_idx_sum, k=3, gamma=0.25)
+                        early_boost_sum = 1.0 + min(0.2, max(0.0, (7 - (day_idx_sum - 1)) / 7.0 * 0.1))
+                        sum_pred = int(round(sum_pred * min(1.25, mf_sum * early_boost_sum)))
+
                         merged_pred["총합계"] = sum_pred
                         if level == "전국":
                             merged_pred["전국"] = sum_pred
                         if level == "서울":
-                            # ★ 서울 총합계를 '서울특별시'에 반드시 기록
                             merged_pred["서울특별시"] = sum_pred
                         filled_local += 1
                 else:
@@ -1208,15 +1218,12 @@ def main():
 
                 dbg(f"[predict] {level} {ym}: filled_local={filled_local}")
 
-            # ★ 마지막 안전망: '서울'이 남아있으면 '서울특별시'로 합치기
             if "서울" in merged_pred:
                 if (merged_pred.get("서울특별시") in ("", None)) and (merged_pred["서울"] not in ("", None)):
                     merged_pred["서울특별시"] = merged_pred["서울"]
                 merged_pred.pop("서울", None)
 
-            # 디버그: 이번 ym에서 서울특별시 예측값 확인
             dbg(f"[predict] {ym} 서울특별시 pred={merged_pred.get('서울특별시', None)}")
-
             write_predicted_line(ws_sum, ym, merged_pred)
 
         # 패턴 분석 탭: 최신 월 표+그래프
