@@ -74,9 +74,6 @@ def log(msg: str):
     except Exception:
         pass
 
-def dbg(msg: str):
-    log(f"[DBG] {msg}")
-
 _LAST = 0.0
 def _throttle(sec=0.60):  # RPS 완화
     import time as _t
@@ -339,7 +336,7 @@ def is_mature_month(ws: gspread.Worksheet, min_days: int = 85) -> bool:
         return False
     return (l - f).days + 1 >= min_days
 
-# ===== 학습: 일차 d → 최종/당일 배율표(지역별 median) =====
+# ===== 학습: 일차 d → 최종/당일 전역 median 배율 =====
 def train_day_ratios(
     sheets: Dict[str, Dict[str, gspread.Worksheet]],
     level: str,                     # "전국" 또는 "서울"
@@ -351,7 +348,6 @@ def train_day_ratios(
 ) -> Dict[str, List[float]]:
     """반환: region_n -> ratios[1..90] (0번째는 더미 0.0)
        각 ratios[d]는 학습월들에서의 median( C90 / max(Cd,1) )
-       학습월이 부족한 d는 이웃 일차 값으로 보간 후 [1.0, 6.0]으로 클립
     """
     def ym_to_key(ym: str) -> Tuple[int,int]:
         yy, mm = ym.split("/")
@@ -391,19 +387,6 @@ def train_day_ratios(
         for d in range(horizon):
             vals = day_lists[d]
             arr.append(float(np.median(vals)) if vals else 0.0)
-        # 이웃 보간
-        last = None
-        for i in range(1, horizon+1):
-            if arr[i] <= 0.0:
-                arr[i] = last if last is not None else arr[i]
-            else:
-                last = arr[i]
-        last = None
-        for i in range(horizon, 0, -1):
-            if arr[i] <= 0.0 and last is not None:
-                arr[i] = last
-            elif arr[i] > 0.0:
-                last = arr[i]
         # 기본값/클립
         for i in range(1, horizon+1):
             if arr[i] <= 0.0: arr[i] = 2.0
@@ -411,18 +394,90 @@ def train_day_ratios(
         ratios_final[region] = arr
     return ratios_final
 
-# ===== 예측: 오늘(실제 반영은 내일) 일차 d에서 ratio 적용 + 요일/공휴일 보정 =====
+# ===== 학습: (d, Cd) → (Cd, C90) 페어 수집(국지 배율용) =====
+def collect_training_pairs(
+    sheets: Dict[str, Dict[str, gspread.Worksheet]],
+    level: str,
+    start_key: Tuple[int,int],
+    end_key_exclusive: Tuple[int,int],
+    allow_cols: set,
+    min_days: int = 85,
+    horizon: int = 90,
+) -> Dict[str, Dict[int, List[Tuple[int,int]]]]:
+    """
+    반환: pairs[region_n][d] = [(Cd, C90), ...]
+    성숙달(>=min_days)만 사용. 지역별·일차별로 (당일누적, 최종누적) 페어 모음.
+    """
+    def ym_to_key(ym: str) -> Tuple[int,int]:
+        yy, mm = ym.split("/")
+        return (2000 + int(yy), int(mm))
+
+    pool = {ym: ws for ym, ws in sheets[level].items()
+            if ym_to_key(ym) >= start_key and ym_to_key(ym) < end_key_exclusive}
+
+    out: Dict[str, Dict[int, List[Tuple[int,int]]]] = {}
+    for ym, ws in sorted(pool.items(), key=lambda kv: ym_to_key(kv[0])):
+        if not is_mature_month(ws, min_days=min_days):
+            continue
+        df_cum, _ = build_cum_by_day(ws, allow_cols, horizon=horizon)
+        if df_cum.empty:
+            continue
+
+        for col in df_cum.columns:
+            if col == "date": continue
+            s = pd.to_numeric(df_cum[col], errors="coerce").fillna(0).astype(int)
+            c90 = int(s.iloc[horizon-1])
+            if c90 <= 0:
+                continue
+            for d in range(1, horizon+1):
+                cd = int(s.iloc[d-1])
+                if cd <= 0:  # 당일 0은 비정보성
+                    continue
+                out.setdefault(col, {}).setdefault(d, []).append((cd, c90))
+    return out
+
+def local_ratio_for_observed(
+    pairs_for_day: List[Tuple[int,int]],
+    observed_cd: int,
+    k_neighbors: int = 25,
+    width_factor: float = 2.0,
+) -> Optional[float]:
+    """
+    같은 d일차의 학습 페어 중에서 '현재 Cd와 비슷한' 이웃을 골라 median(C90/Cd)을 반환.
+    - 1차: Cd in [obs/width_factor, obs*width_factor]
+    - 2차: 최근접 k개
+    """
+    if not pairs_for_day:
+        return None
+    obs = max(1, int(observed_cd))
+
+    lo, hi = int(obs/width_factor), int(obs*width_factor)
+    bucket = [(cd, c90) for (cd, c90) in pairs_for_day if lo <= cd <= hi]
+    if not bucket:
+        bucket = sorted(pairs_for_day, key=lambda t: abs(t[0]-obs))[:k_neighbors]
+    if not bucket:
+        return None
+
+    ratios = [float(c90)/max(cd,1) for (cd, c90) in bucket if cd > 0 and c90 > 0]
+    if not ratios:
+        return None
+    return float(np.median(ratios))
+
+# ===== 예측: 국지 배율 + 전역 fallback + 주말/공휴일 보정 =====
 def predict_by_day_ratio(
     ws: gspread.Worksheet,
-    ratios: Dict[str, List[float]],
+    ratios: Dict[str, List[float]],                     # 전역 median(d별)
     allow_cols: set,
     today: date,
     fallback_ratio: float = 2.0,
     horizon: int = 90,
+    training_pairs: Optional[Dict[str, Dict[int, List[Tuple[int,int]]]]] = None,
 ) -> Dict[str, int]:
-    """월 시트(ws) 한 탭(전국 또는 서울)에 대해 지역별 최종(90일) 예측치 반환
-       - '데이터는 다음날 반영' → 효과 기준일 = today - 1day
-       - 토·일·공휴일 약세 보정: 해당 '효과 기준일'의 요일/공휴일 여부로 보정배율 곱함
+    """
+    - 효과 기준일 = today - 1일
+    - 먼저 (d일차, Cd)와 가까운 학습페어에서 '국지 median(C90/Cd)'을 찾고,
+      없으면 전역 median(d일차)을 fallback으로 사용.
+    - 주말/공휴일 보정 적용, 관측 이하 금지, 안전 클립.
     """
     df_cum, fday = build_cum_by_day(ws, allow_cols, horizon=horizon)
     if df_cum.empty or not fday:
@@ -438,16 +493,26 @@ def predict_by_day_ratio(
         s = pd.to_numeric(df_cum[col], errors="coerce").fillna(0).astype(int)
         obs = int(s.iloc[d-1])
 
-        ratio_arr = ratios.get(col)
-        base_ratio = float(ratio_arr[d] if (ratio_arr is not None and d < len(ratio_arr)) else fallback_ratio)
+        # 1) 국지 배율
+        loc_ratio = None
+        if training_pairs is not None:
+            loc_ratio = local_ratio_for_observed(training_pairs.get(col, {}).get(d, []), obs)
+
+        # 2) 전역 median(d일차) fallback
+        if loc_ratio is None:
+            ratio_arr = ratios.get(col)
+            base_ratio = float(ratio_arr[d] if (ratio_arr is not None and d < len(ratio_arr)) else fallback_ratio)
+        else:
+            base_ratio = float(loc_ratio)
+
         ratio = base_ratio * dow_factor
-        ratio = max(1.0, min(8.0, ratio))  # 안전 장치
+        ratio = max(1.0, min(10.0, ratio))  # 상한 조금 넉넉히
 
         pred = int(round(obs * ratio))
-        pred = max(pred, obs)
+        pred = max(pred, obs)   # 예측은 관측보다 작지 않게
         out[col] = pred
 
-    # 총합계
+    # 총합계 처리
     if _norm("총합계") in df_cum.columns:
         out[_norm("총합계")] = max(out.get(_norm("총합계"), 0), int(df_cum[_norm("총합계")].iloc[-1]))
         s_keys = [k for k in out.keys() if k != _norm("총합계")]
@@ -1059,7 +1124,7 @@ def main():
         else:
             log("[압구정동] sheet not found (skip)")
 
-    # ===== 예측(현재월 포함 최근 3개월) : 일차별 배율 기반 =====
+    # ===== 예측(현재월 포함 최근 3개월) : 국지배율 + 전역 fallback =====
     if ws_sum:
         sheets = list_month_sheets(sh)
         if not sheets["서울"] and not sheets["전국"]:
@@ -1087,11 +1152,13 @@ def main():
 
         ratios_nat  = train_day_ratios(sheets, "전국", START_KEY, END_KEY_EXCL, allow_nat,  min_days=85, horizon=90)
         ratios_seou = train_day_ratios(sheets, "서울", START_KEY, END_KEY_EXCL, allow_seoul, min_days=85, horizon=90)
+        pairs_nat   = collect_training_pairs(sheets, "전국", START_KEY, END_KEY_EXCL, allow_nat,  min_days=85, horizon=90)
+        pairs_seou  = collect_training_pairs(sheets, "서울", START_KEY, END_KEY_EXCL, allow_seoul, min_days=85, horizon=90)
 
         targets = [key_to_ym(*add_months(cur_y, cur_m, -i)) for i in range(0, 3)]
         targets = [ym for ym in targets if ym in sheets["전국"] or ym in sheets["서울"]]
         targets = sorted(set(targets), key=lambda ym: (2000 + int(ym.split("/")[0]), int(ym.split("/")[1])))
-        dbg(f"[predict] targets={targets}")
+        log(f"[predict] targets={targets}")
 
         for ym in targets:
             merged_pred: Dict[str, Union[int, str]] = {col: "" for col in SUMMARY_COLS}
@@ -1099,14 +1166,13 @@ def main():
             # 전국 탭 예측
             ws_nat = sheets["전국"].get(ym)
             if ws_nat:
-                pred_nat_n = predict_by_day_ratio(ws_nat, ratios_nat, allow_nat, today, fallback_ratio=2.0, horizon=90)
+                pred_nat_n  = predict_by_day_ratio(ws_nat, ratios_nat,  allow_nat,  today,
+                                                   fallback_ratio=2.0, horizon=90, training_pairs=pairs_nat)
                 # (선택) 총합 모멘텀 소폭 보정
                 df_cum_nat, fday_nat = build_cum_by_day(ws_nat, allow_nat, horizon=90)
-                if not df_cum_nat.empty and fday_nat:
-                    if TOTAL_N in df_cum_nat.columns:
-                        d_idx = min((today - (today - timedelta(days=1))).days + 1, 90)  # dummy, 영향 미미
-                        mf = momentum_factor_from_increments(df_cum_nat, TOTAL_N, d_idx, k=3, gamma=0.20)
-                        pred_nat_n[TOTAL_N] = int(round(pred_nat_n[TOTAL_N] * mf))
+                if not df_cum_nat.empty and fday_nat and TOTAL_N in df_cum_nat.columns:
+                    mf = momentum_factor_from_increments(df_cum_nat, TOTAL_N, 1, k=3, gamma=0.20)
+                    pred_nat_n[TOTAL_N] = int(round(pred_nat_n[TOTAL_N] * mf))
 
                 for k_n, v in pred_nat_n.items():
                     human = next((orig for orig in SUMMARY_COLS if _norm(orig) == k_n), k_n)
@@ -1118,14 +1184,14 @@ def main():
             # 서울 탭 예측
             ws_se  = sheets["서울"].get(ym)
             if ws_se:
-                pred_seoul_n = predict_by_day_ratio(ws_se, ratios_seou, allow_seoul, today, fallback_ratio=2.0, horizon=90)
+                pred_seoul_n = predict_by_day_ratio(ws_se,  ratios_seou, allow_seoul, today,
+                                                    fallback_ratio=2.0, horizon=90, training_pairs=pairs_seou)
                 # (선택) 모멘텀
                 df_cum_se, fday_se = build_cum_by_day(ws_se, allow_seoul, horizon=90)
                 if not df_cum_se.empty and fday_se:
                     base_col = TOTAL_N if TOTAL_N in df_cum_se.columns else next((c for c in df_cum_se.columns if c != "date"), None)
                     if base_col:
-                        d_dummy = 1
-                        mf = momentum_factor_from_increments(df_cum_se, base_col, d_dummy, k=3, gamma=0.20)
+                        mf = momentum_factor_from_increments(df_cum_se, base_col, 1, k=3, gamma=0.20)
                         if TOTAL_N in pred_seoul_n:
                             pred_seoul_n[TOTAL_N] = int(round(pred_seoul_n[TOTAL_N] * mf))
 
