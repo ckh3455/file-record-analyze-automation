@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os, re, json, time, random
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
@@ -292,21 +292,27 @@ def daily_increments(df: pd.DataFrame) -> pd.DataFrame:
         inc[c] = inc[c].clip(lower=0)
     return inc
 
+# --- 날짜 기반 판단 유틸 ---
+def is_weekend_or_holiday(d: date) -> bool:
+    if d.weekday() >= 5:
+        return True
+    if d.strftime("%Y-%m-%d") in KR_HOLIDAYS:
+        return True
+    return False
+
+def weekday_ratio_for_completion(d: date) -> float:
+    # 약한 날(토·일·공휴일) ↑, 평일 ↓  (필요시 조절)
+    return 1.12 if is_weekend_or_holiday(d) else 0.95
+
 # ===== 일차별 누적 프레임(단조증가화 포함) =====
 def build_cum_by_day(ws: gspread.Worksheet, allow_cols: set, horizon: int = 90) -> Tuple[pd.DataFrame, Optional[date]]:
-    """월 시트(ws) → date, 지역열(normalized) 로 된 누적 df.
-       - 날짜 정렬, 결측 0 채움
-       - 일별 cummax로 단조증가화
-       - 첫날 기준으로 최대 90일 구간만 자름
-    """
-    df = month_sheet_to_frame(ws)  # 열명은 이미 정규화되어 있음(_norm)
+    df = month_sheet_to_frame(ws)
     if df.empty:
         return pd.DataFrame(), None
     fday = first_data_date(ws)
     if not fday:
         return pd.DataFrame(), None
 
-    # 필요한 지역만 남기고 숫자화
     cols = ["date"] + [c for c in df.columns if c != "date" and c in allow_cols]
     if len(cols) <= 1:
         return pd.DataFrame(), None
@@ -315,24 +321,29 @@ def build_cum_by_day(ws: gspread.Worksheet, allow_cols: set, horizon: int = 90) 
         if c == "date": continue
         g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0).astype(int)
 
-    # 날짜 정렬 + cummax(소폭 하락 보정)
     g = g.sort_values("date").reset_index(drop=True)
     for c in cols:
         if c == "date": continue
-        g[c] = g[c].cummax()
+        g[c] = g[c].cummax()  # 소폭하락 보정
 
-    # 첫날~90일 인덱스로 정렬/보간(ffill)
     idx = pd.date_range(fday, fday + pd.Timedelta(days=horizon-1), freq="D")
     g = g.set_index("date").reindex(idx, method="ffill").fillna(0)
     g.index.name = "date"
     g = g.reset_index()
     return g, fday
 
+# ===== 학습 달 판정(성숙 달: >= min_days 경과) =====
+def is_mature_month(ws: gspread.Worksheet, min_days: int = 85) -> bool:
+    f = first_data_date(ws); l = latest_data_date(ws)
+    if not f or not l:
+        return False
+    return (l - f).days + 1 >= min_days
+
 # ===== 학습: 일차 d → 최종/당일 배율표(지역별 median) =====
 def train_day_ratios(
     sheets: Dict[str, Dict[str, gspread.Worksheet]],
     level: str,                     # "전국" 또는 "서울"
-    start_key: Tuple[int,int],      # (2024,10) 같은 키
+    start_key: Tuple[int,int],      # (2024,10)
     end_key_exclusive: Tuple[int,int],  # 이 키 "직전"까지 학습
     allow_cols: set,
     min_days: int = 85,
@@ -351,17 +362,16 @@ def train_day_ratios(
 
     ratios_by_region_day: Dict[str, List[List[float]]] = {}
     for ym, ws in sorted(pool.items(), key=lambda kv: ym_to_key(kv[0])):
-        # 성숙 달만 학습
         if not is_mature_month(ws, min_days=min_days):
             continue
-        df_cum, fday = build_cum_by_day(ws, allow_cols, horizon=horizon)
+        df_cum, _ = build_cum_by_day(ws, allow_cols, horizon=horizon)
         if df_cum.empty:
             continue
 
         for col in df_cum.columns:
             if col == "date": continue
             s = pd.to_numeric(df_cum[col], errors="coerce").fillna(0).astype(int)
-            c90 = int(s.iloc[horizon-1])  # 90일째 값
+            c90 = int(s.iloc[horizon-1])
             if c90 <= 0:
                 continue
             day_ratios = []
@@ -377,13 +387,10 @@ def train_day_ratios(
 
     ratios_final: Dict[str, List[float]] = {}
     for region, day_lists in ratios_by_region_day.items():
-        arr = [0.0]  # 0번째 더미
+        arr = [0.0]
         for d in range(horizon):
             vals = day_lists[d]
-            if not vals:
-                arr.append(0.0)
-            else:
-                arr.append(float(np.median(vals)))
+            arr.append(float(np.median(vals)) if vals else 0.0)
         # 이웃 보간
         last = None
         for i in range(1, horizon+1):
@@ -404,7 +411,7 @@ def train_day_ratios(
         ratios_final[region] = arr
     return ratios_final
 
-# ===== 예측: 오늘 일차 d에서 ratio 적용 =====
+# ===== 예측: 오늘(실제 반영은 내일) 일차 d에서 ratio 적용 + 요일/공휴일 보정 =====
 def predict_by_day_ratio(
     ws: gspread.Worksheet,
     ratios: Dict[str, List[float]],
@@ -413,32 +420,42 @@ def predict_by_day_ratio(
     fallback_ratio: float = 2.0,
     horizon: int = 90,
 ) -> Dict[str, int]:
-    """월 시트(ws) 한 탭(전국 또는 서울)에 대해 지역별 최종(90일) 예측치 반환"""
+    """월 시트(ws) 한 탭(전국 또는 서울)에 대해 지역별 최종(90일) 예측치 반환
+       - '데이터는 다음날 반영' → 효과 기준일 = today - 1day
+       - 토·일·공휴일 약세 보정: 해당 '효과 기준일'의 요일/공휴일 여부로 보정배율 곱함
+    """
     df_cum, fday = build_cum_by_day(ws, allow_cols, horizon=horizon)
     if df_cum.empty or not fday:
         return {}
-    # 오늘 기준 일차
-    d = min((today - fday).days + 1, horizon)
+
+    eff_today = today - timedelta(days=1)
+    d = min(max(1, (eff_today - fday).days + 1), horizon)
+    dow_factor = weekday_ratio_for_completion(eff_today)
+
     out: Dict[str, int] = {}
     for col in df_cum.columns:
         if col == "date": continue
         s = pd.to_numeric(df_cum[col], errors="coerce").fillna(0).astype(int)
         obs = int(s.iloc[d-1])
+
         ratio_arr = ratios.get(col)
-        ratio = float(ratio_arr[d] if (ratio_arr is not None and d < len(ratio_arr)) else fallback_ratio)
+        base_ratio = float(ratio_arr[d] if (ratio_arr is not None and d < len(ratio_arr)) else fallback_ratio)
+        ratio = base_ratio * dow_factor
+        ratio = max(1.0, min(8.0, ratio))  # 안전 장치
+
         pred = int(round(obs * ratio))
-        pred = max(pred, obs)  # 예측은 관측보다 작을 수 없음
+        pred = max(pred, obs)
         out[col] = pred
 
-    # 총합계 채우기
+    # 총합계
     if _norm("총합계") in df_cum.columns:
         out[_norm("총합계")] = max(out.get(_norm("총합계"), 0), int(df_cum[_norm("총합계")].iloc[-1]))
-        # 관측된 개별 지역 예측의 합보다 너무 작지 않게(안전)
         s_keys = [k for k in out.keys() if k != _norm("총합계")]
         out[_norm("총합계")] = max(out[_norm("총합계")], int(sum(out[k] for k in s_keys)))
     else:
         keys = [c for c in df_cum.columns if c != "date" and c in allow_cols and c != _norm("총합계")]
         out[_norm("총합계")] = int(sum(int(out[k]) for k in keys))
+
     return out
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: str) -> int:
@@ -506,7 +523,6 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
         _retry(ws.update, [["년월", "구분"] + default_cols], "A1")
         header = ["년월", "구분"] + default_cols
 
-    # 거래요약 실제 헤더에만 씀 (새 열 생성 금지)
     hmap_norm = {_norm(h): i + 1 for i, h in enumerate(header)}
     sheet_prefix = f"'{ws.title}'!"
     payload = [
@@ -520,7 +536,6 @@ def put_summary_line(ws, row_idx: int, ym: str, label: str, line_map: dict):
                 "range": f"{sheet_prefix}{a1_col(hmap_norm[_norm(k)])}{row_idx}",
                 "values": [[v]]
             })
-    # 총합계 칸 있으면 채우기
     for possible in ("총합계", "합계"):
         pn = _norm(possible)
         if pn in hmap_norm:
@@ -574,34 +589,9 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     r4 = find_summary_row(ws, ym, "전월대비 건수증감"); put_summary_line(ws, r4, ym, "전월대비 건수증감", diffs)
     header = _retry(ws.row_values, 1); color_diff_line(ws, r4, diffs, header); log(f"[summary] {ym} 전월대비 -> row={r4}")
 
-# ===== 거래요약: 기존 '거래건수' 행 읽기(예측 계산에선 필요 없지만 유지) =====
-def read_summary_counts_row(ws_sum: gspread.Worksheet, ym: str, label="거래건수") -> Dict[str, int]:
-    vals = _retry(ws_sum.get_all_values) or []
-    if len(vals) < 2: return {}
-    header = [str(h).strip() for h in vals[0]]
-    target = None
-    for r in vals[1:]:
-        if len(r) >= 2 and str(r[0]).strip() == ym and str(r[1]).strip() == label:
-            target = r; break
-    if not target: return {}
-    hmap = { _norm(h): idx for idx, h in enumerate(header) }
-    out = {}
-    for h, idx in hmap.items():
-        if h in (_norm("년월"), _norm("구분")): continue
-        val = str(target[idx]).strip() if idx < len(target) else "0"
-        try:
-            v = int(float(val or "0"))
-        except Exception:
-            v = 0
-        human = next((orig for orig in SUMMARY_COLS if _norm(orig) == h), h)
-        if human == "서울": human = "서울특별시"
-        out[human] = v
-    return out
-
 # ===== 거래요약: '예상건수' 라인 (초록 Bold) =====
 def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     r = find_summary_row(ws_sum, ym, "예상건수")
-    # '서울' 키 제거, '서울특별시'로 통일
     if pred_map and "서울" in pred_map:
         if (pred_map.get("서울특별시") in ("", None)) and (pred_map["서울"] not in ("", None)):
             pred_map["서울특별시"] = pred_map["서울"]
@@ -767,8 +757,7 @@ def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: p
         })
     add_chart = {"addChart": {"chart": {"spec": {
         "title": f"{month_title} - 누적 등록 추이",
-        "basicChart": {
-            "chartType": "LINE", "legendPosition": "BOTTOM_LEGEND",
+        "basicChart": {"chartType": "LINE", "legendPosition": "BOTTOM_LEGEND",
             "axis": [{"position": "BOTTOM_AXIS", "title": "Date"}, {"position": "LEFT_AXIS", "title": "Cumulative"}],
             "domains": [{"domain": {"sourceRange": {"sources": [{
                 "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows, "startColumnIndex": 0, "endColumnIndex": 1
@@ -1078,7 +1067,6 @@ def main():
 
         today = datetime.now().date()
 
-        # 키 유틸
         def add_months(y, m, delta):
             nm = m + delta
             y += (nm - 1) // 12
@@ -1091,17 +1079,15 @@ def main():
 
         START_KEY = (2024, 10)
         cur_y, cur_m = today.year, today.month
-        end_y, end_m = add_months(cur_y, cur_m, -3)              # 오늘-3개월 (포함)
-        END_KEY_EXCL = add_months(end_y, end_m, +1)              # exclusive upper bound
+        end_y, end_m = add_months(cur_y, cur_m, -3)          # 오늘-3개월(포함)
+        END_KEY_EXCL = add_months(end_y, end_m, +1)          # exclusive 상한
 
         allow_seoul = SEOUL_SET_N | {TOTAL_N}
         allow_nat   = NATION_SET_N | {TOTAL_N}
 
-        # 레벨별 학습(일차별 배율표)
         ratios_nat  = train_day_ratios(sheets, "전국", START_KEY, END_KEY_EXCL, allow_nat,  min_days=85, horizon=90)
         ratios_seou = train_day_ratios(sheets, "서울", START_KEY, END_KEY_EXCL, allow_seoul, min_days=85, horizon=90)
 
-        # 최근 3개월(현재월 포함) 타깃
         targets = [key_to_ym(*add_months(cur_y, cur_m, -i)) for i in range(0, 3)]
         targets = [ym for ym in targets if ym in sheets["전국"] or ym in sheets["서울"]]
         targets = sorted(set(targets), key=lambda ym: (2000 + int(ym.split("/")[0]), int(ym.split("/")[1])))
@@ -1114,13 +1100,12 @@ def main():
             ws_nat = sheets["전국"].get(ym)
             if ws_nat:
                 pred_nat_n = predict_by_day_ratio(ws_nat, ratios_nat, allow_nat, today, fallback_ratio=2.0, horizon=90)
-
-                # (선택) 총합 모멘텀 가볍게
+                # (선택) 총합 모멘텀 소폭 보정
                 df_cum_nat, fday_nat = build_cum_by_day(ws_nat, allow_nat, horizon=90)
-                if not df_cum_nat.empty:
+                if not df_cum_nat.empty and fday_nat:
                     if TOTAL_N in df_cum_nat.columns:
-                        day_idx = min((today - fday_nat).days + 1, 90)
-                        mf = momentum_factor_from_increments(df_cum_nat, TOTAL_N, day_idx, k=3, gamma=0.20)
+                        d_idx = min((today - (today - timedelta(days=1))).days + 1, 90)  # dummy, 영향 미미
+                        mf = momentum_factor_from_increments(df_cum_nat, TOTAL_N, d_idx, k=3, gamma=0.20)
                         pred_nat_n[TOTAL_N] = int(round(pred_nat_n[TOTAL_N] * mf))
 
                 for k_n, v in pred_nat_n.items():
@@ -1134,15 +1119,13 @@ def main():
             ws_se  = sheets["서울"].get(ym)
             if ws_se:
                 pred_seoul_n = predict_by_day_ratio(ws_se, ratios_seou, allow_seoul, today, fallback_ratio=2.0, horizon=90)
-
-                # (선택) 총합/핵심 구 모멘텀 가볍게
+                # (선택) 모멘텀
                 df_cum_se, fday_se = build_cum_by_day(ws_se, allow_seoul, horizon=90)
-                if not df_cum_se.empty:
-                    day_idx = min((today - fday_se).days + 1, 90)
+                if not df_cum_se.empty and fday_se:
                     base_col = TOTAL_N if TOTAL_N in df_cum_se.columns else next((c for c in df_cum_se.columns if c != "date"), None)
                     if base_col:
-                        mf = momentum_factor_from_increments(df_cum_se, base_col, day_idx, k=3, gamma=0.20)
-                        # 총합계 보정
+                        d_dummy = 1
+                        mf = momentum_factor_from_increments(df_cum_se, base_col, d_dummy, k=3, gamma=0.20)
                         if TOTAL_N in pred_seoul_n:
                             pred_seoul_n[TOTAL_N] = int(round(pred_seoul_n[TOTAL_N] * mf))
 
@@ -1155,7 +1138,7 @@ def main():
 
             write_predicted_line(ws_sum, ym, merged_pred)
 
-        # 패턴 분석 탭: 최신 월 표+그래프
+        # 패턴 분석 탭
         if targets:
             latest_ym = targets[-1]
             ws_latest = sheets["서울"].get(latest_ym) or sheets["전국"].get(latest_ym)
