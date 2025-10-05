@@ -3,7 +3,7 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    # 매일 KST 09:00 = UTC 00:00
+    # 매일 KST 08:30 = UTC 23:30
     - cron: "30 23 * * *"
 
 permissions:
@@ -13,13 +13,20 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 150         # 재시도 고려(최대 2~3회)
+    # 30분 간격 재시도 고려
+    timeout-minutes: 150
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
-      TZ: Asia/Seoul
+      SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+
+      # 외부 레포/워크플로/아티팩트 이름
+      SRC_REPO: ckh3455/file-automation
+      SRC_WORKFLOW: molit.yml        # 외부 레포의 워크플로 파일명
+      SRC_ARTIFACT: molit-xlsx       # molit에서 업로드한 artifact 이름
 
     steps:
       - name: Checkout
@@ -37,79 +44,128 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # === 30분 간격 재시도 포함: 다운로드 + 신선도 검사 루프 ===
-      - name: Download & freshness guard with retries (every 30 min)
+      # === 최신 성공 run의 artifact 다운로드 + 신선도(<=12h) 검사 + 상세 로그 + 재시도 안내 메시지 ===
+      - name: Download artifacts with freshness guard (retry every 30 min)
         id: fetch
         shell: bash
         env:
-          SRC_REPO: ckh3455/file-automation
-          SRC_WORKFLOW: molit.yml         # ← 실제 파일명
-          SRC_ARTIFACT: molit-xlsx        # ← molit 업로드명과 일치
-          MAX_TRIES: "4"                  # 1회 + 3회 재시도(총 4번)
-          SLEEP_SEC: "1800"               # 30분
+          MAX_TRIES: "4"          # 총 4번 시도(첫+3회 재시도)
+          RETRY_MIN: "30"         # 재시도 간격(분)
         run: |
           set -euo pipefail
+
+          echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
+
+          # 깨끗하게 시작
           rm -rf artifacts && mkdir -p artifacts
 
           try=1
           while :; do
-            echo "::group::[try $try] download latest successful artifact"
-            rm -rf artifacts/* || true
-            echo "downloading from $SRC_REPO / $SRC_WORKFLOW ..."
-            gh api \
-              repos/$SRC_REPO/actions/artifacts \
-              >/dev/null 2>&1 || echo "gh ok" # warm up
-
-            # 최신 성공 실행의 artifact 다운로드
-            dawidd6_action () {
-              cat <<'YML' > /tmp/download.yml
-              uses: dawidd6/action-download-artifact@v6
-              with:
-                github_token: ${{ secrets.SOURCE_REPO_PAT }}
-                repo: ${SRC_REPO}
-                workflow: ${SRC_WORKFLOW}
-                workflow_conclusion: success
-                branch: main
-                name: ${SRC_ARTIFACT}
-                path: artifacts
-                if_no_artifact_found: fail
-              YML
-            }
-            dawidd6_action
+            echo "::group::[try $try] Locate latest SUCCESS run ($SRC_REPO / $SRC_WORKFLOW)"
+            RUN_JSON=$(gh run list -R "$SRC_REPO" \
+                        --workflow "$SRC_WORKFLOW" \
+                        --status success \
+                        --json databaseId,headBranch,headSha,displayTitle,updatedAt,createdAt \
+                        --limit 1)
+            echo "RUN_JSON: $RUN_JSON"
+            RUN_ID=$(echo "$RUN_JSON" | jq -r '.[0].databaseId // empty')
+            RUN_UPDATED=$(echo "$RUN_JSON" | jq -r '.[0].updatedAt // empty')
+            RUN_TITLE=$(echo "$RUN_JSON" | jq -r '.[0].displayTitle // empty')
+            echo "RUN_ID=$RUN_ID"
+            echo "RUN_UPDATED(UTC)=$RUN_UPDATED"
+            echo "RUN_TITLE=$RUN_TITLE"
             echo "::endgroup::"
 
-            echo "::group::freshness check (<= 12h, KST)"
-            python - <<'PY'
-import pathlib, sys, datetime, os
+            rc=0
+            if [[ -z "${RUN_ID:-}" ]]; then
+              echo "::warning::No successful run found yet in $SRC_REPO/$SRC_WORKFLOW."
+              rc=66
+            else
+              echo "::group::Download artifact: $SRC_ARTIFACT (run $RUN_ID)"
+              rm -rf artifacts/* || true
+              if ! gh run download "$RUN_ID" -R "$SRC_REPO" -n "$SRC_ARTIFACT" -D artifacts; then
+                echo "::warning::Failed to download artifact '$SRC_ARTIFACT' from run $RUN_ID."
+                rc=66
+              fi
+              echo "::endgroup::"
+            fi
+
+            # 상세 신선도/날짜 로그
+            if [[ $rc -eq 0 ]]; then
+              echo "::group::Freshness & date check (<= 12h, KST) with verbose logs"
+              python - <<'PY'
+import pathlib, sys, datetime, os, time
+
 root = pathlib.Path("artifacts")
-files = list(root.rglob("*.xlsx"))
-print("files:", len(files))
-if not files:
-    sys.exit(66)  # stale / none
-
-latest = max(files, key=lambda p: p.stat().st_mtime)
-mt = latest.stat().st_mtime
+files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
 kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-age_h = (kst_now - datetime.datetime.utcfromtimestamp(mt)).total_seconds()/3600
-print("latest:", latest, "age_h:", round(age_h,2))
-# 12시간 이내여야 통과
-if age_h > 12:
-    sys.exit(66)            # stale
-PY
-            rc=$?
-            echo "::endgroup::"
+today_kst = kst_now.date()
+threshold_hours = 12
 
-            if [ $rc -eq 0 ]; then
-              echo "fresh artifacts ✓"
+print(f"KST now: {kst_now}  (today={today_kst})")
+print(f"Freshness threshold: <= {threshold_hours} hours")
+print(f"Total XLSX files found: {len(files)}")
+
+if not files:
+    print("NO XLSX FILES in artifacts directory.")
+    sys.exit(66)
+
+# 상위 15개 파일의 상세 로그 출력
+def fmt_ts(ts):
+    return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
+
+for p in files[-15:]:
+    mt = p.stat().st_mtime
+    mod_kst = fmt_ts(mt)
+    age_h = (kst_now - mod_kst).total_seconds()/3600
+    print(f"- {p} | modified(KST)={mod_kst} | age_hours={age_h:.2f}")
+
+latest = files[-1]
+latest_mt = latest.stat().st_mtime
+latest_kst = fmt_ts(latest_mt)
+latest_age_h = (kst_now - latest_kst).total_seconds()/3600
+print(f"Latest file: {latest}")
+print(f"Latest mtime (KST): {latest_kst}")
+print(f"Latest age hours: {latest_age_h:.2f}")
+
+# '오늘 날짜' 힌트 로그 (파일명에서 날짜 추정 시도)
+import re
+name = latest.name
+date_hint = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', name)
+if date_hint:
+    y, m, d = date_hint[-1]
+    try:
+        hint_date = datetime.date(int(y), int(m), int(d))
+        print(f"Date hint from filename: {hint_date}  (today={today_kst})  diff_days={(today_kst - hint_date).days}")
+    except Exception:
+        pass
+else:
+    print("No obvious date hint found in the latest filename.")
+
+# 신선도 기준: 최신 파일 수정 시간이 12시간 이내여야 함
+if latest_age_h > threshold_hours:
+    print("RESULT: STALE or NOT TODAY → will retry later.")
+    sys.exit(66)
+
+print("RESULT: FRESH ✓")
+PY
+              rc=$?
+              echo "::endgroup::"
+            fi
+
+            if [[ $rc -eq 0 ]]; then
+              echo "Fresh artifacts detected. Proceeding."
               break
             fi
 
-            if [ $try -ge $MAX_TRIES ]; then
-              echo "no fresh artifacts after $try tries"
+            if [[ $try -ge $MAX_TRIES ]]; then
+              echo "::error::No fresh artifacts after $try tries. Giving up."
               exit 1
             fi
-            echo "stale/not found → sleep ${SLEEP_SEC}s and retry..."
-            sleep "${SLEEP_SEC}"
+
+            echo "::notice::Artifacts are not fresh or not present yet. Will retry in ${RETRY_MIN} minutes (try $((try+1))/${MAX_TRIES})."
+            echo "Sleeping for ${RETRY_MIN} minutes to wait for upstream completion..."
+            sleep "$((RETRY_MIN*60))"
             try=$((try+1))
           done
 
@@ -121,7 +177,7 @@ PY
           find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort
 
       - name: Run analysis & update
-        if: ${{ hashFiles('.fresh_ok') != '' }}   # 신선도 통과시에만
+        if: ${{ hashFiles('.fresh_ok') != '' }}
         env:
           ARTIFACTS_DIR: artifacts
         run: |
