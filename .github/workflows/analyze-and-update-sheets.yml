@@ -49,8 +49,8 @@ jobs:
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "4"          # 총 4번 시도(첫+3회 재시도)
-          RETRY_MIN: "30"         # 재시도 간격(분)
+          MAX_TRIES: "6"          # 총 4번 시도(첫+3회 재시도)
+          RETRY_MIN: "15"         # 재시도 간격(분)
         run: |
           set -euo pipefail
 
