@@ -1,4 +1,3 @@
-# .github/workflows/analyze-and-update-sheets.yml
 name: analyze-and-update-sheets
 
 on:
@@ -7,7 +6,6 @@ on:
     # 매일 KST 09:00 = UTC 00:00
     - cron: "30 23 * * *"
 
-
 permissions:
   contents: read
   actions: read
@@ -15,26 +13,19 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 150         # 재시도 고려(최대 2~3회)
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
+      TZ: Asia/Seoul
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Download artifacts from ckh3455/file-automation (latest success)
-        uses: dawidd6/action-download-artifact@v6
         with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}
-          repo: ckh3455/file-automation
-          workflow: molit.yml
-          workflow_conclusion: success
-          branch: main
-          path: artifacts
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,7 +37,93 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # === 30분 간격 재시도 포함: 다운로드 + 신선도 검사 루프 ===
+      - name: Download & freshness guard with retries (every 30 min)
+        id: fetch
+        shell: bash
+        env:
+          SRC_REPO: ckh3455/file-automation
+          SRC_WORKFLOW: molit.yml         # ← 실제 파일명
+          SRC_ARTIFACT: molit-xlsx        # ← molit 업로드명과 일치
+          MAX_TRIES: "4"                  # 1회 + 3회 재시도(총 4번)
+          SLEEP_SEC: "1800"               # 30분
+        run: |
+          set -euo pipefail
+          rm -rf artifacts && mkdir -p artifacts
+
+          try=1
+          while :; do
+            echo "::group::[try $try] download latest successful artifact"
+            rm -rf artifacts/* || true
+            echo "downloading from $SRC_REPO / $SRC_WORKFLOW ..."
+            gh api \
+              repos/$SRC_REPO/actions/artifacts \
+              >/dev/null 2>&1 || echo "gh ok" # warm up
+
+            # 최신 성공 실행의 artifact 다운로드
+            dawidd6_action () {
+              cat <<'YML' > /tmp/download.yml
+              uses: dawidd6/action-download-artifact@v6
+              with:
+                github_token: ${{ secrets.SOURCE_REPO_PAT }}
+                repo: ${SRC_REPO}
+                workflow: ${SRC_WORKFLOW}
+                workflow_conclusion: success
+                branch: main
+                name: ${SRC_ARTIFACT}
+                path: artifacts
+                if_no_artifact_found: fail
+              YML
+            }
+            dawidd6_action
+            echo "::endgroup::"
+
+            echo "::group::freshness check (<= 12h, KST)"
+            python - <<'PY'
+import pathlib, sys, datetime, os
+root = pathlib.Path("artifacts")
+files = list(root.rglob("*.xlsx"))
+print("files:", len(files))
+if not files:
+    sys.exit(66)  # stale / none
+
+latest = max(files, key=lambda p: p.stat().st_mtime)
+mt = latest.stat().st_mtime
+kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+age_h = (kst_now - datetime.datetime.utcfromtimestamp(mt)).total_seconds()/3600
+print("latest:", latest, "age_h:", round(age_h,2))
+# 12시간 이내여야 통과
+if age_h > 12:
+    sys.exit(66)            # stale
+PY
+            rc=$?
+            echo "::endgroup::"
+
+            if [ $rc -eq 0 ]; then
+              echo "fresh artifacts ✓"
+              break
+            fi
+
+            if [ $try -ge $MAX_TRIES ]; then
+              echo "no fresh artifacts after $try tries"
+              exit 1
+            fi
+            echo "stale/not found → sleep ${SLEEP_SEC}s and retry..."
+            sleep "${SLEEP_SEC}"
+            try=$((try+1))
+          done
+
+          echo "OK" > .fresh_ok
+
+      - name: List downloaded files (debug)
+        run: |
+          echo "=== downloaded ==="
+          find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort
+
       - name: Run analysis & update
+        if: ${{ hashFiles('.fresh_ok') != '' }}   # 신선도 통과시에만
+        env:
+          ARTIFACTS_DIR: artifacts
         run: |
           python scripts/analyze_and_update.py \
             --artifacts-dir artifacts \
@@ -55,14 +132,10 @@ jobs:
       - name: Preview analyze_report (always)
         if: always()
         run: |
-          echo "== analyze_report tree =="
-          ls -alR analyze_report || true
-          echo "---- latest.log (head) ----"
-          sed -n '1,220p' analyze_report/latest.log || true
-          echo "---- run logs list ----"
-          ls -al analyze_report/run-*.log 2>/dev/null || true
-          echo "---- where_written.txt ----"
-          cat analyze_report/where_written.txt 2>/dev/null || true
+          echo "== analyze_report tree =="; ls -alR analyze_report || true
+          echo "---- latest.log (head) ----"; sed -n '1,220p' analyze_report/latest.log || true
+          echo "---- run logs list ----"; ls -al analyze_report/run-*.log 2>/dev/null || true
+          echo "---- where_written.txt ----"; cat analyze_report/where_written.txt 2>/dev/null || true
 
       - name: Upload report
         if: always()
@@ -70,6 +143,5 @@ jobs:
         with:
           name: analyze-report
           path: analyze_report/**
-          if-no-files-found: warn
           retention-days: 14
           compression-level: 6
