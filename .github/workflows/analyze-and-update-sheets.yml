@@ -18,9 +18,11 @@ jobs:
       CI: "1"
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Seoul
+
       SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+
       SRC_REPO: ckh3455/file-automation
       SRC_WORKFLOW: molit.yml
       SRC_ARTIFACT: molit-xlsx
@@ -41,13 +43,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ 성공본 기준: 아티팩트 찾기 + 신선도 검사 + 15분 간격 재시도
-      - name: Download artifacts with freshness guard (retry)
+      # 🔁 15분 간격 재시도 + Bash만 사용(파이썬 없음)
+      - name: Download artifacts with freshness guard (retry every 15 min)
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "6"   # 총 6회 시도 (처음 + 5번 재시도)
-          RETRY_MIN: "15"  # 🔁 재시도 간격 15분
+          MAX_TRIES: "6"    # 처음 + 5회 재시도
+          RETRY_MIN: "15"   # 15분 간격
         run: |
           set -euo pipefail
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
@@ -86,43 +88,59 @@ jobs:
               echo "::endgroup::"
             fi
 
+            # 🔍 Bash로만 신선도(<=12h, KST) 확인
             if [ ${rc} -eq 0 ]; then
-              echo "::group::Freshness check (<=12h, KST)"
-              python - <<'PY'
-import pathlib, sys, datetime, re
-root = pathlib.Path("artifacts")
-files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
-kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-today = kst_now.date()
-print(f"KST now: {kst_now}  (today={today})")
-print(f"files: {len(files)}")
-if not files:
-    sys.exit(66)
+              echo "::group::Freshness check (<=12h, KST, bash-only)"
+              # KST now
+              KST_NOW_SEC=$(date -u +"%s")
+              KST_NOW_SEC=$((KST_NOW_SEC + 9*3600))
+              echo "KST now (epoch): ${KST_NOW_SEC}"
 
-def kst(ts): return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
+              mapfile -t XLSX < <(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n)
+              echo "xlsx files found: ${#XLSX[@]}"
 
-for p in files[-15:]:
-    mod = kst(p.stat().st_mtime)
-    age = (kst_now - mod).total_seconds()/3600
-    print(f"- {p} | modified(KST)={mod} | age_h={age:.2f}")
+              if [ "${#XLSX[@]}" -eq 0 ]; then
+                echo "No .xlsx → treat as stale"
+                rc=66
+              else
+                # 최근 파일 로그(최대 15개)
+                CNT=${#XLSX[@]}
+                START=$(( CNT > 15 ? CNT-15 : 0 ))
+                for ((i=START; i<CNT; i++)); do
+                  LINE="${XLSX[$i]}"
+                  TS_FLOAT="${LINE%% *}"
+                  FILE="${LINE#* }"
+                  TS_INT="${TS_FLOAT%.*}"
+                  AGE=$(( KST_NOW_SEC - TS_INT ))
+                  printf -- "- %s | modified(KST epoch)=%s | age_h=%.2f\n" "$FILE" "$TS_INT" "$(echo "$AGE/3600" | bc -l)"
+                done
 
-latest = files[-1]
-mod = kst(latest.stat().st_mtime)
-age = (kst_now - mod).total_seconds()/3600
-print(f"latest: {latest} | modified(KST)={mod} | age_h={age:.2f}")
+                # 최신 파일
+                LAST_LINE="${XLSX[-1]}"
+                LAST_TS_FLOAT="${LAST_LINE%% *}"
+                LAST_FILE="${LAST_LINE#* }"
+                LAST_TS_INT="${LAST_TS_FLOAT%.*}"
+                LAST_AGE=$(( KST_NOW_SEC - LAST_TS_INT ))
+                LAST_AGE_H=$(echo "$LAST_AGE/3600" | bc -l)
 
-m = re.findall(r'(20\\d{2})[-_/ ]?(\\d{1,2})[-_/ ]?(\\d{1,2})', latest.name)
-if m:
-    y, M, d = map(int, m[-1])
-    hint = datetime.date(y, M, d)
-    print(f"filename date hint: {hint} (diff_days={(today-hint).days})")
+                echo "latest: ${LAST_FILE}"
+                echo "latest age hours: ${LAST_AGE_H}"
 
-if age > 12:
-    print("RESULT: STALE or NOT TODAY → retry later")
-    sys.exit(66)
-print("RESULT: FRESH ✓")
-PY
-              rc=$?
+                # 파일명에서 날짜 힌트(있으면 로그만)
+                if grep -Eo '20[0-9]{2}[-_/ ]?[0-9]{1,2}[-_/ ]?[0-9]{1,2}' <<<"$(basename "$LAST_FILE")" >/dev/null 2>&1; then
+                  HINT="$(grep -Eo '20[0-9]{2}[-_/ ]?[0-9]{1,2}[-_/ ]?[0-9]{1,2}' <<<"$(basename "$LAST_FILE")" | tail -1)"
+                  echo "filename date hint: ${HINT}"
+                fi
+
+                # 12시간(43200초) 기준
+                if [ "$LAST_AGE" -gt 43200 ]; then
+                  echo "RESULT: STALE or NOT TODAY → retry later"
+                  rc=66
+                else
+                  echo "RESULT: FRESH ✓"
+                  rc=0
+                fi
+              fi
               echo "::endgroup::"
             fi
 
