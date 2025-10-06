@@ -13,10 +13,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 15분 간격 재시도(최대 6회) + 분석까지 고려해 여유있게
+    timeout-minutes: 150
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
@@ -25,45 +27,79 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) 기존 이름으로 먼저 시도
-      - name: Download artifacts (exact)
-        id: dl1
-        continue-on-error: true
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}
-          repo: ckh3455/file-automation
-          workflow: molit.yml
-          workflow_conclusion: success
-          branch: main
-          name: molit-xlsx
-          path: artifacts
-
-      # 2) 실패하면 정규식(outputs-*)으로 재시도
-      - name: Download artifacts (fallback regex)
-        id: dl2
-        if: steps.dl1.outcome == 'failure'
-        continue-on-error: true
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          github_token: ${{ secrets.SOURCE_REPO_PAT }}
-          repo: ckh3455/file-automation
-          workflow: molit.yml
-          workflow_conclusion: success
-          branch: main
-          name: ^outputs-.*$
-          name_is_regexp: true
-          path: artifacts
-
-      # 3) 실제 수신 검증: xlsx 없으면 실패로 종료 (원인 파악 쉬움)
-      - name: Verify artifacts exist
+      # 아티팩트 다운로드 (정확명 → 정규식) + 15분 간격 재시도
+      - name: Download artifacts with retry (exact → regex)
+        shell: bash
         run: |
-          echo "== downloaded =="
-          find artifacts -type f -maxdepth 2 -printf "%p\n" || true
-          if ! find artifacts -type f -name "*.xlsx" -print -quit | grep -q .; then
-            echo "::error::No XLSX artifacts found. Check upstream artifact name."
-            exit 1
-          fi
+          set -euo pipefail
+          echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
+
+          rm -rf artifacts
+          mkdir -p artifacts
+
+          MAX_TRIES=6       # 총 6회 시도(초기 1회 + 5회 재시도)
+          SLEEP_MIN=15      # 재시도 간격(분)
+          TRY=1
+
+          while :; do
+            echo "::group::[try ${TRY}] find latest SUCCESS run"
+            RUN_JSON="$(gh run list -R ckh3455/file-automation \
+              --workflow molit.yml \
+              --status success \
+              --json databaseId,updatedAt \
+              --limit 1)"
+            RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
+            RUN_UPDATED="$(echo "${RUN_JSON}" | jq -r '.[0].updatedAt // empty')"
+            echo "RUN_ID=${RUN_ID}"
+            echo "RUN_UPDATED(UTC)=${RUN_UPDATED}"
+            echo "::endgroup::"
+
+            rc=0
+            rm -rf artifacts/*
+
+            if [ -z "${RUN_ID}" ]; then
+              echo "::warning::No successful upstream run yet."
+              rc=66
+            else
+              echo "::group::Download artifact (exact name: molit-xlsx)"
+              if gh run download "${RUN_ID}" -R ckh3455/file-automation -n molit-xlsx -D artifacts; then
+                echo "Downloaded exact-name artifact."
+              else
+                echo "::warning::Exact-name missing. Trying regex: ^outputs-.*$"
+                if gh run download "${RUN_ID}" -R ckh3455/file-automation -n '^outputs-.*$' -D artifacts; then
+                  echo "Downloaded regex-matched artifact."
+                else
+                  rc=66
+                fi
+              fi
+              echo "::endgroup::"
+            fi
+
+            # 실제 파일 수신 검증: .xlsx 하나라도 없으면 재시도
+            if [ ${rc} -eq 0 ]; then
+              if find artifacts -type f -name '*.xlsx' -print -quit | grep -q .; then
+                echo "Artifacts are ready."
+                break
+              else
+                echo "::notice::No .xlsx yet; upstream may still be uploading."
+                rc=66
+              fi
+            fi
+
+            if [ ${TRY} -ge ${MAX_TRIES} ]; then
+              echo "::error::No artifacts after ${TRY} tries. Giving up."
+              exit 1
+            fi
+
+            echo "::notice::Retry in ${SLEEP_MIN} minutes (next try: $((TRY+1))/${MAX_TRIES})."
+            sleep "$((SLEEP_MIN*60))"
+            TRY=$((TRY+1))
+          done
+
+      - name: List downloaded files
+        run: |
+          echo "=== downloaded files ==="
+          find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,6 +112,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run analysis & update
+        env:
+          ARTIFACTS_DIR: artifacts
         run: |
           python scripts/analyze_and_update.py \
             --artifacts-dir artifacts \
@@ -95,6 +133,5 @@ jobs:
         with:
           name: analyze-report
           path: analyze_report/**
-          if-no-files-found: warn
           retention-days: 14
           compression-level: 6
