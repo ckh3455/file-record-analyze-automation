@@ -1,4 +1,3 @@
-# .github/workflows/analyze-and-update-sheets.yml
 name: analyze-and-update-sheets
 
 on:
@@ -18,12 +17,9 @@ jobs:
       CI: "1"
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Seoul
-
       SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
+      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
-
-      # 외부 레포/워크플로/아티팩트 설정
       SRC_REPO: ckh3455/file-automation
       SRC_WORKFLOW: molit.yml
       SRC_ARTIFACT: molit-xlsx
@@ -44,15 +40,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ 아티팩트 다운로드(정확명 우선, 실패 시 전부), KST 12h 신선도, 15분 간격 재시도
-      - name: Download artifacts with freshness guard (retry every 15 min)
+      # === 아티팩트 다운로드 + 파일명 날짜(YYMMDD) = 오늘(KST) 검사 + (백업) 수정시간 12h 신선도 ===
+      - name: Download artifacts with filename-date freshness guard (retry every 15 min)
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "6"    # 처음 + 5회 재시도
-          RETRY_MIN: "15"   # 15분 간격
+          MAX_TRIES: "6"
+          RETRY_MIN: "15"
         run: |
           set -euo pipefail
+
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
 
           rm -rf artifacts
@@ -88,14 +85,16 @@ jobs:
 
               rm -rf artifacts/*
 
-              # 1) 정확한 이름 우선
-              if grep -Fxq "${SRC_ARTIFACT}" <<<"${ART_NAMES}"; then
+              # 1) 정확 이름 우선 다운로드
+              if [ -n "${ART_NAMES}" ] && grep -Fxq "${SRC_ARTIFACT}" <<<"${ART_NAMES}"; then
                 echo "::group::Download artifact (exact): ${SRC_ARTIFACT}"
-                gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT}" -D artifacts || rc=66
+                if ! gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT}" -D artifacts; then
+                  echo "::warning::Exact artifact download failed."
+                  rc=66
+                fi
                 echo "::endgroup::"
               else
-                echo "::notice::Artifact '${SRC_ARTIFACT}' not found on run ${RUN_ID}. Fallback to download all artifacts."
-                # 2) 모든 아티팩트 다운로드 → .xlsx 검사
+                echo "::notice::'${SRC_ARTIFACT}' not found. Fallback: download all artifacts of the run."
                 if [ -n "${ART_NAMES}" ]; then
                   while IFS= read -r NAME; do
                     [ -z "${NAME}" ] && continue
@@ -105,45 +104,87 @@ jobs:
                   done <<< "${ART_NAMES}"
                 else
                   echo "::warning::This run has zero artifacts."
+                  rc=66
                 fi
               fi
 
               XLSX_COUNT="$(find artifacts -type f -name '*.xlsx' | wc -l | tr -d ' ')"
+              echo "xlsx files downloaded: ${XLSX_COUNT}"
               if [ "${XLSX_COUNT}" -eq 0 ]; then
-                echo "::warning::No .xlsx found after download. Will retry."
                 rc=66
-              else
-                echo "::notice::Downloaded ${XLSX_COUNT} xlsx file(s)."
               fi
             fi
 
-            # 🔍 Bash-only freshness check (<=12h, KST)
+            # ✅ 1순위: 파일명 날짜(YYMMDD) = 오늘(KST) 검사 + 상세 로그
             if [ ${rc} -eq 0 ]; then
-              echo "::group::Freshness check (<=12h, KST, bash-only)"
+              echo "::group::Filename date check (YYMMDD == today KST)"
+              TODAY_YMD="$(date +'%y%m%d')"   # TZ=Asia/Seoul in job env
+              echo "TODAY_YMD(KST)=${TODAY_YMD}"
+              MATCH=0
+              # 상세 비교 로그
+              while IFS= read -r f; do
+                base="$(basename "$f")"
+                # 파일명에서 6자리 숫자 토큰 추출 (여러 개면 모두 비교)
+                ymd_tokens="$(echo "$base" | grep -Eo '[0-9]{6}' || true)"
+                if [ -z "$ymd_tokens" ]; then
+                  echo "NO-DATE  | $base"
+                  continue
+                fi
+                hit="NO"
+                while IFS= read -r tok; do
+                  [ -z "$tok" ] && continue
+                  if [ "$tok" = "$TODAY_YMD" ]; then
+                    hit="YES"
+                    MATCH=$((MATCH+1))
+                  fi
+                done <<< "$ymd_tokens"
+                if [ "$hit" = "YES" ]; then
+                  echo "MATCH    | $base (tokens: $ymd_tokens)"
+                else
+                  echo "MISMATCH | $base (tokens: $ymd_tokens)"
+                fi
+              done < <(find artifacts -type f -name '*.xlsx' | sort)
+
+              if [ "$MATCH" -gt 0 ]; then
+                echo "RESULT: Filename-date MATCH ✓  (matched_files=${MATCH})"
+                rc=0
+              else
+                echo "RESULT: No filename-date match → will use freshness fallback."
+                rc=1
+              fi
+              echo "::endgroup::"
+            fi
+
+            # 🔁 2순위 백업: 수정시간 신선도(<=12h, KST) + 상세 로그
+            if [ ${rc} -ne 0 ]; then
+              echo "::group::Freshness fallback (<=12h, KST)"
               KST_NOW_SEC=$(( $(date -u +%s) + 9*3600 ))
               mapfile -t LINES < <(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n)
-              echo "xlsx files found: ${#LINES[@]}"
-
               if [ "${#LINES[@]}" -eq 0 ]; then
-                echo "No .xlsx after download → treat as stale"
+                echo "No .xlsx → stale"
                 rc=66
               else
+                echo "Last 10 files by mtime (KST):"
+                for line in "${LINES[@]: -10}"; do
+                  ts="${line%% *}"; file="${line#* }"
+                  ts_int="${ts%.*}"
+                  kst_time="$(date -d "@$((ts_int-9*3600))" -u +'%Y-%m-%d %H:%M:%S')"
+                  # 위는 UTC 출력이라 보기가 애매하니 그냥 초로 나이 출력
+                  age_sec=$(( KST_NOW_SEC - ts_int ))
+                  echo "- ${file} | age_sec=${age_sec}"
+                done
                 LAST_LINE="${LINES[-1]}"
                 LAST_TS_FLOAT="${LAST_LINE%% *}"
                 LAST_FILE="${LAST_LINE#* }"
                 LAST_TS_INT="${LAST_TS_FLOAT%.*}"
                 LAST_AGE_SEC=$(( KST_NOW_SEC - LAST_TS_INT ))
-                LAST_AGE_H=$(echo "$LAST_AGE_SEC/3600" | bc -l)
-
-                echo "latest: ${LAST_FILE}"
-                echo "latest age hours: ${LAST_AGE_H}"
-
-                # 12h(43200s) 기준
+                echo "latest file: ${LAST_FILE}"
+                echo "latest age sec: ${LAST_AGE_SEC}"
                 if [ "$LAST_AGE_SEC" -gt 43200 ]; then
-                  echo "RESULT: STALE or NOT TODAY → retry later"
+                  echo "RESULT: STALE (>12h) → retry"
                   rc=66
                 else
-                  echo "RESULT: FRESH ✓"
+                  echo "RESULT: FRESH by age ✓"
                   rc=0
                 fi
               fi
@@ -151,12 +192,12 @@ jobs:
             fi
 
             if [ ${rc} -eq 0 ]; then
-              echo "Fresh artifacts detected."
+              echo "Artifacts ready. Proceed."
               break
             fi
 
             if [ ${try} -ge ${MAX_TRIES} ]; then
-              echo "::error::No fresh artifacts after ${try} tries."
+              echo "::error::Not ready after ${try} tries."
               exit 1
             fi
 
