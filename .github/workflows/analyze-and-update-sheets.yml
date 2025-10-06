@@ -25,8 +25,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) 먼저 예전 이름(정확 일치)으로 시도
-      - name: Download artifacts (exact name first)
+      # 1) 기존 이름으로 먼저 시도
+      - name: Download artifacts (exact)
         id: dl1
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v6
@@ -36,11 +36,11 @@ jobs:
           workflow: molit.yml
           workflow_conclusion: success
           branch: main
-          name: molit-xlsx                  # 기존 이름
+          name: molit-xlsx
           path: artifacts
 
-      # 2) 실패하면 새 이름 패턴(정규식)으로 재시도
-      - name: Download artifacts (fallback regex: outputs-*)
+      # 2) 실패하면 정규식(outputs-*)으로 재시도
+      - name: Download artifacts (fallback regex)
         id: dl2
         if: steps.dl1.outcome == 'failure'
         continue-on-error: true
@@ -51,17 +51,17 @@ jobs:
           workflow: molit.yml
           workflow_conclusion: success
           branch: main
-          name: ^outputs-.*$               # 예: outputs-18265675068
+          name: ^outputs-.*$
           name_is_regexp: true
           path: artifacts
 
-      # 3) 실제로 파일을 받았는지 확인(엑셀 한 개라도 없으면 실패)
+      # 3) 실제 수신 검증: xlsx 없으면 실패로 종료 (원인 파악 쉬움)
       - name: Verify artifacts exist
         run: |
-          echo "== downloaded files =="
+          echo "== downloaded =="
           find artifacts -type f -maxdepth 2 -printf "%p\n" || true
           if ! find artifacts -type f -name "*.xlsx" -print -quit | grep -q .; then
-            echo "::error::No XLSX artifacts found. Check upstream run and artifact name."
+            echo "::error::No XLSX artifacts found. Check upstream artifact name."
             exit 1
           fi
 
