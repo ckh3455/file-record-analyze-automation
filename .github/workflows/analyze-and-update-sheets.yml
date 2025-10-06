@@ -1,7 +1,7 @@
 name: analyze-and-update-sheets
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: "30 23 * * *"  # KST 08:30
 
@@ -40,19 +40,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 최신 성공 run의 artifact 다운로드 + 신선도(<=12h) 검사 + 15분 간격 재시도(최대 6회)
       - name: Download artifacts with freshness guard (retry)
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "6"   # 총 6회(첫 + 5회 재시도)
-          RETRY_MIN: "15"  # 분
+          MAX_TRIES: "6"
+          RETRY_MIN: "15"
         run: |
           set -euo pipefail
 
+          echo "::group::Authenticate gh"
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
+          gh --version
+          echo "::endgroup::"
 
           rm -rf artifacts
-          mkdir -p artifacts .tmp
+          mkdir -p artifacts
 
           try=1
           while :; do
@@ -61,7 +65,7 @@ jobs:
               --workflow "${SRC_WORKFLOW}" \
               --status success \
               --json databaseId,displayTitle,updatedAt \
-              --limit 1)"
+              --limit 1 || true)"
             echo "RUN_JSON=${RUN_JSON}"
             RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
             RUN_UPDATED="$(echo "${RUN_JSON}" | jq -r '.[0].updatedAt // empty')"
@@ -85,45 +89,44 @@ jobs:
               echo "::endgroup::"
             fi
 
+            # 신선도(<=12h)와 상세 로그
             if [ ${rc} -eq 0 ]; then
-              echo "::group::freshness check (<=12h, KST)"
-              cat > .tmp/freshness_check.py <<'PY'
-import pathlib, sys, datetime, re
-root = pathlib.Path("artifacts")
-files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
-kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-today = kst_now.date()
-print(f"KST now: {kst_now}  (today={today})")
-print(f"files: {len(files)}")
-if not files:
-    print("NO XLSX FILES in artifacts directory.")
-    sys.exit(66)
+              echo "::group::Freshness check (<=12h, KST)"
+              file_count=$(find artifacts -type f -name '*.xlsx' | wc -l | tr -d ' ')
+              echo "xlsx files in artifacts: ${file_count}"
+              if [ "${file_count}" = "0" ]; then
+                echo "NO XLSX FILES in artifacts directory."
+                rc=66
+              else
+                # 최신 파일 찾기(수정시간 기준)
+                latest_line="$(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n | tail -1)"
+                latest_path="${latest_line#* }"
+                latest_epoch_utc="$(stat -c %Y "${latest_path}")"
+                now_utc="$(date -u +%s)"
+                kst_now=$(( now_utc + 9*3600 ))
+                age_sec=$(( kst_now - latest_epoch_utc ))
+                # 로그 보기 좋게
+                mod_utc_str="$(date -u -d @"${latest_epoch_utc}" '+%F %T')"
+                mod_kst_str="$(date -u -d "$((latest_epoch_utc+9*3600))" '+%F %T')"
+                printf 'Latest: %s | mtime(UTC)=%s | mtime(KST)=%s | age_hours=%.2f\n' \
+                  "${latest_path}" "${mod_utc_str}" "${mod_kst_str}" "$(awk "BEGIN{print ${age_sec}/3600}")"
 
-def kst(ts):
-    return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
+                # 파일명에서 날짜 힌트 로그(있으면)
+                base="$(basename "${latest_path}")"
+                if echo "${base}" | grep -Eq '20[0-9]{2}[-_/ ]?[0-9]{1,2}[-_/ ]?[0-9]{1,2}'; then
+                  y=$(echo "${base}" | sed -nE 's/.*(20[0-9]{2})[-_/ ]?([0-9]{1,2})[-_/ ]?([0-9]{1,2}).*/\1/p')
+                  M=$(echo "${base}" | sed -nE 's/.*(20[0-9]{2})[-_/ ]?([0-9]{1,2})[-_/ ]?([0-9]{1,2}).*/\2/p')
+                  d=$(echo "${base}" | sed -nE 's/.*(20[0-9]{2})[-_/ ]?([0-9]{1,2})[-_/ ]?([0-9]{1,2}).*/\3/p')
+                  echo "filename date hint: ${y}-${M}-${d}"
+                fi
 
-for p in files[-15:]:
-    mod = kst(p.stat().st_mtime)
-    age = (kst_now - mod).total_seconds()/3600
-    print(f"- {p} | modified(KST)={mod} | age_h={age:.2f}")
-
-latest = files[-1]
-mod = kst(latest.stat().st_mtime)
-age = (kst_now - mod).total_seconds()/3600
-print(f"latest: {latest} | modified(KST)={mod} | age_h={age:.2f}")
-
-m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', latest.name)
-if m:
-    y, M, d = map(int, m[-1])
-    hint = datetime.date(y, M, d)
-    print(f"filename date hint: {hint} (diff_days={(today-hint).days})")
-
-if age > 12:
-    print("RESULT: STALE or NOT TODAY → retry later")
-    sys.exit(66)
-print("RESULT: FRESH ✓")
-PY
-              python .tmp/freshness_check.py || rc=$?
+                if [ "${age_sec}" -gt $((12*3600)) ]; then
+                  echo "RESULT: STALE or NOT TODAY → retry later"
+                  rc=66
+                else
+                  echo "RESULT: FRESH ✓"
+                fi
+              fi
               echo "::endgroup::"
             fi
 
