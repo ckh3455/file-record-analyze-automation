@@ -20,9 +20,10 @@ jobs:
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+
+      # 업스트림 정보
       SRC_REPO: ckh3455/file-automation
       SRC_WORKFLOW: molit.yml
-      SRC_ARTIFACT: molit-xlsx
 
     steps:
       - name: Checkout
@@ -40,8 +41,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 외부 레포 최신 성공 run에서 artifact 다운로드 (안정된 공식 액션)
-      - name: Download artifact (latest success from ${{ env.SRC_REPO }})
+      # === 최신 성공 run의 모든 아티팩트 다운로드 ===
+      - name: Download ALL artifacts (latest success)
         uses: dawidd6/action-download-artifact@v6
         with:
           github_token: ${{ secrets.SOURCE_REPO_PAT }}
@@ -49,105 +50,64 @@ jobs:
           workflow: ${{ env.SRC_WORKFLOW }}
           workflow_conclusion: success
           branch: main
-          name: ${{ env.SRC_ARTIFACT }}
+          # name 은 지정하지 않습니다(전부 받기)
           path: artifacts
 
-      # 신선도 검사(<=12h 또는 파일명 날짜가 오늘) - Bash만 사용
-      - name: Freshness check (<=12h or filename date == today KST)
-        id: fresh
+      - name: Show downloaded tree (debug)
+        run: |
+          echo "== downloaded artifacts tree =="
+          find artifacts -maxdepth 3 -type f -print || true
+
+      # === 파일명에서 오늘(KST)의 YYMMDD만 선별 ===
+      - name: Select only today's KST XLSX (전국/서울시 *_YYMMDD*.xlsx)
+        id: select
         shell: bash
         run: |
           set -euo pipefail
-          echo "is_fresh=false" >> "$GITHUB_OUTPUT"
 
-          echo "=== Freshness check start ==="
-          if ! find artifacts -type f -name "*.xlsx" | grep -q . ; then
-            echo "No .xlsx files under artifacts/"
-            exit 0
-          fi
+          # 오늘 KST → YYMMDD
+          KST_YMD=$(date -u -d "+9 hours" +'%y%m%d')
+          echo "KST today (YYMMDD): ${KST_YMD}"
 
-          # 최신 파일(mtime) 가져오기
-          latest_line="$(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n | tail -1)"
-          if [ -z "${latest_line}" ]; then
-            echo "No XLSX files found after listing."
-            exit 0
-          fi
+          mkdir -p artifacts_selected
+          found=0
 
-          latest_ts="$(echo "${latest_line}" | awk '{print $1}')"
-          latest_path="$(echo "${latest_line}" | cut -d' ' -f2-)"
-          latest_file="$(basename -- "${latest_path}")"
-          now_ts="$(date +%s)"
-          latest_ts_int="$(printf '%.0f\n' "${latest_ts}")"
-          age_sec="$(( now_ts - latest_ts_int ))"
-          age_h="$(awk -v s="${age_sec}" 'BEGIN{printf "%.2f", s/3600.0}')"
-
-          echo "Latest file: ${latest_file}"
-          echo "Age hours: ${age_h}"
-
-          # mtime 기준 신선도 (<= 12h)
-          is_fresh_by_mtime="false"
-          if [ "${age_sec}" -le $((12*3600)) ]; then
-            is_fresh_by_mtime="true"
-          fi
-
-          # 파일명에서 날짜 힌트 추출 (YYYYMMDD or YYYY-MM-DD or YYMMDD)
-          today_kst="$(TZ=Asia/Seoul date +%Y%m%d)"
-
-          # 1) YYYYMMDD 또는 YYYY-MM-DD
-          name_digits="$(echo "${latest_file}" | grep -Eo '20[0-9]{2}[-_/]?[01]?[0-9][-_/]?[0-3]?[0-9]' || true)"
-          is_fresh_by_name="false"
-          if [ -n "${name_digits}" ]; then
-            # 숫자만 추출
-            y="$(echo "${name_digits}" | sed -E 's/[^0-9]//g' | tail -1)"
-            if [ ${#y} -eq 8 ]; then
-              ymd="${y}"
-              # 비교
-              if [ "${ymd}" = "${today_kst}" ]; then
-                is_fresh_by_name="true"
-              fi
+          # 패턴: '전국 *.xlsx' 또는 '서울시 *.xlsx' 이면서 파일명에 _YYMMDD 포함
+          while IFS= read -r -d '' f; do
+            bn="$(basename "$f")"
+            if [[ "$bn" =~ ^(전국|서울시)[[:space:]].*_${KST_YMD}.*\.xlsx$ ]]; then
+              cp -f "$f" artifacts_selected/
+              echo "SELECTED: $bn"
+              found=1
             fi
+          done < <(find artifacts -type f -name '*.xlsx' -print0)
+
+          if [[ $found -eq 0 ]]; then
+            echo "::error::No XLSX matching today's (${KST_YMD}) pattern found."
+            echo "---- candidate list with date hints ----"
+            # 파일명에서 YYMMDD 감지해 보기 좋은 로그 제공
+            python - <<'PY'
+import pathlib, re
+root = pathlib.Path("artifacts")
+files = sorted(root.rglob("*.xlsx"))
+pat = re.compile(r"(\d{6})")
+for p in files:
+    m = pat.findall(p.name)
+    print(f"- {p.name} | hints={m}")
+PY
+            exit 66
           fi
 
-          # 2) YYMMDD 패턴 보조 (예: 251006)
-          if [ "${is_fresh_by_name}" != "true" ]; then
-            ymd2="$(echo "${latest_file}" | grep -Eo '(^|[^0-9])[0-9]{6}([^0-9]|$)' | grep -Eo '[0-9]{6}' | tail -1 || true)"
-            if [ -n "${ymd2}" ]; then
-              yy="${ymd2:0:2}"; mm="${ymd2:2:2}"; dd="${ymd2:4:2}"
-              # 2000년대 가정
-              y_full=$((2000 + 10#${yy}))
-              ymd="${y_full}$(printf '%02d%02d' "${mm}" "${dd}")"
-              if [ "${ymd}" = "${today_kst}" ]; then
-                is_fresh_by_name="true"
-              fi
-            fi
-          fi
-
-          echo "fresh_by_mtime=${is_fresh_by_mtime}, fresh_by_name=${is_fresh_by_name}"
-
-          if [ "${is_fresh_by_mtime}" = "true" ] || [ "${is_fresh_by_name}" = "true" ]; then
-            echo "is_fresh=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Artifacts are stale → skip analysis this run."
-          fi
-
-      - name: List downloaded files
-        run: |
-          echo "=== downloaded files ==="
-          find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
+          echo "selected_dir=artifacts_selected" >> "$GITHUB_OUTPUT"
 
       - name: Run analysis & update
-        if: ${{ steps.fresh.outputs.is_fresh == 'true' }}
         env:
-          ARTIFACTS_DIR: artifacts
+          ARTIFACTS_DIR: ${{ steps.select.outputs.selected_dir }}
+          SHEET_ID: ${{ env.SHEET_ID }}
         run: |
           python scripts/analyze_and_update.py \
-            --artifacts-dir artifacts \
+            --artifacts-dir "${ARTIFACTS_DIR}" \
             --sheet-id "$SHEET_ID"
-
-      - name: Skip note (stale artifacts)
-        if: ${{ steps.fresh.outputs.is_fresh != 'true' }}
-        run: |
-          echo "::notice::Artifacts are not fresh (older than 12h or not today's date). Skipping this run."
 
       - name: Preview analyze_report (always)
         if: always()
