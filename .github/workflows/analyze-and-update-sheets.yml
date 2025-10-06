@@ -40,79 +40,61 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download artifacts with freshness guard (retry)
-        id: fetch
+      # 👉 외부 레포 최신 성공 런에서 artifact 다운로드 (액션 사용: 단순/안정)
+      - name: Download artifact (latest success from ${{ env.SRC_REPO }})
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          repo: ${{ env.SRC_REPO }}
+          workflow: ${{ env.SRC_WORKFLOW }}
+          workflow_conclusion: success
+          branch: main
+          name: ${{ env.SRC_ARTIFACT }}
+          path: artifacts
+
+      # 👉 신선도 검사(<=12h 또는 파일명 날짜가 오늘): 출력 is_fresh=true/false
+      - name: Freshness check (<=12h or filename date == today KST)
+        id: fresh
         shell: bash
-        # 이 스텝이 fresh 여부를 출력으로 남김
         run: |
           set -euo pipefail
-          echo "fresh=false" >> "$GITHUB_OUTPUT"
 
-          echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
+          echo "=== Freshness check start ==="
+          if ! find artifacts -type f -name "*.xlsx" | grep -q . ; then
+            echo "No .xlsx files under artifacts/"
+            echo "is_fresh=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          rm -rf artifacts
-          mkdir -p artifacts
-
-          MAX_TRIES=6
-          RETRY_MIN=15
-          try=1
-          while :; do
-            echo "::group::[try ${try}] locate latest SUCCESS run"
-            RUN_JSON="$(gh run list -R "${SRC_REPO}" \
-              --workflow "${SRC_WORKFLOW}" \
-              --status success \
-              --json databaseId,displayTitle,updatedAt \
-              --limit 1 || true)"
-            echo "RUN_JSON=${RUN_JSON}"
-            RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
-            echo "RUN_ID=${RUN_ID}"
-            echo "::endgroup::"
-
-            rc=0
-            if [ -z "${RUN_ID}" ]; then
-              echo "::warning::no successful run found yet."
-              rc=66
-            else
-              echo "::group::download artifact ${SRC_ARTIFACT} (run ${RUN_ID})"
-              rm -rf artifacts/*
-              if ! gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT}" -D artifacts; then
-                echo "::warning::artifact download failed."
-                rc=66
-              fi
-              echo "::endgroup::"
-            fi
-
-            if [ ${rc} -eq 0 ]; then
-              echo "::group::freshness check (<=12h, KST + filename date hint)"
-              python - <<'PY'
-import pathlib, sys, datetime, re
+          python - <<'PY'
+import pathlib, datetime, re, sys, os
 root = pathlib.Path("artifacts")
 files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
 kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 today = kst_now.date()
-print(f"KST now: {kst_now} (today={today})")
-print(f"files: {len(files)}")
-if not files:
-    sys.exit(66)
 
 def kst(ts): return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
-latest = files[-1]
-mod_kst = kst(latest.stat().st_mtime)
-age_h = (kst_now - mod_kst).total_seconds()/3600
-print(f"latest: {latest.name} | mtime(KST)={mod_kst} | age_h={age_h:.2f}")
 
+print(f"KST now: {kst_now} (today={today})")
+print("Files (last 10 by mtime):")
+for p in files[-10:]:
+    print(" -", p.name, "| mtime(KST)=", kst(p.stat().st_mtime))
+
+latest = files[-1]
+age_h = (kst_now - kst(latest.stat().st_mtime)).total_seconds()/3600
 fresh_by_mtime = age_h <= 12.0
 
 def hint_is_today(name: str) -> bool:
-    s = name
-    m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', s)
+    # YYYYMMDD
+    m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', name)
     if m:
         y, M, d = map(int, m[-1])
         try:
             return datetime.date(y, M, d) == today
         except ValueError:
             pass
-    m2 = re.findall(r'(^|[^0-9])(\d{6})([^0-9]|$)', s)  # YYMMDD
+    # YYMMDD (예: 251006)
+    m2 = re.findall(r'(^|[^0-9])(\d{6})([^0-9]|$)', name)
     if m2:
         yymmdd = m2[-1][1]
         yy = int(yymmdd[0:2]); mm = int(yymmdd[2:4]); dd = int(yymmdd[4:6])
@@ -125,45 +107,34 @@ def hint_is_today(name: str) -> bool:
 
 fresh_by_name = any(hint_is_today(p.name) for p in files)
 
-if fresh_by_mtime or fresh_by_name:
-    print("RESULT: FRESH ✓")
-    sys.exit(0)
+print(f"latest={latest.name}, age_h={age_h:.2f}, fresh_by_mtime={fresh_by_mtime}, fresh_by_name={fresh_by_name}")
+status = "true" if (fresh_by_mtime or fresh_by_name) else "false"
+print("is_fresh:", status)
 
-print("RESULT: STALE → retry later")
-sys.exit(66)
+# GITHUB_OUTPUT에 기록
+out = os.environ.get("GITHUB_OUTPUT")
+with open(out, "a", encoding="utf-8") as f:
+    f.write(f"is_fresh={status}\n")
 PY
-              rc=$?
-              echo "::endgroup::"
-            fi
-
-            if [ ${rc} -eq 0 ]; then
-              echo "fresh artifacts detected."
-              echo "fresh=true" >> "$GITHUB_OUTPUT"
-              break
-            fi
-
-            if [ ${try} -ge ${MAX_TRIES} ]; then
-              echo "::error::no fresh artifacts after ${try} tries."
-              exit 1
-            fi
-
-            echo "::notice::stale or not ready. retry in ${RETRY_MIN} minutes (next try: $((try+1))/${MAX_TRIES})."
-            sleep "$((RETRY_MIN*60))"
-            try=$((try+1))
-          done
 
       - name: List downloaded files
         run: |
+          echo "=== downloaded files ==="
           find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
 
       - name: Run analysis & update
-        if: ${{ steps.fetch.outputs.fresh == 'true' }}
+        if: ${{ steps.fresh.outputs.is_fresh == 'true' }}
         env:
           ARTIFACTS_DIR: artifacts
         run: |
           python scripts/analyze_and_update.py \
             --artifacts-dir artifacts \
             --sheet-id "$SHEET_ID"
+
+      - name: Skip note (stale artifacts)
+        if: ${{ steps.fresh.outputs.is_fresh != 'true' }}
+        run: |
+          echo "::notice::Artifacts are not fresh (older than 12h or not today's date). Skipping this run."
 
       - name: Preview analyze_report (always)
         if: always()
