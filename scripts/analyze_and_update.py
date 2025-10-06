@@ -146,6 +146,50 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
         log(f"[ws] created: {title}")
     return ws
 
+# === 포커스 링크/이름범위 유틸 ===
+from urllib.parse import quote
+
+def log_focus_link(ws: gspread.Worksheet, row_idx: int, last_col_index: int, sheet_id: str):
+    """
+    방금 기록한 행으로 바로 점프하는 링크를 where_written.txt에 남긴다.
+    """
+    try:
+        a1_last = a1_col(last_col_index if last_col_index >= 1 else 1)
+        range_a1 = f"{ws.title}!A{row_idx}:{a1_last}{row_idx}"
+        link = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}&range={quote(range_a1)}"
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with (LOG_DIR / "where_written.txt").open("a", encoding="utf-8") as f:
+            f.write(f"[{ws.title}] wrote row {row_idx} → {range_a1}\n")
+            f.write(f"Open here: {link}\n")
+    except Exception:
+        pass
+
+def upsert_named_range(ws: gspread.Worksheet, name: str, row_idx: int, last_col_index: int):
+    """
+    선택 사항: 같은 이름으로 최신 행에 이름범위를 갱신해 둔다.
+    URL에 range=LATEST_<sheetId> 같이 넣어도 바로 점프 가능.
+    """
+    try:
+        grid_range = {
+            "sheetId": ws.id,
+            "startRowIndex": row_idx - 1,
+            "endRowIndex": row_idx,
+            "startColumnIndex": 0,
+            "endColumnIndex": max(1, last_col_index),
+        }
+        # 기존 동일 이름 삭제
+        meta = _retry(ws.spreadsheet.fetch_sheet_metadata)
+        existing = [nr for nr in meta.get("namedRanges", []) if nr.get("name") == name]
+        reqs = []
+        for nr in existing:
+            reqs.append({"deleteNamedRange": {"namedRangeId": nr["namedRangeId"]}})
+        # 새 이름범위 추가
+        reqs.append({"addNamedRange": {"namedRange": {"name": name, "range": grid_range}}})
+        batch_format(ws, reqs)
+    except Exception:
+        pass
+
 # ===================== 파일/읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="data", dtype=str)
@@ -528,6 +572,11 @@ def write_month_sheet(ws, date_label: str, header: List[str], values_by_colname:
     if payload:
         values_batch_update(ws, payload)
         log(f"[ws] {ws.title} -> {date_label} row={row_idx} (wrote {len(payload)} cells incl. date)")
+        # 포커스 링크/이름범위 기록
+        header_len = len(header or [])
+        sheet_id_env = os.environ.get("SHEET_ID", "").strip()
+        log_focus_link(ws, row_idx, header_len, sheet_id_env)
+        upsert_named_range(ws, f"LATEST_{ws.id}", row_idx, header_len)
 
 def ym_from_filename(fname: str):
     m = re.search(r"(\d{2})(\d{2})_", fname)
@@ -632,6 +681,12 @@ def write_month_summary(ws, y: int, m: int, counts: dict, med: dict, mean: dict,
     color_diff_line(ws, r4, diffs, header)
     log(f"[summary] {ym} 전월대비 -> row={r4}")
 
+    # 포커스 링크/이름범위 기록 (전월대비 라인 기준)
+    header_now = _retry(ws.row_values, 1)
+    sheet_id_env = os.environ.get("SHEET_ID", "").strip()
+    log_focus_link(ws, r4, len(header_now or []), sheet_id_env)
+    upsert_named_range(ws, f"LATEST_{ws.id}", r4, len(header_now or []))
+
 def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     # '서울' 키는 절대 기록하지 않고, '서울특별시'로 통일
     if pred_map and "서울" in pred_map:
@@ -658,6 +713,12 @@ def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     batch_format(ws_sum, reqs)
     filled = sum(1 for v in (pred_map or {}).values() if (isinstance(v, int) and v > 0))
     log(f"[summary] {ym} 예상건수 -> row={r} (green bold) filled={filled}")
+
+    # 포커스 링크/이름범위 기록
+    header_sum = _retry(ws_sum.row_values, 1)
+    sheet_id_env = os.environ.get("SHEET_ID", "").strip()
+    log_focus_link(ws_sum, r, len(header_sum or []), sheet_id_env)
+    upsert_named_range(ws_sum, f"LATEST_{ws_sum.id}", r, len(header_sum or []))
 
 # ===================== 압구정동 원본/변동 기록 (동일) =====================
 APGU_BASE_COLS = [
