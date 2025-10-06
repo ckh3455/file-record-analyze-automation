@@ -3,7 +3,8 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 23 * * *"  # KST 08:30
+    # KST 08:30 (UTC 23:30)
+    - cron: "30 23 * * *"
 
 permissions:
   contents: read
@@ -12,25 +13,57 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 30
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
-      TZ: Asia/Seoul
       SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+      SA_JSON:  ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
-      SRC_REPO: ckh3455/file-automation
-      SRC_WORKFLOW: molit.yml
-      # molit 쪽에서 업로드하는 아티팩트 이름이 다를 수 있어 두 후보 모두 시도
-      SRC_ARTIFACT_PRIMARY: molit-xlsx
-      SRC_ARTIFACT_FALLBACK: outputs-*
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 1) 먼저 예전 이름(정확 일치)으로 시도
+      - name: Download artifacts (exact name first)
+        id: dl1
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
         with:
-          fetch-depth: 0
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          repo: ckh3455/file-automation
+          workflow: molit.yml
+          workflow_conclusion: success
+          branch: main
+          name: molit-xlsx                  # 기존 이름
+          path: artifacts
+
+      # 2) 실패하면 새 이름 패턴(정규식)으로 재시도
+      - name: Download artifacts (fallback regex: outputs-*)
+        id: dl2
+        if: steps.dl1.outcome == 'failure'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SOURCE_REPO_PAT }}
+          repo: ckh3455/file-automation
+          workflow: molit.yml
+          workflow_conclusion: success
+          branch: main
+          name: ^outputs-.*$               # 예: outputs-18265675068
+          name_is_regexp: true
+          path: artifacts
+
+      # 3) 실제로 파일을 받았는지 확인(엑셀 한 개라도 없으면 실패)
+      - name: Verify artifacts exist
+        run: |
+          echo "== downloaded files =="
+          find artifacts -type f -maxdepth 2 -printf "%p\n" || true
+          if ! find artifacts -type f -name "*.xlsx" -print -quit | grep -q .; then
+            echo "::error::No XLSX artifacts found. Check upstream run and artifact name."
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,133 +75,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download artifacts with freshness guard (retry)
-        id: fetch
-        shell: bash
-        env:
-          MAX_TRIES: "6"     # 총 6회(초기 + 5회 재시도)
-          RETRY_MIN: "15"    # 재시도 간격(분)
-        run: |
-          set -euo pipefail
-
-          echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
-
-          rm -rf artifacts
-          mkdir -p artifacts
-
-          try=1
-          while :; do
-            echo "::group::[try ${try}] locate latest SUCCESS run"
-            RUN_JSON="$(gh run list -R "${SRC_REPO}" \
-              --workflow "${SRC_WORKFLOW}" \
-              --status success \
-              --json databaseId,displayTitle,updatedAt \
-              --limit 1)"
-            echo "RUN_JSON=${RUN_JSON}"
-            RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
-            RUN_UPDATED="$(echo "${RUN_JSON}" | jq -r '.[0].updatedAt // empty')"
-            RUN_TITLE="$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle // empty')"
-            echo "RUN_ID=${RUN_ID}"
-            echo "RUN_UPDATED(UTC)=${RUN_UPDATED}"
-            echo "RUN_TITLE=${RUN_TITLE}"
-            echo "::endgroup::"
-
-            rc=0
-            if [ -z "${RUN_ID}" ]; then
-              echo "::warning::No successful run found yet."
-              rc=66
-            else
-              echo "::group::Download artifact (primary name: ${SRC_ARTIFACT_PRIMARY})"
-              rm -rf artifacts/*
-              if gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT_PRIMARY}" -D artifacts; then
-                echo "Primary artifact downloaded."
-              else
-                echo "::warning::Primary artifact '${SRC_ARTIFACT_PRIMARY}' not found. Trying fallback pattern '${SRC_ARTIFACT_FALLBACK}'."
-                if gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT_FALLBACK}" -D artifacts; then
-                  echo "Fallback artifact downloaded."
-                else
-                  echo "::warning::Failed to download any artifact."
-                  rc=66
-                fi
-              fi
-              echo "::endgroup::"
-            fi
-
-            # Freshness check (<=12h)
-            if [ ${rc} -eq 0 ]; then
-              echo "::group::Freshness check (<=12h, KST)"
-              python - <<'PY'
-from pathlib import Path
-import sys
-import datetime as dt
-import re
-
-root = Path("artifacts")
-files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
-kst_now = dt.datetime.utcnow() + dt.timedelta(hours=9)
-today = kst_now.date()
-
-print(f"KST now: {kst_now}  (today={today})")
-print(f"XLSX count: {len(files)}")
-if not files:
-    print("NO XLSX FILES in artifacts")
-    sys.exit(66)
-
-def kst(ts):
-    return dt.datetime.utcfromtimestamp(ts) + dt.timedelta(hours=9)
-
-for p in files[-10:]:
-    mod = kst(p.stat().st_mtime)
-    age = (kst_now - mod).total_seconds()/3600
-    print(f"- {p.name} | modified(KST)={mod} | age_h={age:.2f}")
-
-latest = files[-1]
-latest_mod = kst(latest.stat().st_mtime)
-age_h = (kst_now - latest_mod).total_seconds()/3600
-print(f"latest: {latest.name} | modified(KST)={latest_mod} | age_h={age_h:.2f}")
-
-m = re.findall(r'(20\d{2})[-_ ]?(\d{1,2})[-_ ]?(\d{1,2})', latest.name)
-if m:
-    y, M, d = map(int, m[-1])
-    hint = dt.date(y, M, d)
-    print(f"filename date hint: {hint} (diff_days={(today-hint).days})")
-
-if age_h > 12:
-    print("RESULT: STALE or NOT TODAY → retry later")
-    sys.exit(66)
-
-print("RESULT: FRESH ✓")
-PY
-              rc=$?
-              echo "::endgroup::"
-            fi
-
-            if [ ${rc} -eq 0 ]; then
-              echo "Fresh artifacts detected. Proceeding."
-              break
-            fi
-
-            if [ ${try} -ge ${MAX_TRIES} ]; then
-              echo "::error::No fresh artifacts after ${try} tries. Giving up."
-              exit 1
-            fi
-
-            echo "::notice::Artifacts are not fresh/ready. Retry in ${RETRY_MIN} minutes (next try: $((try+1))/${MAX_TRIES})."
-            sleep "$((RETRY_MIN*60))"
-            try=$((try+1))
-          done
-
-          echo "OK" > .fresh_ok
-
-      - name: List downloaded files
-        run: |
-          echo "=== downloaded ==="
-          find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
-
       - name: Run analysis & update
-        if: ${{ hashFiles('.fresh_ok') != '' }}
-        env:
-          ARTIFACTS_DIR: artifacts
         run: |
           python scripts/analyze_and_update.py \
             --artifacts-dir artifacts \
@@ -188,5 +95,6 @@ PY
         with:
           name: analyze-report
           path: analyze_report/**
+          if-no-files-found: warn
           retention-days: 14
           compression-level: 6
