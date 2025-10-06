@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 👉 외부 레포 최신 성공 런에서 artifact 다운로드 (액션 사용: 단순/안정)
+      # 외부 레포 최신 성공 run에서 artifact 다운로드 (안정된 공식 액션)
       - name: Download artifact (latest success from ${{ env.SRC_REPO }})
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -52,70 +52,83 @@ jobs:
           name: ${{ env.SRC_ARTIFACT }}
           path: artifacts
 
-      # 👉 신선도 검사(<=12h 또는 파일명 날짜가 오늘): 출력 is_fresh=true/false
+      # 신선도 검사(<=12h 또는 파일명 날짜가 오늘) - Bash만 사용
       - name: Freshness check (<=12h or filename date == today KST)
         id: fresh
         shell: bash
         run: |
           set -euo pipefail
+          echo "is_fresh=false" >> "$GITHUB_OUTPUT"
 
           echo "=== Freshness check start ==="
           if ! find artifacts -type f -name "*.xlsx" | grep -q . ; then
             echo "No .xlsx files under artifacts/"
-            echo "is_fresh=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          python - <<'PY'
-import pathlib, datetime, re, sys, os
-root = pathlib.Path("artifacts")
-files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
-kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-today = kst_now.date()
+          # 최신 파일(mtime) 가져오기
+          latest_line="$(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n | tail -1)"
+          if [ -z "${latest_line}" ]; then
+            echo "No XLSX files found after listing."
+            exit 0
+          fi
 
-def kst(ts): return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
+          latest_ts="$(echo "${latest_line}" | awk '{print $1}')"
+          latest_path="$(echo "${latest_line}" | cut -d' ' -f2-)"
+          latest_file="$(basename -- "${latest_path}")"
+          now_ts="$(date +%s)"
+          latest_ts_int="$(printf '%.0f\n' "${latest_ts}")"
+          age_sec="$(( now_ts - latest_ts_int ))"
+          age_h="$(awk -v s="${age_sec}" 'BEGIN{printf "%.2f", s/3600.0}')"
 
-print(f"KST now: {kst_now} (today={today})")
-print("Files (last 10 by mtime):")
-for p in files[-10:]:
-    print(" -", p.name, "| mtime(KST)=", kst(p.stat().st_mtime))
+          echo "Latest file: ${latest_file}"
+          echo "Age hours: ${age_h}"
 
-latest = files[-1]
-age_h = (kst_now - kst(latest.stat().st_mtime)).total_seconds()/3600
-fresh_by_mtime = age_h <= 12.0
+          # mtime 기준 신선도 (<= 12h)
+          is_fresh_by_mtime="false"
+          if [ "${age_sec}" -le $((12*3600)) ]; then
+            is_fresh_by_mtime="true"
+          fi
 
-def hint_is_today(name: str) -> bool:
-    # YYYYMMDD
-    m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', name)
-    if m:
-        y, M, d = map(int, m[-1])
-        try:
-            return datetime.date(y, M, d) == today
-        except ValueError:
-            pass
-    # YYMMDD (예: 251006)
-    m2 = re.findall(r'(^|[^0-9])(\d{6})([^0-9]|$)', name)
-    if m2:
-        yymmdd = m2[-1][1]
-        yy = int(yymmdd[0:2]); mm = int(yymmdd[2:4]); dd = int(yymmdd[4:6])
-        y_full = 2000 + yy
-        try:
-            return datetime.date(y_full, mm, dd) == today
-        except ValueError:
-            pass
-    return False
+          # 파일명에서 날짜 힌트 추출 (YYYYMMDD or YYYY-MM-DD or YYMMDD)
+          today_kst="$(TZ=Asia/Seoul date +%Y%m%d)"
 
-fresh_by_name = any(hint_is_today(p.name) for p in files)
+          # 1) YYYYMMDD 또는 YYYY-MM-DD
+          name_digits="$(echo "${latest_file}" | grep -Eo '20[0-9]{2}[-_/]?[01]?[0-9][-_/]?[0-3]?[0-9]' || true)"
+          is_fresh_by_name="false"
+          if [ -n "${name_digits}" ]; then
+            # 숫자만 추출
+            y="$(echo "${name_digits}" | sed -E 's/[^0-9]//g' | tail -1)"
+            if [ ${#y} -eq 8 ]; then
+              ymd="${y}"
+              # 비교
+              if [ "${ymd}" = "${today_kst}" ]; then
+                is_fresh_by_name="true"
+              fi
+            fi
+          fi
 
-print(f"latest={latest.name}, age_h={age_h:.2f}, fresh_by_mtime={fresh_by_mtime}, fresh_by_name={fresh_by_name}")
-status = "true" if (fresh_by_mtime or fresh_by_name) else "false"
-print("is_fresh:", status)
+          # 2) YYMMDD 패턴 보조 (예: 251006)
+          if [ "${is_fresh_by_name}" != "true" ]; then
+            ymd2="$(echo "${latest_file}" | grep -Eo '(^|[^0-9])[0-9]{6}([^0-9]|$)' | grep -Eo '[0-9]{6}' | tail -1 || true)"
+            if [ -n "${ymd2}" ]; then
+              yy="${ymd2:0:2}"; mm="${ymd2:2:2}"; dd="${ymd2:4:2}"
+              # 2000년대 가정
+              y_full=$((2000 + 10#${yy}))
+              ymd="${y_full}$(printf '%02d%02d' "${mm}" "${dd}")"
+              if [ "${ymd}" = "${today_kst}" ]; then
+                is_fresh_by_name="true"
+              fi
+            fi
+          fi
 
-# GITHUB_OUTPUT에 기록
-out = os.environ.get("GITHUB_OUTPUT")
-with open(out, "a", encoding="utf-8") as f:
-    f.write(f"is_fresh={status}\n")
-PY
+          echo "fresh_by_mtime=${is_fresh_by_mtime}, fresh_by_name=${is_fresh_by_name}"
+
+          if [ "${is_fresh_by_mtime}" = "true" ] || [ "${is_fresh_by_name}" = "true" ]; then
+            echo "is_fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Artifacts are stale → skip analysis this run."
+          fi
 
       - name: List downloaded files
         run: |
