@@ -3,7 +3,7 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 23 * * *"  # KST 08:30
+    - cron: "30 23 * * *" # KST 08:30
 
 permissions:
   contents: read
@@ -16,13 +16,13 @@ jobs:
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
-      TZ: Asia/Seoul
+      TZ: "Asia/Seoul"
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
       SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
-      SRC_REPO: ckh3455/file-automation
-      SRC_WORKFLOW: molit.yml
-      SRC_ARTIFACT: molit-xlsx
+      SRC_REPO: "ckh3455/file-automation"
+      SRC_WORKFLOW: "molit.yml"
+      SRC_ARTIFACT: "molit-xlsx"
 
     steps:
       - name: Checkout
@@ -40,14 +40,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install jq (needed for JSON parsing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: Download artifacts with freshness guard (retry)
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "6"
-          RETRY_MIN: "15"
+          MAX_TRIES: "6"   # total tries (first + 5 retries)
+          RETRY_MIN: "15"  # minutes between retries
         run: |
           set -euo pipefail
+
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
 
           rm -rf artifacts
@@ -86,18 +92,23 @@ jobs:
 
             if [ ${rc} -eq 0 ]; then
               echo "::group::freshness check (<=12h, KST)"
-              python - <<'PY'
+              python <<'PY'
 import pathlib, sys, datetime, re
+
 root = pathlib.Path("artifacts")
 files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
+
 kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 today = kst_now.date()
 print(f"KST now: {kst_now}  (today={today})")
 print(f"files: {len(files)}")
+
 if not files:
+    print("NO XLSX FILES in artifacts directory.")
     sys.exit(66)
 
-def kst(ts): return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
+def kst(ts): 
+    return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
 
 for p in files[-15:]:
     mod = kst(p.stat().st_mtime)
@@ -109,7 +120,7 @@ mod = kst(latest.stat().st_mtime)
 age = (kst_now - mod).total_seconds()/3600
 print(f"latest: {latest} | modified(KST)={mod} | age_h={age:.2f}")
 
-m = re.findall(r'(20\\d{2})[-_/ ]?(\\d{1,2})[-_/ ]?(\\d{1,2})', latest.name)
+m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', latest.name)
 if m:
     y, M, d = map(int, m[-1])
     hint = datetime.date(y, M, d)
@@ -118,6 +129,7 @@ if m:
 if age > 12:
     print("RESULT: STALE or NOT TODAY → retry later")
     sys.exit(66)
+
 print("RESULT: FRESH ✓")
 PY
               rc=$?
