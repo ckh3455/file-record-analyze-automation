@@ -1,4 +1,3 @@
-# .github/workflows/analyze-and-update-sheets.yml
 name: analyze-and-update-sheets
 
 on:
@@ -41,21 +40,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 최신 성공 run의 artifact 다운로드 + 신선도 검사(<=12h 또는 '오늘자' 파일명) + 재시도 안내
       - name: Download artifacts with freshness guard (retry)
         id: fetch
         shell: bash
-        env:
-          MAX_TRIES: "6"      # 총 6회(첫 시도 + 5회 재시도)
-          RETRY_MIN: "15"     # 재시도 간격(분)
+        # 이 스텝이 fresh 여부를 출력으로 남김
         run: |
           set -euo pipefail
+          echo "fresh=false" >> "$GITHUB_OUTPUT"
 
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
 
           rm -rf artifacts
           mkdir -p artifacts
 
+          MAX_TRIES=6
+          RETRY_MIN=15
           try=1
           while :; do
             echo "::group::[try ${try}] locate latest SUCCESS run"
@@ -63,14 +62,10 @@ jobs:
               --workflow "${SRC_WORKFLOW}" \
               --status success \
               --json databaseId,displayTitle,updatedAt \
-              --limit 1)"
+              --limit 1 || true)"
             echo "RUN_JSON=${RUN_JSON}"
             RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
-            RUN_UPDATED="$(echo "${RUN_JSON}" | jq -r '.[0].updatedAt // empty')"
-            RUN_TITLE="$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle // empty')"
             echo "RUN_ID=${RUN_ID}"
-            echo "RUN_UPDATED(UTC)=${RUN_UPDATED}"
-            echo "RUN_TITLE=${RUN_TITLE}"
             echo "::endgroup::"
 
             rc=0
@@ -91,7 +86,6 @@ jobs:
               echo "::group::freshness check (<=12h, KST + filename date hint)"
               python - <<'PY'
 import pathlib, sys, datetime, re
-
 root = pathlib.Path("artifacts")
 files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
 kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -102,7 +96,6 @@ if not files:
     sys.exit(66)
 
 def kst(ts): return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
-
 latest = files[-1]
 mod_kst = kst(latest.stat().st_mtime)
 age_h = (kst_now - mod_kst).total_seconds()/3600
@@ -112,7 +105,6 @@ fresh_by_mtime = age_h <= 12.0
 
 def hint_is_today(name: str) -> bool:
     s = name
-    # ① 4자리 연도 (예: 2025-10-06, 20251006, 2025_10_06 등)
     m = re.findall(r'(20\d{2})[-_/ ]?(\d{1,2})[-_/ ]?(\d{1,2})', s)
     if m:
         y, M, d = map(int, m[-1])
@@ -120,8 +112,7 @@ def hint_is_today(name: str) -> bool:
             return datetime.date(y, M, d) == today
         except ValueError:
             pass
-    # ② YYMMDD (예: _251006, 공백 251006 등)
-    m2 = re.findall(r'(^|[^0-9])(\d{6})([^0-9]|$)', s)
+    m2 = re.findall(r'(^|[^0-9])(\d{6})([^0-9]|$)', s)  # YYMMDD
     if m2:
         yymmdd = m2[-1][1]
         yy = int(yymmdd[0:2]); mm = int(yymmdd[2:4]); dd = int(yymmdd[4:6])
@@ -135,8 +126,6 @@ def hint_is_today(name: str) -> bool:
 fresh_by_name = any(hint_is_today(p.name) for p in files)
 
 if fresh_by_mtime or fresh_by_name:
-    if fresh_by_name:
-        print("filename date hint == today(KST) ✓")
     print("RESULT: FRESH ✓")
     sys.exit(0)
 
@@ -149,6 +138,7 @@ PY
 
             if [ ${rc} -eq 0 ]; then
               echo "fresh artifacts detected."
+              echo "fresh=true" >> "$GITHUB_OUTPUT"
               break
             fi
 
@@ -162,14 +152,12 @@ PY
             try=$((try+1))
           done
 
-          echo "OK" > .fresh_ok
-
       - name: List downloaded files
         run: |
           find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
 
       - name: Run analysis & update
-        if: ${{ hashFiles('.fresh_ok') != '' }}
+        if: ${{ steps.fetch.outputs.fresh == 'true' }}
         env:
           ARTIFACTS_DIR: artifacts
         run: |
