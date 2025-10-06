@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install jq (needed for JSON parsing)
+      - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
@@ -49,11 +49,10 @@ jobs:
         id: fetch
         shell: bash
         env:
-          MAX_TRIES: "6"   # total tries (first + 5 retries)
-          RETRY_MIN: "15"  # minutes between retries
+          MAX_TRIES: "6"
+          RETRY_MIN: "15"
         run: |
           set -euo pipefail
-
           echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
 
           rm -rf artifacts
@@ -92,22 +91,19 @@ jobs:
 
             if [ ${rc} -eq 0 ]; then
               echo "::group::freshness check (<=12h, KST)"
-              python <<'PY'
+              python - <<'PY'
 import pathlib, sys, datetime, re
-
 root = pathlib.Path("artifacts")
 files = sorted(root.rglob("*.xlsx"), key=lambda p: p.stat().st_mtime)
-
 kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 today = kst_now.date()
 print(f"KST now: {kst_now}  (today={today})")
 print(f"files: {len(files)}")
-
 if not files:
     print("NO XLSX FILES in artifacts directory.")
     sys.exit(66)
 
-def kst(ts): 
+def kst(ts):
     return datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=9)
 
 for p in files[-15:]:
@@ -129,7 +125,6 @@ if m:
 if age > 12:
     print("RESULT: STALE or NOT TODAY → retry later")
     sys.exit(66)
-
 print("RESULT: FRESH ✓")
 PY
               rc=$?
