@@ -1,4 +1,3 @@
-# scripts/analyze_and_update.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -720,7 +719,7 @@ def write_predicted_line(ws_sum: gspread.Worksheet, ym: str, pred_map: dict):
     log_focus_link(ws_sum, r, len(header_sum or []), sheet_id_env)
     upsert_named_range(ws_sum, f"LATEST_{ws_sum.id}", r, len(header_sum or []))
 
-# ===================== 압구정동 원본/변동 기록 (동일) =====================
+# ===================== 압구정동 원본/변동 기록 =====================
 APGU_BASE_COLS = [
     "광역", "구", "법정동", "리", "번지", "본번", "부번", "단지명", "전용면적(㎡)",
     "계약년", "계약월", "계약일", "거래금액(만원)", "동", "층",
@@ -763,11 +762,15 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     if header != APGU_BASE_COLS:
         _retry(ws.update, [APGU_BASE_COLS], "A1"); header = APGU_BASE_COLS
 
+    # 현재 시트에서 base 영역(변경구분 이전) 읽기
     all_now = _get_all_values_cached(ws) or [header]
     body = all_now[1:]
     base_rows_old: List[List[str]] = []
-    for r in body:
+    change_start_row = None  # 변경이력 시작 행 번호 저장
+    
+    for idx, r in enumerate(body, start=2):
         if r and r[0] in ("변경구분", "(신규)", "(삭제)"):
+            change_start_row = idx
             break
         base_rows_old.append((r + [""] * len(header))[:len(header)])
 
@@ -775,8 +778,22 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     for _, row in df.iterrows():
         base_rows_new.append([_apgu_norm(row.get(c, "")) for c in APGU_BASE_COLS])
 
-    start = 2; end = max(start, start + len(base_rows_new) - 1)
+    # base 영역 업데이트
+    start = 2
+    end = max(start, start + len(base_rows_new) - 1)
     _ensure_rows(ws, end)
+    
+    # ===== 핵심 수정: 이전 base 영역이 새 base보다 길면, 남은 부분을 clear =====
+    if len(base_rows_old) > len(base_rows_new):
+        old_end = start + len(base_rows_old) - 1
+        clear_start = end + 1
+        # 남은 행들을 빈 값으로 채워서 삭제
+        empty_rows = [[""] * len(header) for _ in range(clear_start, old_end + 1)]
+        if empty_rows:
+            _retry(ws.update, empty_rows, f"A{clear_start}:{a1_col(len(header))}{old_end}")
+            log(f"[압구정동] cleared old base rows: {clear_start}-{old_end}")
+    # ==================================================================================
+    
     _retry(ws.update, base_rows_new, f"A{start}:{a1_col(len(header))}{end}")
     log(f"[압구정동] base rows written: {len(base_rows_new)}")
 
