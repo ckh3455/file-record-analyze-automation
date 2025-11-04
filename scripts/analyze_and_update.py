@@ -755,6 +755,10 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
 
     df = df.sort_values(["계약년", "계약월", "계약일"], ascending=[True, True, True], kind="mergesort")
 
+    # 캐시 무효화: 이 시트의 최신 데이터를 읽기 위해
+    if ws.id in _WS_VALUES_CACHE:
+        del _WS_VALUES_CACHE[ws.id]
+    
     vals = _get_all_values_cached(ws) or []
     if not vals:
         _retry(ws.update, [APGU_BASE_COLS], "A1"); vals = [APGU_BASE_COLS]
@@ -762,7 +766,7 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     if header != APGU_BASE_COLS:
         _retry(ws.update, [APGU_BASE_COLS], "A1"); header = APGU_BASE_COLS
 
-    # 현재 시트에서 base 영역(변경구분 이전) 읽기
+    # 현재 시트에서 base 영역(변경구분 이전) 읽기 - 이전 실행의 base
     all_now = _get_all_values_cached(ws) or [header]
     body = all_now[1:]
     base_rows_old: List[List[str]] = []
@@ -774,6 +778,7 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
             break
         base_rows_old.append((r + [""] * len(header))[:len(header)])
 
+    # 새 데이터 준비
     base_rows_new: List[List[str]] = []
     for _, row in df.iterrows():
         base_rows_new.append([_apgu_norm(row.get(c, "")) for c in APGU_BASE_COLS])
@@ -783,27 +788,43 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     end = max(start, start + len(base_rows_new) - 1)
     _ensure_rows(ws, end)
     
-    # ===== 핵심 수정: 이전 base 영역이 새 base보다 길면, 남은 부분을 clear =====
+    # 이전 base 영역이 새 base보다 길면, 남은 부분을 clear
     if len(base_rows_old) > len(base_rows_new):
         old_end = start + len(base_rows_old) - 1
         clear_start = end + 1
-        # 남은 행들을 빈 값으로 채워서 삭제
         empty_rows = [[""] * len(header) for _ in range(clear_start, old_end + 1)]
         if empty_rows:
             _retry(ws.update, empty_rows, f"A{clear_start}:{a1_col(len(header))}{old_end}")
             log(f"[압구정동] cleared old base rows: {clear_start}-{old_end}")
-    # ==================================================================================
     
     _retry(ws.update, base_rows_new, f"A{start}:{a1_col(len(header))}{end}")
     log(f"[압구정동] base rows written: {len(base_rows_new)}")
 
+    # 변경 계산
     old_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_old}
     new_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_new}
     added_keys = sorted(list(new_keys - old_keys))
     removed_keys = sorted(list(old_keys - new_keys))
-    if not added_keys and not removed_keys:
-        log("[압구정동] changes: none"); return
 
+    # 변경이력 영역 시작점
+    change_start = end + 1
+    
+    if not added_keys and not removed_keys:
+        # 변화 없음: 기존 변경이력 영역을 완전히 clear
+        if change_start_row and change_start_row <= len(all_now):
+            # 이전 변경이력이 있었다면 모두 삭제
+            rows_to_clear = len(all_now) - change_start_row + 1
+            if rows_to_clear > 0:
+                empty_rows = [[""] * len(APGU_BASE_COLS + ["변경구분", "변경일"])] * rows_to_clear
+                _retry(ws.update, empty_rows, f"A{change_start}:{a1_col(len(APGU_BASE_COLS)+2)}{change_start + rows_to_clear - 1}")
+                log(f"[압구정동] changes: none - cleared old change history")
+            else:
+                log("[압구정동] changes: none")
+        else:
+            log("[압구정동] changes: none")
+        return
+
+    # 변화 있음: 새 변경이력 작성
     def _rowmap(rows: List[List[str]]):
         m = {}
         for r in rows:
@@ -817,13 +838,25 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     for k in added_keys: change_rows.append(["(신규)", today_str] + new_map[k])
     for k in removed_keys: change_rows.append(["(삭제)", today_str] + old_map[k])
 
-    start_chg = end + 1; end_chg = start_chg + len(change_rows) - 1
+    # 기존 변경이력 영역 완전히 clear 후 새로 작성
+    end_chg = change_start + len(change_rows) - 1
     _ensure_rows(ws, end_chg)
-    _retry(ws.update, change_rows, f"A{start_chg}:{a1_col(len(change_header))}{end_chg}")
-    req = {"repeatCell":{"range":{"sheetId":ws.id,"startRowIndex":start_chg-1,"endRowIndex":end_chg,"startColumnIndex":0,"endColumnIndex":len(change_header)},
+    
+    # 이전 변경이력이 새 변경이력보다 길었다면 남은 부분 clear
+    if change_start_row:
+        old_change_end = len(all_now)
+        if old_change_end > end_chg:
+            clear_start_chg = end_chg + 1
+            empty_rows = [[""] * len(change_header)] * (old_change_end - end_chg)
+            _retry(ws.update, empty_rows, f"A{clear_start_chg}:{a1_col(len(change_header))}{old_change_end}")
+            log(f"[압구정동] cleared old change history: {clear_start_chg}-{old_change_end}")
+    
+    _retry(ws.update, change_rows, f"A{change_start}:{a1_col(len(change_header))}{end_chg}")
+    req = {"repeatCell":{"range":{"sheetId":ws.id,"startRowIndex":change_start-1,"endRowIndex":end_chg,"startColumnIndex":0,"endColumnIndex":len(change_header)},
                          "cell":{"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":1.0,"green":0.0,"blue":0.0}}}},
                          "fields":"userEnteredFormat.textFormat.foregroundColor"}}
-    batch_format(ws, [req]); log(f"[압구정동] changes: 신규={len(added_keys)} 삭제={len(removed_keys)}")
+    batch_format(ws, [req])
+    log(f"[압구정동] changes: 신규={len(added_keys)} 삭제={len(removed_keys)}")
 
 # ===== 패턴 분석 시트 (표 + 라인차트) =====
 def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: pd.DataFrame, df_inc: pd.DataFrame, targets: List[str]):
