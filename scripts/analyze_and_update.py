@@ -835,8 +835,14 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     change_header = ["변경구분", "변경일"] + APGU_BASE_COLS
     change_rows: List[List[str]] = [change_header]
     today_str = fmt_kdate(run_day)
-    for k in added_keys: change_rows.append(["(신규)", today_str] + new_map[k])
-    for k in removed_keys: change_rows.append(["(삭제)", today_str] + old_map[k])
+    
+    # 신규 행 추가
+    for k in added_keys: 
+        change_rows.append(["(신규)", today_str] + new_map[k])
+    
+    # 삭제 행 추가
+    for k in removed_keys: 
+        change_rows.append(["(삭제)", today_str] + old_map[k])
 
     # 기존 변경이력 영역 완전히 clear 후 새로 작성
     end_chg = change_start + len(change_rows) - 1
@@ -851,12 +857,63 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
             _retry(ws.update, empty_rows, f"A{clear_start_chg}:{a1_col(len(change_header))}{old_change_end}")
             log(f"[압구정동] cleared old change history: {clear_start_chg}-{old_change_end}")
     
+    # 변경이력 데이터 작성
     _retry(ws.update, change_rows, f"A{change_start}:{a1_col(len(change_header))}{end_chg}")
-    req = {"repeatCell":{"range":{"sheetId":ws.id,"startRowIndex":change_start-1,"endRowIndex":end_chg,"startColumnIndex":0,"endColumnIndex":len(change_header)},
-                         "cell":{"userEnteredFormat":{"textFormat":{"foregroundColor":{"red":1.0,"green":0.0,"blue":0.0}}}},
-                         "fields":"userEnteredFormat.textFormat.foregroundColor"}}
-    batch_format(ws, [req])
-    log(f"[압구정동] changes: 신규={len(added_keys)} 삭제={len(removed_keys)}")
+    
+    # 색상 포맷팅: 신규는 파란색, 삭제는 빨간색
+    format_reqs = []
+    current_row = change_start + 1  # 헤더 다음부터 시작
+    
+    # 신규 행들 - 파란색
+    for _ in range(len(added_keys)):
+        format_reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": current_row - 1,
+                    "endRowIndex": current_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(change_header)
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 1.0}
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.textFormat.foregroundColor"
+            }
+        })
+        current_row += 1
+    
+    # 삭제 행들 - 빨간색
+    for _ in range(len(removed_keys)):
+        format_reqs.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": current_row - 1,
+                    "endRowIndex": current_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(change_header)
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "foregroundColor": {"red": 1.0, "green": 0.0, "blue": 0.0}
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.textFormat.foregroundColor"
+            }
+        })
+        current_row += 1
+    
+    if format_reqs:
+        batch_format(ws, format_reqs)
+    
+    log(f"[압구정동] changes: 신규={len(added_keys)}(파란색) 삭제={len(removed_keys)}(빨간색)")
 
 # ===== 패턴 분석 시트 (표 + 라인차트) =====
 def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: pd.DataFrame, df_inc: pd.DataFrame, targets: List[str]):
