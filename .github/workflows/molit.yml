@@ -2,20 +2,20 @@ name: molit
 
 on:
   schedule:
-    - cron: "05 0 * * *"   # KST 09:05
-  workflow_dispatch:
+    - cron: '05 0 * * *'   # KST 09:05
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-      ARTIFACTS_ONLY: "1"      # 아티팩트만 올리는 단계
-      DOWNLOAD_TIMEOUT: "30"
-      CLICK_RETRY_MAX: "15"
-      CLICK_RETRY_WAIT: "1"
+      CI: '1'
+      PYTHONUNBUFFERED: '1'
+      ARTIFACTS_ONLY: '1'
+      DOWNLOAD_TIMEOUT: '30'
+      CLICK_RETRY_MAX: '15'
+      CLICK_RETRY_WAIT: '1'
 
     steps:
       - name: Checkout
@@ -26,13 +26,13 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y chromium-browser chromium-chromedriver
-          echo "CHROME_BIN=/usr/bin/chromium-browser" >> $GITHUB_ENV
-          echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> $GITHUB_ENV
+          echo "CHROME_BIN=/usr/bin/chromium-browser" >> "$GITHUB_ENV"
+          echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
@@ -43,23 +43,9 @@ jobs:
         run: |
           python scripts/rt_allinone.py
 
-      - name: Debug: list output xlsx
-        if: always()
-        run: |
-          echo "PWD:"
-          pwd
-          echo "Top level:"
-          ls -al || true
-          echo "output dir:"
-          ls -al output || echo "output dir not found"
-          echo "Search for any .xlsx under repo:"
-          find . -maxdepth 5 -type f -name '*.xlsx' -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
-
       - name: Upload artifacts (processed xlsx)
         uses: actions/upload-artifact@v4
         with:
           name: molit-xlsx
           path: output/*.xlsx
           if-no-files-found: error
-          # 필요하면 보관일 지정 가능 (레포 제한이 3일이면 이 줄은 생략 가능)
-          # retention-days: 3
