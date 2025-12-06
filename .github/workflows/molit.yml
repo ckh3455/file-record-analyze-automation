@@ -43,10 +43,28 @@ jobs:
         run: |
           python scripts/rt_allinone.py
 
+      # 디버그용: 실제로 어떤 .xlsx 가 어디에 생겼는지 확인
+      - name: Debug: list output xlsx
+        if: always()
+        run: |
+          echo "PWD:"
+          pwd
+          echo "Top level:"
+          ls -al || true
+          echo "output dir:"
+          ls -al output || echo "output dir not found"
+          echo "Search for any .xlsx under repo:"
+          find . -maxdepth 5 -type f -name '*.xlsx' -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
+
       - name: Upload artifacts (processed xlsx)
         uses: actions/upload-artifact@v4
         with:
-          name: molit-xlsx-${{ github.run_id }}
+          # 🔴 여기 이름을 고정해야 analyze 쪽이 찾을 수 있음
+          name: molit-xlsx
+          # 🔴 rt_allinone.py 가 output/ 아래에 저장하니까 이 경로 유지
           path: output/*.xlsx
+          # 엑셀 하나도 없으면 에러로 실패시키고 싶으면 그대로 error 유지
+          # (원하면 여기 warn 으로 바꿔도 됨)
           if-no-files-found: error
-
+          # 레포 제한이 3일이면 굳이 안 써도 되지만, 쓰고 싶으면 추가:
+          # retention-days: 3
