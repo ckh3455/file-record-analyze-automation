@@ -3,7 +3,7 @@ name: molit
 on:
   schedule:
     - cron: "05 0 * * *"   # KST 09:05
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   run:
@@ -12,7 +12,7 @@ jobs:
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
-      ARTIFACTS_ONLY: "1"           # 이번 단계는 아티팩트만 올림
+      ARTIFACTS_ONLY: "1"      # 아티팩트만 올리는 단계
       DOWNLOAD_TIMEOUT: "30"
       CLICK_RETRY_MAX: "15"
       CLICK_RETRY_WAIT: "1"
@@ -43,7 +43,6 @@ jobs:
         run: |
           python scripts/rt_allinone.py
 
-      # 디버그용: 실제로 어떤 .xlsx 가 어디에 생겼는지 확인
       - name: Debug: list output xlsx
         if: always()
         run: |
@@ -59,12 +58,8 @@ jobs:
       - name: Upload artifacts (processed xlsx)
         uses: actions/upload-artifact@v4
         with:
-          # 🔴 여기 이름을 고정해야 analyze 쪽이 찾을 수 있음
           name: molit-xlsx
-          # 🔴 rt_allinone.py 가 output/ 아래에 저장하니까 이 경로 유지
           path: output/*.xlsx
-          # 엑셀 하나도 없으면 에러로 실패시키고 싶으면 그대로 error 유지
-          # (원하면 여기 warn 으로 바꿔도 됨)
           if-no-files-found: error
-          # 레포 제한이 3일이면 굳이 안 써도 되지만, 쓰고 싶으면 추가:
+          # 필요하면 보관일 지정 가능 (레포 제한이 3일이면 이 줄은 생략 가능)
           # retention-days: 3
