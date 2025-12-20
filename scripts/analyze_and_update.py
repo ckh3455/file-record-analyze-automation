@@ -749,7 +749,6 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     - base(원본) 영역은 덮어쓰지 않고, 신규/변경분만 append
     - 변경이력(history) 영역은 기존 이력을 지우지 않고, 신규/삭제 이벤트만 append
     - 삭제는 base에서 제거하지 않음(원본 보존), 대신 history에 (삭제)로만 남김
-    - (중요) (신규)/(삭제) 이벤트는 1회성: 이미 (삭제)된 항목은 다음 실행에서 다시 (삭제)로 기록하지 않음
     """
     df = df_all[(df_all.get("광역", "") == "서울특별시") & (df_all.get("법정동", "") == "압구정동")].copy()
     if df.empty:
@@ -810,77 +809,78 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     # 오늘 수집분(base 후보) 구성
     base_rows_new = [[_apgu_norm(row.get(c, "")) for c in APGU_BASE_COLS] for _, row in df.iterrows()]
 
-    # ---------------------------
-    # 1회성 이벤트(삭제 반복 방지)를 위해:
-    # - base(원본)는 누적(삭제해도 남김)
-    # - 비교는 "현재 유효(active)" 데이터 기준으로 수행
-    #   => history에서 마지막 상태가 (삭제)인 키는 inactive로 간주
-    # ---------------------------
+    # 키 셋
+    old_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_old}
+    new_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_new}
+
     # history 기존 body 추출(헤더 제거)
-    hist_body_old: List[List[str]] = []
+    hist_body_old = []
     if hist_rows_old:
         if hist_rows_old[0] and _apgu_norm(hist_rows_old[0][0]) == _apgu_norm("변경구분"):
             hist_body_old = [ (r + [""]*len(change_header))[:len(change_header)]
                               for r in hist_rows_old[1:] if not _is_empty_row(r) ]
 
+    # ---- 변경 1회성 이벤트 처리 ----
+    # history에서 마지막 상태가 (삭제)인 키는 "비활성"으로 간주하여,
+    # 다음 실행에서 new_keys에 없더라도 (삭제)가 반복 기록되지 않도록 한다.
     def _key_from_hist_row(hr: List[str]) -> str:
-        # hr: ["(신규)/(삭제)", "YYYY. M. D", ...APGU_BASE_COLS...]
         base_part = (hr[2:] + [""] * len(APGU_BASE_COLS))[:len(APGU_BASE_COLS)]
         return _apgu_key_from_row_values(base_part, header)
 
     last_status: Dict[str, str] = {}
     existing_events = set()  # (chg, day, key) 중복 방지(같은 날 재실행 대비)
+
     for hr in hist_body_old:
         chg = _apgu_norm(hr[0])
         day = _apgu_norm(hr[1])
-        if chg not in ("(신규)", "(삭제)"):
+        if chg not in ("(신규)", "(삭제)", "(재등장)"):
             continue
         k = _key_from_hist_row(hr)
         last_status[k] = chg
         existing_events.add((chg, day, k))
 
     inactive_keys = {k for k, st in last_status.items() if st == "(삭제)"}
-
-    # 키 셋
-    old_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_old}
-    new_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_new}
-
     active_old_keys = old_keys - inactive_keys
 
-    added_keys = sorted(list(new_keys - active_old_keys))
+    added_all = sorted(list(new_keys - active_old_keys))
     removed_keys = sorted(list(active_old_keys - new_keys))
 
-    # base는 "추가만" 한다 (원본 보존)
-    # - 이미 base에 존재했던(과거 삭제 후 재등장 포함) 키는 중복 append 하지 않음
+    # base는 "진짜 신규(처음 등장한 키)"만 append (중복 방지)
     new_map = {_apgu_key_from_row_values(r, header): r for r in base_rows_new}
-    base_append_keys = [k for k in added_keys if k not in old_keys]
-    base_append = [new_map[k] for k in base_append_keys]
+    brand_new_keys = [k for k in added_all if k not in old_keys]  # base에도 없었던 완전 신규
+    reappear_keys  = [k for k in added_all if k in old_keys]      # 과거 base에 있었던 재등장
+
+    base_append = [new_map[k] for k in brand_new_keys]
     base_rows_updated = base_rows_old + base_append
 
-    # history는 "기존 유지 + 신규 append"
     today_str = fmt_kdate(run_day)
 
     # removed 행의 원본 값은 base_old에서 가져와 기록
     old_map = {_apgu_key_from_row_values(r, header): r for r in base_rows_old}
 
-    hist_append_new: List[List[str]] = []
-    for k in added_keys:
-        evt = ("(신규)", today_str, k)
-        if evt in existing_events:
-            continue
-        hist_append_new.append(["(신규)", today_str] + new_map[k])
+    # history는 "이벤트 1회성"으로 append
+    hist_append_rows = []
 
-    hist_append_del: List[List[str]] = []
+    # 신규(또는 재등장)는 파란색 처리 대상이므로 같이 append하되,
+    # 같은 날 같은 이벤트가 이미 있으면 중복 기록하지 않는다.
+    for k in brand_new_keys:
+        evt = ("(신규)", today_str, k)
+        if evt not in existing_events:
+            hist_append_rows.append(["(신규)", today_str] + new_map[k])
+
+    # 재등장 케이스를 별도 표기하고 싶다면 "(재등장)"으로 기록한다.
+    # (원치 않으면 위 '(신규)'로 통일해도 무방)
+    for k in reappear_keys:
+        evt = ("(재등장)", today_str, k)
+        if evt not in existing_events:
+            hist_append_rows.append(["(재등장)", today_str] + new_map[k])
+
     for k in removed_keys:
         evt = ("(삭제)", today_str, k)
-        if evt in existing_events:
-            continue
-        hist_append_del.append(["(삭제)", today_str] + old_map[k])
+        if evt not in existing_events and k in old_map:
+            hist_append_rows.append(["(삭제)", today_str] + old_map[k])
 
-    hist_append_rows = hist_append_new + hist_append_del
-    added_cnt = len(hist_append_new)
-    removed_cnt = len(hist_append_del)
-
+    added_cnt = len(brand_new_keys) + len(reappear_keys)
     # 최종 시트 내용 재구성(전체를 다시 써서 base가 늘어나도 history 보존)
     out = []
     out.append(APGU_BASE_COLS)
@@ -940,14 +940,14 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
             })
 
         # (삭제) 블록
-        if removed_cnt > 0:
+        if len(removed_keys) > 0:
             del_start = append_start_row + added_cnt
             reqs.append({
                 "repeatCell": {
                     "range": {
                         "sheetId": ws.id,
                         "startRowIndex": del_start - 1,
-                        "endRowIndex": del_start - 1 + removed_cnt,
+                        "endRowIndex": del_start - 1 + len(removed_keys),
                         "startColumnIndex": 0,
                         "endColumnIndex": len(change_header),
                     },
@@ -958,7 +958,8 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
 
         batch_format(ws, reqs)
 
-    log(f"[압구정동] base append={len(base_append)} / history append 신규={added_cnt} 삭제={removed_cnt}")
+    log(f"[압구정동] base append={len(base_append)} / history append 신규={added_cnt} 삭제={len(removed_keys)}")
+
 
 # ===== 패턴 분석 시트 (표 + 라인차트) =====
 def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: pd.DataFrame, df_inc: pd.DataFrame, targets: List[str]):
@@ -1033,6 +1034,105 @@ def list_month_sheets(sh: gspread.Spreadsheet):
             ym = yymm_from_title(t); out["서울"][ym] = ws
     return out
 
+def _clear_values_below_header(ws: gspread.Worksheet, max_rows: int = 800):
+    """
+    헤더(1행)는 유지하고 2행부터 값만 비운다(서식 유지 목적).
+    gspread 구현체/권한에 따라 batch_clear가 안 될 수 있어 폴백 포함.
+    """
+    try:
+        vals = _retry(ws.get_all_values) or []
+        used_rows = max(2, min(len(vals), max_rows))
+        used_cols = 0
+        for r in vals[:used_rows]:
+            used_cols = max(used_cols, len(r))
+        used_cols = max(1, used_cols)
+    except Exception:
+        used_rows = max_rows
+        used_cols = max(1, min(40, getattr(ws, "col_count", 40)))
+
+    end_col = a1_col(used_cols)
+    rng = f"A2:{end_col}{used_rows}"
+
+    # 1) batch_clear 시도(대개 값만 지우고 서식은 유지)
+    try:
+        _retry(ws.batch_clear, [rng])
+        return
+    except Exception:
+        pass
+
+    # 2) 폴백: 빈값 업데이트(서식은 보통 유지)
+    blanks = [[""] * used_cols for _ in range(max(0, used_rows - 1))]
+    _retry(ws.update, blanks, rng)
+
+
+def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str, ym: str) -> gspread.Worksheet:
+    """
+    월별 탭이 없으면 자동 생성한다.
+    - 가능하면 같은 level(전국/서울)의 직전 월 탭을 복제해서 동일한 형식/서식을 유지
+    - 복제 후에는 2행 이하 '값'만 비워 새 달 시작 상태로 만든다(헤더/서식 유지)
+    - 템플릿이 하나도 없으면 기본 헤더로 신규 생성
+    """
+    ws = fuzzy_ws(sh, title)
+    if ws is not None:
+        return ws
+
+    # 템플릿 후보(전국/서울 월 탭 목록)
+    sheets_map = list_month_sheets(sh)  # {"전국": {ym: ws}, "서울": {ym: ws}}
+    candidates = sheets_map.get(level, {})
+
+    # 가장 가까운 과거 월 템플릿(최대 36개월 역탐색)
+    tpl = None
+    cur = ym
+    for _ in range(36):
+        cur = prev_ym(cur)
+        if cur in candidates:
+            tpl = candidates[cur]
+            break
+
+    if tpl is not None:
+        try:
+            _retry(sh.duplicate_sheet, tpl.id, new_sheet_name=title)
+        except TypeError:
+            # gspread 구버전 시그니처 대응
+            _retry(sh.duplicate_sheet, tpl.id, None, None, title)
+
+        ws = fuzzy_ws(sh, title)
+        if ws is None:
+            ws = _retry(sh.worksheet, title)
+
+        _clear_values_below_header(ws)
+        _WS_VALUES_CACHE.pop(ws.id, None)
+        log(f"[ws] created by duplication: {title} (from={tpl.title})")
+        return ws
+
+    # 템플릿이 없으면: 새로 생성 + 기본 헤더
+    ws = get_or_create_ws(sh, title, rows=800, cols=40)
+    header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
+    _retry(ws.update, [header], "A1")
+    _WS_VALUES_CACHE.pop(ws.id, None)
+    log(f"[ws] created from scratch: {title}")
+    return ws
+
+
+SUMMARY_MONTH_LABELS = [
+    "거래건수",
+    "중앙값(단위:억)",
+    "평균가(단위:억)",
+    "전월대비 건수증감",
+    "예상건수",
+]
+
+
+def ensure_summary_month_rows(ws_sum: gspread.Worksheet, ym: str):
+    """
+    거래요약 탭에서 '해당 월'의 5개 라인(거래건수/중앙값/평균가/전월대비/예상건수)이
+    항상 존재하도록 보장한다.
+    """
+    for label in SUMMARY_MONTH_LABELS:
+        r = find_summary_row(ws_sum, ym, label)
+        put_summary_line(ws_sum, r, ym, label, {})
+
+
 # ===== 모멘텀(선택: 총합 소폭 보정) =====
 def momentum_factor_from_increments(df_cum: pd.DataFrame, region_col_n: str, day_idx_for_window: int, k: int = 3, gamma: float = 0.20) -> float:
     if region_col_n not in df_cum.columns: return 1.0
@@ -1098,49 +1198,45 @@ def main():
             empty_mean  = {c: "" for c in SUMMARY_COLS}
             month_cache[ym] = {"counts": zero_counts, "med": empty_med, "mean": empty_mean}
 
-            ws_nat = fuzzy_ws(sh, nat_title)
-            if ws_nat:
-                header_nat = _retry(ws_nat.row_values, 1)
-                values_nat = {}
-                for h in header_nat:
-                    if not h or h == "날짜": continue
-                    if h == "총합계": values_nat["총합계"] = 0
-                    elif h in zero_counts: values_nat[h] = 0
-                write_month_sheet(ws_nat, today_label, header_nat, values_nat)
+            ws_nat = ensure_month_ws(sh, nat_title, level="전국", ym=ym)
+            header_nat = _retry(ws_nat.row_values, 1)
+            values_nat = {}
+            for h in header_nat:
+                if not h or h == "날짜": continue
+                if h == "총합계": values_nat["총합계"] = 0
+                elif h in zero_counts: values_nat[h] = 0
+            write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-            ws_se = fuzzy_ws(sh, se_title)
-            if ws_se:
-                header_se = _retry(ws_se.row_values, 1)
-                values_se = {}
-                for h in header_se:
-                    if not h or h == "날짜": continue
-                    if h == "총합계": values_se["총합계"] = 0
-                    elif h in zero_counts: values_se[h] = 0
-                write_month_sheet(ws_se, today_label, header_se, values_se)
+            ws_se = ensure_month_ws(sh, se_title, level="서울", ym=ym)
+            header_se = _retry(ws_se.row_values, 1)
+            values_se = {}
+            for h in header_se:
+                if not h or h == "날짜": continue
+                if h == "총합계": values_se["총합계"] = 0
+                elif h in zero_counts: values_se[h] = 0
+            write_month_sheet(ws_se, today_label, header_se, values_se)
             continue
 
         counts, med, mean = agg_all_stats(df)
         month_cache[ym] = {"counts": counts, "med": med, "mean": mean}
 
-        ws_nat = fuzzy_ws(sh, nat_title)
-        if ws_nat:
-            header_nat = _retry(ws_nat.row_values, 1)
-            values_nat: Dict[str, int] = {}
-            for h in header_nat:
-                if not h or h == "날짜": continue
-                if h == "총합계": values_nat["총합계"] = int(counts.get("전국", 0))
-                elif h in counts: values_nat[h] = int(counts[h])
-            write_month_sheet(ws_nat, today_label, header_nat, values_nat)
+        ws_nat = ensure_month_ws(sh, nat_title, level="전국", ym=ym)
+        header_nat = _retry(ws_nat.row_values, 1)
+        values_nat: Dict[str, int] = {}
+        for h in header_nat:
+            if not h or h == "날짜": continue
+            if h == "총합계": values_nat["총합계"] = int(counts.get("전국", 0))
+            elif h in counts: values_nat[h] = int(counts[h])
+        write_month_sheet(ws_nat, today_label, header_nat, values_nat)
 
-        ws_se = fuzzy_ws(sh, se_title)
-        if ws_se:
-            header_se = _retry(ws_se.row_values, 1)
-            values_se: Dict[str, int] = {}
-            for h in header_se:
-                if not h or h == "날짜": continue
-                if h == "총합계": values_se["총합계"] = int(counts.get("서울", 0))
-                elif h in counts: values_se[h] = int(counts[h])
-            write_month_sheet(ws_se, today_label, header_se, values_se)
+        ws_se = ensure_month_ws(sh, se_title, level="서울", ym=ym)
+        header_se = _retry(ws_se.row_values, 1)
+        values_se: Dict[str, int] = {}
+        for h in header_se:
+            if not h or h == "날짜": continue
+            if h == "총합계": values_se["총합계"] = int(counts.get("서울", 0))
+            elif h in counts: values_se[h] = int(counts[h])
+        write_month_sheet(ws_se, today_label, header_se, values_se)
 
         ap = df[(df.get("광역", "") == "서울특별시") & (df.get("법정동", "") == "압구정동")].copy()
         if not ap.empty: apgu_all.append(ap)
@@ -1152,6 +1248,7 @@ def main():
             def ym_key(ym): yy, mm = ym.split("/"); return (int(yy), int(mm))
             for ym in sorted(month_cache.keys(), key=ym_key):
                 cur = month_cache[ym]; prv = month_cache.get(prev_ym(ym))
+                ensure_summary_month_rows(ws_sum, ym)
                 write_month_summary(ws_sum, 2000 + int(ym.split("/")[0]), int(ym.split("/")[1]),
                                     cur["counts"], cur["med"], cur["mean"],
                                     prv["counts"] if prv else None)
@@ -1178,6 +1275,8 @@ def main():
 
         for ym in last12_ym:
             counts = None; med = None; mean = None; prv_counts = None
+
+            ensure_summary_month_rows(ws_sum, ym)
 
             if ym in month_cache:
                 counts = month_cache[ym]["counts"]; med = month_cache[ym]["med"]; mean = month_cache[ym]["mean"]
