@@ -749,6 +749,7 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     - base(원본) 영역은 덮어쓰지 않고, 신규/변경분만 append
     - 변경이력(history) 영역은 기존 이력을 지우지 않고, 신규/삭제 이벤트만 append
     - 삭제는 base에서 제거하지 않음(원본 보존), 대신 history에 (삭제)로만 남김
+    - (중요) (신규)/(삭제) 이벤트는 1회성: 이미 (삭제)된 항목은 다음 실행에서 다시 (삭제)로 기록하지 않음
     """
     df = df_all[(df_all.get("광역", "") == "서울특별시") & (df_all.get("법정동", "") == "압구정동")].copy()
     if df.empty:
@@ -809,37 +810,76 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
     # 오늘 수집분(base 후보) 구성
     base_rows_new = [[_apgu_norm(row.get(c, "")) for c in APGU_BASE_COLS] for _, row in df.iterrows()]
 
-    # 키 셋
-    old_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_old}
-    new_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_new}
-
-    added_keys = sorted(list(new_keys - old_keys))
-    removed_keys = sorted(list(old_keys - new_keys))
-
-    # base는 "추가만" 한다 (원본 보존)
-    new_map = {_apgu_key_from_row_values(r, header): r for r in base_rows_new}
-    base_append = [new_map[k] for k in added_keys]
-    base_rows_updated = base_rows_old + base_append
-
-    # history는 "기존 유지 + 신규 append"
-    # 기존 history body 추출(헤더 제거)
-    hist_body_old = []
+    # ---------------------------
+    # 1회성 이벤트(삭제 반복 방지)를 위해:
+    # - base(원본)는 누적(삭제해도 남김)
+    # - 비교는 "현재 유효(active)" 데이터 기준으로 수행
+    #   => history에서 마지막 상태가 (삭제)인 키는 inactive로 간주
+    # ---------------------------
+    # history 기존 body 추출(헤더 제거)
+    hist_body_old: List[List[str]] = []
     if hist_rows_old:
-        # 첫 행이 change_header인지 확인(아니면 강제로 헤더 재작성)
         if hist_rows_old[0] and _apgu_norm(hist_rows_old[0][0]) == _apgu_norm("변경구분"):
             hist_body_old = [ (r + [""]*len(change_header))[:len(change_header)]
                               for r in hist_rows_old[1:] if not _is_empty_row(r) ]
 
+    def _key_from_hist_row(hr: List[str]) -> str:
+        # hr: ["(신규)/(삭제)", "YYYY. M. D", ...APGU_BASE_COLS...]
+        base_part = (hr[2:] + [""] * len(APGU_BASE_COLS))[:len(APGU_BASE_COLS)]
+        return _apgu_key_from_row_values(base_part, header)
+
+    last_status: Dict[str, str] = {}
+    existing_events = set()  # (chg, day, key) 중복 방지(같은 날 재실행 대비)
+    for hr in hist_body_old:
+        chg = _apgu_norm(hr[0])
+        day = _apgu_norm(hr[1])
+        if chg not in ("(신규)", "(삭제)"):
+            continue
+        k = _key_from_hist_row(hr)
+        last_status[k] = chg
+        existing_events.add((chg, day, k))
+
+    inactive_keys = {k for k, st in last_status.items() if st == "(삭제)"}
+
+    # 키 셋
+    old_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_old}
+    new_keys = {_apgu_key_from_row_values(r, header) for r in base_rows_new}
+
+    active_old_keys = old_keys - inactive_keys
+
+    added_keys = sorted(list(new_keys - active_old_keys))
+    removed_keys = sorted(list(active_old_keys - new_keys))
+
+    # base는 "추가만" 한다 (원본 보존)
+    # - 이미 base에 존재했던(과거 삭제 후 재등장 포함) 키는 중복 append 하지 않음
+    new_map = {_apgu_key_from_row_values(r, header): r for r in base_rows_new}
+    base_append_keys = [k for k in added_keys if k not in old_keys]
+    base_append = [new_map[k] for k in base_append_keys]
+    base_rows_updated = base_rows_old + base_append
+
+    # history는 "기존 유지 + 신규 append"
     today_str = fmt_kdate(run_day)
 
     # removed 행의 원본 값은 base_old에서 가져와 기록
     old_map = {_apgu_key_from_row_values(r, header): r for r in base_rows_old}
 
-    hist_append_rows = []
+    hist_append_new: List[List[str]] = []
     for k in added_keys:
-        hist_append_rows.append(["(신규)", today_str] + new_map[k])
+        evt = ("(신규)", today_str, k)
+        if evt in existing_events:
+            continue
+        hist_append_new.append(["(신규)", today_str] + new_map[k])
+
+    hist_append_del: List[List[str]] = []
     for k in removed_keys:
-        hist_append_rows.append(["(삭제)", today_str] + old_map[k])
+        evt = ("(삭제)", today_str, k)
+        if evt in existing_events:
+            continue
+        hist_append_del.append(["(삭제)", today_str] + old_map[k])
+
+    hist_append_rows = hist_append_new + hist_append_del
+    added_cnt = len(hist_append_new)
+    removed_cnt = len(hist_append_del)
 
     # 최종 시트 내용 재구성(전체를 다시 써서 base가 늘어나도 history 보존)
     out = []
@@ -884,13 +924,13 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
         reqs = []
 
         # (신규) 블록
-        if len(added_keys) > 0:
+        if added_cnt > 0:
             reqs.append({
                 "repeatCell": {
                     "range": {
                         "sheetId": ws.id,
                         "startRowIndex": append_start_row - 1,
-                        "endRowIndex": append_start_row - 1 + len(added_keys),
+                        "endRowIndex": append_start_row - 1 + added_cnt,
                         "startColumnIndex": 0,
                         "endColumnIndex": len(change_header),
                     },
@@ -900,14 +940,14 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
             })
 
         # (삭제) 블록
-        if len(removed_keys) > 0:
-            del_start = append_start_row + len(added_keys)
+        if removed_cnt > 0:
+            del_start = append_start_row + added_cnt
             reqs.append({
                 "repeatCell": {
                     "range": {
                         "sheetId": ws.id,
                         "startRowIndex": del_start - 1,
-                        "endRowIndex": del_start - 1 + len(removed_keys),
+                        "endRowIndex": del_start - 1 + removed_cnt,
                         "startColumnIndex": 0,
                         "endColumnIndex": len(change_header),
                     },
@@ -918,8 +958,7 @@ def upsert_apgu_verbatim(ws: gspread.Worksheet, df_all: pd.DataFrame, run_day: d
 
         batch_format(ws, reqs)
 
-    log(f"[압구정동] base append={len(base_append)} / history append 신규={len(added_keys)} 삭제={len(removed_keys)}")
-
+    log(f"[압구정동] base append={len(base_append)} / history append 신규={added_cnt} 삭제={removed_cnt}")
 
 # ===== 패턴 분석 시트 (표 + 라인차트) =====
 def render_pattern_analysis(sh: gspread.Spreadsheet, month_title: str, df_cum: pd.DataFrame, df_inc: pd.DataFrame, targets: List[str]):
