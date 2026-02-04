@@ -673,9 +673,14 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
         log("[apgu] no rows for 압구정동")
         return
 
-    # 표시용 정렬(최근 날짜 우선)
-    cur["_dt"] = pd.to_datetime(cur["계약년"].astype(str)+"-"+cur["계약월"].astype(str)+"-"+cur["계약일"].astype(str), errors="coerce")
-    cur = cur.sort_values(["_dt","거래금액(만원)"], ascending=[False, False]).drop(columns=["_dt"])
+    # 표시용 정렬: **최근 날짜가 아래로 내려가도록(오래된 → 최신)**
+    # - 날짜는 오름차순(최신이 맨 아래)
+    # - 같은 날짜 내에서는 거래금액은 내림차순(큰 금액이 위)
+    cur["_dt"] = pd.to_datetime(
+        cur["계약년"].astype(str) + "-" + cur["계약월"].astype(str) + "-" + cur["계약일"].astype(str),
+        errors="coerce",
+    )
+    cur = cur.sort_values(["_dt", "거래금액(만원)"], ascending=[True, False]).drop(columns=["_dt"])
 
     # 키
     cur_key = _make_key_df(cur)
