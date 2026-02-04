@@ -141,6 +141,26 @@ def ws_update(ws: gspread.Worksheet, values, range_name: str):
     _invalidate_cache(ws)
     return resp
 
+
+def ws_clear(ws: gspread.Worksheet):
+    """Worksheet 전체 clear. 쓰기 후 캐시 무효화."""
+    resp = _retry(ws.clear)
+    _invalidate_cache(ws)
+    return resp
+
+def ws_add_rows(ws: gspread.Worksheet, n: int):
+    """Worksheet 행 추가. 쓰기 후 캐시 무효화."""
+    resp = _retry(ws.add_rows, n)
+    _invalidate_cache(ws)
+    return resp
+
+def batch_format(ws: gspread.Worksheet, requests: List[dict]):
+    """Google Sheets batchUpdate(requests) 래퍼."""
+    if not requests:
+        return None
+    return _retry(ws.spreadsheet.batch_update, {"requests": requests})
+
+
 def ws_batch_clear(ws: gspread.Worksheet, ranges: List[str]):
     resp = _retry(ws.batch_clear, ranges)
     _invalidate_cache(ws)
