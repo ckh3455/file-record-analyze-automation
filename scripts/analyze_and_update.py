@@ -848,6 +848,7 @@ def main():
         log(f"[file] {p.name}")
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
+        df_all_frames.append(df)
 
         counts, med, mean = agg_all_stats(df)
         summary_rows.append((ym, counts, med, mean))
