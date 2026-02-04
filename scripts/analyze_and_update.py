@@ -91,15 +91,23 @@ def _throttle(sec=0.60):
     _LAST = _t.time()
 
 def _retry(fn, *a, **kw):
+    """gspread 호출 리트라이 래퍼.
+
+    - 429/5xx 뿐 아니라, 가끔 발생하는 400 'Precondition check failed'도
+      (동시 수정/서버측 상태 전파 지연으로) 일시 오류로 보고 재시도합니다.
+    """
     base = 0.8
-    for i in range(7):
+    for i in range(9):
         try:
             _throttle()
             return fn(*a, **kw)
         except APIError as e:
             s = str(e)
-            if any(x in s for x in ("429", "500", "502", "503")):
-                time.sleep(base * (2 ** i) + random.uniform(0, 0.25))
+            # 일시적 오류로 간주할 케이스
+            transient = any(x in s for x in ("429", "500", "502", "503"))
+            transient = transient or ("Precondition check failed" in s) or ("precondition" in s.lower())
+            if transient:
+                time.sleep(base * (2 ** i) + random.uniform(0, 0.35))
                 continue
             raise
 
