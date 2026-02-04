@@ -738,6 +738,9 @@ def main():
         log("[input] no xlsx files found. stop.")
         return
 
+    # 거래요약/압구정동 집계에 사용할 원천(전국 data 시트) 프레임 모음
+    df_all_frames: List[pd.DataFrame] = []
+
     # 월별(ym)로 최신 파일만 선택(같은 달에 여러 파일이 있을 수 있음: *_260204 같은 suffix)
     best_by_ym: Dict[str, Path] = {}
     for p in xlsx:
