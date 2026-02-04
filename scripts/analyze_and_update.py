@@ -201,6 +201,38 @@ def yymm_from_title(title: str) -> Optional[str]:
         return None
     return f"{y%100:02d}/{mm:02d}"
 
+def ym_norm(ym: str) -> Optional[str]:
+    """Normalize various year-month strings to 'YY/MM' (MM 2-digit)."""
+    s = str(ym or "").strip()
+    if not s:
+        return None
+    m = re.search(r"\b(20\d{2})\s*[/\-.]\s*(\d{1,2})\b", s)
+    if m:
+        y = int(m.group(1)); mm = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{y%100:02d}/{mm:02d}"
+    m = re.search(r"\b(\d{2})\s*[/\-.]\s*(\d{1,2})\b", s)
+    if m:
+        yy = int(m.group(1)); mm = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{yy:02d}/{mm:02d}"
+    m = YM_RE.search(s)
+    if m:
+        y = int(m.group(1)); mm = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{y%100:02d}/{mm:02d}"
+    return None
+
+def prev_ym(ym: str) -> str:
+    ym2 = ym_norm(ym) or ym
+    yy, mm = ym2.split("/")
+    y = int(yy); m = int(mm)
+    if m == 1:
+        return f"{(y-1):02d}/12"
+    return f"{y:02d}/{(m-1):02d}"
+
+
+
 def ym_from_filename(fname: str):
     s = str(fname or "")
     m = re.search(r"\b(\d{2})(\d{2})[_\-\.\s]", s)
@@ -626,9 +658,37 @@ def _clear_values_below_header(ws: gspread.Worksheet, max_rows: int = 800):
     blanks = [[""] * used_cols for _ in range(max(0, used_rows - 1))]
     ws_update(ws, blanks, rng)
 
-def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
+
+def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str, ym: str) -> gspread.Worksheet:
+    """Get or create month worksheet.
+    If missing, duplicate the nearest previous month sheet (same level) as template,
+    then clear data rows below header. Fallback: create from scratch.
+    """
     ws = fuzzy_ws(sh, title)
     if ws is not None:
+        return ws
+
+    sheets_map = list_month_sheets(sh)
+    candidates = sheets_map.get(level, {})
+
+    tpl = None
+    cur = ym_norm(ym) or ym
+    for _ in range(36):
+        cur = prev_ym(cur)
+        if cur in candidates:
+            tpl = candidates[cur]
+            break
+
+    if tpl is not None:
+        try:
+            _retry(sh.duplicate_sheet, tpl.id, new_sheet_name=title)
+        except TypeError:
+            _retry(sh.duplicate_sheet, tpl.id, None, None, title)
+
+        ws = fuzzy_ws(sh, title) or _retry(sh.worksheet, title)
+        _clear_values_below_header(ws)
+        _invalidate_cache(ws)
+        log(f"[ws] created by duplication: {title} (from={tpl.title})")
         return ws
 
     ws = get_or_create_ws(sh, title, rows=800, cols=40)
@@ -638,97 +698,8 @@ def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.
     log(f"[ws] created from scratch: {title}")
     return ws
 
-# ===================== 날짜 행 찾기(고정범위 스캔) =====================
-def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
-    """A열을 A2:A{MAX_SCAN_ROWS} 고정범위로 스캔해서 같은 날짜면 그 행, 없으면 첫 빈행."""
-    target = parse_any_date(date_label) or parse_any_date(str(date_label))
-    if not target:
-        return 2
 
-    rng = f"A2:A{MAX_SCAN_ROWS}"
-    col = _retry(ws.get, rng) or []   # [[val],[val],...]
-    # col 길이는 (MAX_SCAN_ROWS-1)까지
-    first_empty = None
-    for offset, row in enumerate(col, start=2):
-        v = row[0] if row else ""
-        if not v:
-            if first_empty is None:
-                first_empty = offset
-            continue
-        d = parse_any_date(v)
-        if d and d == target:
-            return offset
 
-    # 전부 채워져 있으면 마지막+1
-    if first_empty is not None:
-        return first_empty
-    return min(MAX_SCAN_ROWS + 1, 5000)
-
-def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int], sheet_id: str):
-    hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
-    row_idx = find_or_append_date_row(ws, date_iso)
-
-    sheet_prefix = f"'{ws.title}'!"
-    payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
-    for col_name, val in values_by_colname.items():
-        if col_name in hmap:
-            c = hmap[col_name]
-            payload.append({"range": f"{sheet_prefix}{a1_col(c)}{row_idx}", "values": [[int(val)]]})
-
-    values_batch_update(ws, payload)
-    log(f"[ws] {ws.title} -> {date_iso} row={row_idx} (wrote {len(payload)} cells incl. date)")
-    log_focus_link(ws, row_idx, len(header or []), sheet_id)
-
-    # --- verify (썼는데 안 보이는 이슈를 즉시 판별) ---
-    try:
-        last_col = a1_col(max(1, len(header)))
-        vrng = f"A{row_idx}:{last_col}{row_idx}"
-        got = _retry(ws.get, vrng) or []
-        if got:
-            # 너무 길면 앞 6칸+뒤 2칸만
-            row = got[0]
-            view = row[:6] + (["..."] if len(row) > 10 else []) + (row[-2:] if len(row) > 8 else [])
-            log(f"[verify] {ws.title} {vrng} -> {view}")
-    except Exception as e:
-        log(f"[verify] failed: {e}")
-
-# ===================== 아티팩트 수집 =====================
-def collect_input_files(root: Path) -> List[Path]:
-    if not root.exists():
-        return []
-    # output 폴더가 있으면 우선
-    candidates = []
-    for pat in ("**/전국*.xlsx", "**/서울시*.xlsx", "**/서울 *.xlsx", "**/*전국*.xlsx", "**/*서울시*.xlsx"):
-        candidates += list(root.rglob(pat))
-    # 중복 제거
-    uniq = []
-    seen = set()
-    for p in candidates:
-        rp = str(p.resolve())
-        if rp not in seen:
-            seen.add(rp)
-            uniq.append(p)
-    return sorted(uniq)
-
-# ===================== 인증/시트 열기 =====================
-def load_creds():
-    sa_json = os.environ.get("SA_JSON", "").strip()
-    sa_path = os.environ.get("SA_PATH", "").strip()
-
-    if sa_json:
-        info = json.loads(sa_json)
-    elif sa_path:
-        info = json.loads(Path(sa_path).read_text(encoding="utf-8"))
-    else:
-        raise RuntimeError("SA_JSON 또는 SA_PATH 환경변수가 필요합니다.")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    return Credentials.from_service_account_info(info, scopes=scopes)
-
-# ===================== 메인 =====================
 def main():
     log("[MAIN] start")
 
