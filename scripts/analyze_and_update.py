@@ -275,14 +275,72 @@ def _strip_col(df: pd.DataFrame, col: str):
         df[col] = df[col].astype(str).map(lambda x: str(x).replace("\u3000"," ").strip())
     return df
 
+
+def _strip_col(df: pd.DataFrame, col: str):
+    if col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+
+
 def agg_all_stats(df: pd.DataFrame):
-    """df(data 시트)로부터 '전국/광역/서울/구/압구정동' 카운트, 중앙값, 평균"""
+    """월 파일(data 시트)에서 전국/서울/각 광역/각 구 단위 거래건수 + (억) 중앙값/평균을 계산."""
     counts = {col: 0 for col in SUMMARY_COLS}
     med = {col: "" for col in SUMMARY_COLS}
     mean = {col: "" for col in SUMMARY_COLS}
 
     if df is None or df.empty:
         return counts, med, mean
+
+    df = df.copy()
+    _strip_col(df, "광역")
+    _strip_col(df, "구")
+    _strip_col(df, "법정동")
+
+    counts["전국"] = int(len(df))
+    all_eok = eok_series(df.get("거래금액(만원)", []))
+    if not all_eok.empty:
+        med["전국"] = round2(all_eok.median())
+        mean["전국"] = round2(all_eok.mean())
+
+    # 광역 단위
+    if "광역" in df.columns:
+        for prov, sub in df.groupby("광역"):
+            prov = str(prov).strip()
+            if prov in counts:
+                counts[prov] += int(len(sub))
+                se = eok_series(sub.get("거래금액(만원)", []))
+                if not se.empty:
+                    med[prov] = round2(se.median())
+                    mean[prov] = round2(se.mean())
+
+    # 서울 + 구
+    seoul = df[df.get("광역", "") == "서울특별시"].copy()
+    counts["서울"] = int(len(seoul))
+    if len(seoul) > 0:
+        se = eok_series(seoul.get("거래금액(만원)", []))
+        if not se.empty:
+            med["서울"] = round2(se.median())
+            mean["서울"] = round2(se.mean())
+        if "구" in seoul.columns:
+            for gu, sub in seoul.groupby("구"):
+                gu = str(gu).strip()
+                if gu in counts:
+                    counts[gu] += int(len(sub))
+                    se2 = eok_series(sub.get("거래금액(만원)", []))
+                    if not se2.empty:
+                        med[gu] = round2(se2.median())
+                        mean[gu] = round2(se2.mean())
+
+    # 압구정동
+    ap = seoul[seoul.get("법정동", "") == "압구정동"]
+    counts["압구정동"] = int(len(ap))
+    if len(ap) > 0:
+        s = eok_series(ap.get("거래금액(만원)", []))
+        if not s.empty:
+            med["압구정동"] = round2(s.median())
+            mean["압구정동"] = round2(s.mean())
+
+    return counts, med, mean
+
 
 
 # ===================== 압구정동 탭(스냅샷 + 변동사항) =====================
@@ -528,53 +586,6 @@ def update_apgu_sheet(sh: gspread.Spreadsheet, df_all: pd.DataFrame, today: date
             _format_change_rows(ws, first_change_row, len(added_keys), n_cols, (0.0, 0.0, 1.0))
         if removed_keys:
             _format_change_rows(ws, first_change_row + len(added_keys), len(removed_keys), n_cols, (1.0, 0.0, 0.0))
-    df = df.copy()
-    _strip_col(df, "광역")
-    _strip_col(df, "구")
-    _strip_col(df, "법정동")
-
-    counts["전국"] = int(len(df))
-    all_eok = eok_series(df.get("거래금액(만원)", []))
-    if not all_eok.empty:
-        med["전국"] = round2(all_eok.median())
-        mean["전국"] = round2(all_eok.mean())
-
-    if "광역" in df.columns:
-        for prov, sub in df.groupby("광역"):
-            prov = str(prov).strip()
-            if prov in counts:
-                counts[prov] += int(len(sub))
-                se = eok_series(sub.get("거래금액(만원)", []))
-                if not se.empty:
-                    med[prov] = round2(se.median())
-                    mean[prov] = round2(se.mean())
-
-    seoul = df[df.get("광역", "") == "서울특별시"].copy()
-    counts["서울"] = int(len(seoul))
-    if len(seoul) > 0:
-        se = eok_series(seoul.get("거래금액(만원)", []))
-        if not se.empty:
-            med["서울"] = round2(se.median())
-            mean["서울"] = round2(se.mean())
-        if "구" in seoul.columns:
-            for gu, sub in seoul.groupby("구"):
-                gu = str(gu).strip()
-                if gu in counts:
-                    counts[gu] += int(len(sub))
-                    se2 = eok_series(sub.get("거래금액(만원)", []))
-                    if not se2.empty:
-                        med[gu] = round2(se2.median())
-                        mean[gu] = round2(se2.mean())
-
-    ap = seoul[seoul.get("법정동", "") == "압구정동"]
-    counts["압구정동"] = int(len(ap))
-    if len(ap) > 0:
-        s = eok_series(ap.get("거래금액(만원)", []))
-        if not s.empty:
-            med["압구정동"] = round2(s.median())
-            mean["압구정동"] = round2(s.mean())
-
-    return counts, med, mean
 
 # ===================== 월 시트(전국/서울) 생성/확보 =====================
 def list_month_sheets(sh: gspread.Spreadsheet):
@@ -779,14 +790,14 @@ def main():
         summary_rows.append((ym, counts, med, mean))
 
         # ---- 전국 월탭 ----
-        ws_nat = ensure_month_ws(sh, nat_title, "전국")
+        ws_nat = ensure_month_ws(sh, nat_title, '전국', ym)
         header_nat = ["날짜"] + NATION_REGIONS
         values_nat = {k: int(counts.get(k, 0)) for k in NATION_REGIONS if k != "총합계"}
         values_nat["총합계"] = int(counts.get("전국", 0))
         write_month_sheet(ws_nat, today_iso, header_nat, values_nat, sheet_id)
 
         # ---- 서울 월탭 ----
-        ws_seoul = ensure_month_ws(sh, seoul_title, "서울")
+        ws_seoul = ensure_month_ws(sh, seoul_title, '서울', ym)
         header_seoul = ["날짜"] + SEOUL_REGIONS
         values_seoul = {k: int(counts.get(k, 0)) for k in SEOUL_REGIONS if k != "총합계"}
         values_seoul["총합계"] = int(counts.get("서울", 0))
