@@ -166,6 +166,22 @@ def a1_col(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
+def ws_add_cols(ws: gspread.Worksheet, n: int):
+    resp = _retry(ws.add_cols, n)
+    _invalidate_cache(ws)
+    return resp
+
+def ensure_grid(ws: gspread.Worksheet, min_rows: int, min_cols: int):
+    """Ensure worksheet has at least min_rows/min_cols grid size before writing ranges."""
+    try:
+        if min_rows and ws.row_count < min_rows:
+            ws_add_rows(ws, int(min_rows - ws.row_count))
+        if min_cols and ws.col_count < min_cols:
+            ws_add_cols(ws, int(min_cols - ws.col_count))
+    except Exception:
+        pass
+
+
 def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     resp = _retry(ws.spreadsheet.values_batch_update, body=body)
