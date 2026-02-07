@@ -2,7 +2,7 @@ name: molit
 
 on:
   schedule:
-    - cron: '05 0 * * *'   # KST 09:05
+    - cron: "05 0 * * *" # KST 09:05
   workflow_dispatch: {}
 
 jobs:
@@ -10,22 +10,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CI: '1'
-      PYTHONUNBUFFERED: '1'
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
 
-      # 스크립트가 Drive에서 내려받아 임시 저장할 로컬 폴더 (이름만 artifacts일 뿐, 이전 run artifact랑 무관)
-      ARTIFACTS_DIR: 'cache'
-
-      MAX_SCAN_ROWS: '900'
-
+      # ====== 필수 ======
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # Drive 검색 (권장: 폴더ID)
-      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      # ====== Drive 입력 (권장: 상위폴더만) ======
+      # 사용자가 준 링크: https://drive.google.com/drive/folders/1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E
+      DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
 
-      # 공유드라이브까지 모두 검색하려면 true
-      DRIVE_SUPPORTS_ALL_DRIVES: 'true'
+      # 공유드라이브면 true 필수
+      DRIVE_SUPPORTS_ALL_DRIVES: "true"
+
+      # (선택) 다운로드 저장 폴더
+      DRIVE_DOWNLOAD_DIR: "drive_downloads"
+
+      # (선택) 날짜 스캔 범위
+      MAX_SCAN_ROWS: "900"
 
     steps:
       - name: Checkout
@@ -34,19 +37,34 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # requirements.txt에 없더라도 실행에 필요한 최소 패키지 보강
+          pip install -U \
+            pandas openpyxl numpy \
+            gspread google-auth google-auth-oauthlib google-auth-httplib2
+
+      - name: Debug - list scripts
+        run: |
+          set -euxo pipefail
+          pwd
+          ls -al
+          ls -al scripts
+          python -c "import gspread, google.auth; print('deps OK')"
 
       - name: Run analyze & update (Drive -> Sheets)
         run: |
           set -euxo pipefail
           python scripts/analyze_and_update.py
 
-      - name: Upload logs (optional)
+      - name: Upload analyze logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -54,10 +72,3 @@ jobs:
           path: analyze_report/**
           if-no-files-found: warn
           retention-days: 3
-
-          env:
-  SHEET_ID: ${{ secrets.SHEET_ID }}
-  SA_JSON:  ${{ secrets.SA_JSON }}
-  DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
-  DRIVE_SUPPORTS_ALL_DRIVES: "true"
-
