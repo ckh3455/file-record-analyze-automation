@@ -2,32 +2,39 @@ name: analyze-and-update-sheets
 
 on:
   schedule:
-    - cron: "05 0 * * *"   # KST 09:05
-  workflow_dispatch:
+    - cron: '05 0 * * *'   # KST 09:05
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     env:
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-      TZ: "Asia/Seoul"
+      CI: '1'
+      PYTHONUNBUFFERED: '1'
+      TZ: Asia/Seoul
 
-      # === Required ===
+      # ✅ 시트 기록 대상
       SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON: ${{ secrets.SA_JSON }}
 
-      # === Drive source ===
+      # ✅ 서비스계정 JSON (네 레포 시크릿 이름이 GDRIVE_SA_JSON 이니까 여기서 SA_JSON으로 매핑)
+      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+
+      # ✅ Drive 폴더 (부모 폴더 ID 또는 아파트 폴더 ID)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
 
-      # === Shared Drive support ===
+      # ✅ 공유드라이브 지원
       DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
 
-      # Optional tuning
-      MAX_SCAN_ROWS: "900"
-      DOWNLOAD_DIR: "drive_files"
+      # ✅ "아파트" 하위폴더 자동 탐색 (부모 폴더를 넣어도 됨)
+      DRIVE_SUBFOLDER_NAME: '아파트'
+
+      # ✅ 다운받을 파일명 패턴: "아파트 202510.xlsx" 형태만
+      DRIVE_FILENAME_REGEX: '^아파트\\s+20\\d{4}(0[1-9]|1[0-2])\\.xlsx$'
+
+      # ✅ 몇 개월 처리할지
+      MONTHS_TO_PROCESS: '12'
 
     steps:
       - name: Checkout
@@ -36,29 +43,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Assert required env (no secrets output)
-        run: |
-          python - <<'PY'
-          import os
-          need = ["SHEET_ID", "SA_JSON", "DRIVE_FOLDER_ID", "DRIVE_SUPPORTS_ALL_DRIVES"]
-          missing = [k for k in need if not (os.environ.get(k) or "").strip()]
-          print({k: (k not in missing) for k in need})
-          if missing:
-              raise SystemExit("Missing env: " + ", ".join(missing))
-          PY
-
-      - name: Run analyzer (Drive -> Sheets)
+      - name: Run analyzer (Drive -> Local -> Sheets)
         run: |
           python scripts/analyze_and_update.py
 
-      - name: Upload analyze report
+      - name: Upload analyze log
         if: always()
         uses: actions/upload-artifact@v4
         with:
