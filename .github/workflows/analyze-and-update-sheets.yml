@@ -2,29 +2,33 @@ name: analyze-and-update-sheets
 
 on:
   schedule:
-    - cron: '10 0 * * *'   # KST 09:10
+    - cron: '05 0 * * *'   # KST 09:05
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CI: '1'
-      PYTHONUNBUFFERED: '1'
-      TZ: Asia/Seoul
+    timeout-minutes: 45
 
-      # secrets 매핑 (중요)
+    env:
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
+      TZ: "Asia/Seoul"
+
+      # Google Sheet 기록 대상
       SHEET_ID: ${{ secrets.SHEET_ID }}
+
+      # ✅ 서비스계정 JSON (너 레포 시크릿 이름이 GDRIVE_SA_JSON 이므로 여기서 SA_JSON으로 매핑)
       SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
 
-      # Drive (아파트 폴더 ID)
+      # ✅ 아파트 폴더 “자체”의 ID (너가 만든 시크릿)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+
+      # ✅ 공유드라이브 대응
       DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
 
-      # optional
-      MAX_SCAN_ROWS: '900'
-      DRIVE_CACHE_DIR: '_drive_cache'
+      # (선택) 로그 더 보고 싶으면 1
+      DEBUG: "1"
 
     steps:
       - name: Checkout
@@ -33,26 +37,26 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug env presence (no secrets print)
+      - name: Preflight env check
         run: |
           python - <<'PY'
           import os, sys
           need = ["SHEET_ID","SA_JSON","DRIVE_FOLDER_ID","DRIVE_SUPPORTS_ALL_DRIVES"]
           miss = [k for k in need if not os.environ.get(k)]
-          print("env present:", {k: bool(os.environ.get(k)) for k in need})
+          print("env:", {k: bool(os.environ.get(k)) for k in need})
           if miss:
-            print("Missing env:", ", ".join(miss))
+            print("Missing env:", ",".join(miss))
             sys.exit(1)
           PY
 
-      - name: Run analyze & update sheets (Drive -> Sheets)
+      - name: Run analyzer (Drive -> Local -> Sheets)
         run: |
           python scripts/analyze_and_update.py
 
