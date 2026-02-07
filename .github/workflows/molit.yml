@@ -2,7 +2,7 @@ name: molit
 
 on:
   schedule:
-    - cron: '05 0 * * *'   # KST 09:05
+    - cron: '05 0 * * *'   # UTC 00:05 = KST 09:05
   workflow_dispatch: {}
 
 jobs:
@@ -25,35 +25,66 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver
-          echo "CHROME_BIN=/usr/bin/chromium-browser" >> "$GITHUB_ENV"
-          echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> "$GITHUB_ENV"
+          # ubuntu-latest에서 chromium-browser 패키지가 없는 경우가 있어 chromium도 함께 시도
+          sudo apt-get install -y chromium-browser chromium-chromedriver || sudo apt-get install -y chromium chromium-driver
+          # 가능한 경로를 순서대로 잡음
+          if [ -x /usr/bin/chromium-browser ]; then
+            echo "CHROME_BIN=/usr/bin/chromium-browser" >> "$GITHUB_ENV"
+          elif [ -x /usr/bin/chromium ]; then
+            echo "CHROME_BIN=/usr/bin/chromium" >> "$GITHUB_ENV"
+          else
+            echo "Chromium not found" >&2
+            exit 1
+          fi
+
+          if [ -x /usr/bin/chromedriver ]; then
+            echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> "$GITHUB_ENV"
+          elif [ -x /usr/bin/chromium-driver ]; then
+            echo "CHROMEDRIVER_BIN=/usr/bin/chromium-driver" >> "$GITHUB_ENV"
+          else
+            echo "Chromedriver not found" >&2
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Debug - list xlsx
-        run: |
-        pwd
-        ls -al
-        find . -maxdepth 4 -type f -name "*.xlsx" -print
-        ls -al output || true
-        ls -al artifacts || true
-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Pre-debug (before run) - list dirs
+        run: |
+          set -euxo pipefail
+          pwd
+          ls -al
+          ls -al output || true
+          ls -al artifacts || true
+
       - name: Run crawler & preprocess
         run: |
+          set -euxo pipefail
           python scripts/rt_allinone.py
+
+      - name: Post-debug (after run) - find xlsx
+        run: |
+          set -euxo pipefail
+          echo "=== find xlsx (maxdepth 6) ==="
+          find . -maxdepth 6 -type f -name "*.xlsx" -print
+          echo "=== list output/ ==="
+          ls -al output || true
+          echo "=== list artifacts/ ==="
+          ls -al artifacts || true
 
       - name: Upload artifacts (processed xlsx)
         uses: actions/upload-artifact@v4
         with:
           name: molit-xlsx
-          path: output/*.xlsx
+          # 하위 폴더 포함해서 업로드(실제로 output/ 아래에 폴더가 생기는 경우를 커버)
+          path: output/**/*.xlsx
           if-no-files-found: error
+          # 레포 최대치보다 큰 값은 자동으로 깎이니, 아예 3으로 명시(원하면 조정)
+          retention-days: 3
