@@ -2,8 +2,8 @@ name: analyze-and-update-sheets
 
 on:
   schedule:
-    - cron: '05 0 * * *'   # KST 09:05
-  workflow_dispatch: {}
+    - cron: "05 0 * * *"   # KST 09:05
+  workflow_dispatch:
 
 jobs:
   run:
@@ -11,24 +11,23 @@ jobs:
     timeout-minutes: 45
 
     env:
-      CI: '1'
-      PYTHONUNBUFFERED: '1'
-      TZ: Asia/Seoul
+      CI: "1"
+      PYTHONUNBUFFERED: "1"
+      TZ: "Asia/Seoul"
 
       # === Required ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # === Drive source (Recommended) ===
-      # "아파트" 폴더 자체 ID를 쓰면 가장 확실함
+      # === Drive source ===
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
 
-      # Shared Drive/공유드라이브에서 안 잡히면 true로 바꿔서 시도
+      # === Shared Drive support ===
       DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
 
       # Optional tuning
-      MAX_SCAN_ROWS: '900'
-      DOWNLOAD_DIR: 'drive_files'
+      MAX_SCAN_ROWS: "900"
+      DOWNLOAD_DIR: "drive_files"
 
     steps:
       - name: Checkout
@@ -37,26 +36,23 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 값 노출 없이 "주입 여부"만 확인
-      - name: Assert required env
+      - name: Assert required env (no secrets output)
         run: |
           python - <<'PY'
-import os
-def ok(k): return bool(os.environ.get(k,"").strip())
-need = ["SA_JSON","SHEET_ID","DRIVE_FOLDER_ID"]
-print({k: ok(k) for k in need})
-missing = [k for k in need if not ok(k)]
-if missing:
-  raise SystemExit("Missing env: " + ", ".join(missing))
-print("OK: required env present")
-PY
+          import os
+          need = ["SHEET_ID", "SA_JSON", "DRIVE_FOLDER_ID", "DRIVE_SUPPORTS_ALL_DRIVES"]
+          missing = [k for k in need if not (os.environ.get(k) or "").strip()]
+          print({k: (k not in missing) for k in need})
+          if missing:
+              raise SystemExit("Missing env: " + ", ".join(missing))
+          PY
 
       - name: Run analyzer (Drive -> Sheets)
         run: |
