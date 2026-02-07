@@ -2,7 +2,7 @@ name: analyze-and-update-sheets
 
 on:
   schedule:
-    - cron: '05 0 * * *'   # KST 09:05
+    - cron: '05 0 * * *'  # KST 09:05
   workflow_dispatch: {}
 
 jobs:
@@ -10,25 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
+      CI: '1'
+      PYTHONUNBUFFERED: '1'
       TZ: Asia/Seoul
 
-      # ===== Sheets update target =====
+      # Sheets 기록 대상
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # ===== Drive source (IMPORTANT) =====
-      DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
-      DRIVE_SUBFOLDER_NAME: "아파트"
-      DRIVE_SUPPORTS_ALL_DRIVES: "true"   # 공유드라이브/공유항목이면 켜두는게 안전
-
-      # 옵션: 파일명 패턴이 다르면 여기서 조정(스크립트가 지원하는 경우)
-      # DRIVE_FILENAME_PREFIX: "아파트 "
-      # DRIVE_EXT: ".xlsx"
-
-      # 스캔 범위(너 스크립트 기본 900)
-      MAX_SCAN_ROWS: "900"
+      # Drive 입력 폴더(아파트 파일 폴더)
+      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      DRIVE_SUPPORTS_ALL_DRIVES: 'true'
 
     steps:
       - name: Checkout
@@ -37,14 +29,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run analyze & update (Drive -> Sheets)
+      - name: Run analyzer (Drive -> Sheets)
         run: |
           python scripts/analyze_and_update.py
 
@@ -54,5 +46,4 @@ jobs:
         with:
           name: analyze-report
           path: analyze_report/**
-          if-no-files-found: warn
-          retention-days: 3
+          if-no-files-found: ignore
