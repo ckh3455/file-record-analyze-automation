@@ -33,6 +33,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Debug - list xlsx
+        run: |
+        pwd
+        ls -al
+        find . -maxdepth 4 -type f -name "*.xlsx" -print
+        ls -al output || true
+        ls -al artifacts || true
+
 
       - name: Install deps
         run: |
