@@ -487,7 +487,7 @@ def find_drive_folder_id(drive) -> str:
     우선순위:
     1) DRIVE_FOLDER_ID (아파트 폴더 직접)
     2) DRIVE_PARENT_FOLDER_ID + DRIVE_SUBFOLDER_NAME(기본: 아파트)
-    3) DRIVE_FOLDER_URL / DRIVE_PARENT_FOLDER_URL (호환)
+       - '아파트'가 폴더가 아니라 바로가기(shortcut)일 수 있어 shortcut도 함께 탐색
     """
     folder_id = _extract_drive_id(os.environ.get("DRIVE_FOLDER_ID", ""))
     if not folder_id:
@@ -503,15 +503,32 @@ def find_drive_folder_id(drive) -> str:
     if not parent_id:
         return ""
 
+    # 폴더 + 바로가기 둘 다 찾기
     q = (
         f"'{parent_id}' in parents and trashed=false and "
-        f"mimeType='application/vnd.google-apps.folder' and name='{sub_name}'"
+        f"(mimeType='application/vnd.google-apps.folder' or mimeType='application/vnd.google-apps.shortcut') and "
+        f"name='{sub_name}'"
     )
-    folders = _drive_list(drive, q=q, fields="id,name", page_size=50)
+
+    folders = _drive_list(
+        drive,
+        q=q,
+        fields="id,name,mimeType,shortcutDetails(targetId,targetMimeType)",
+        page_size=50
+    )
     if not folders:
         return ""
-    # 같은 이름이 여러개면 첫번째 사용
-    return folders[0]["id"]
+
+    f0 = folders[0]
+    if f0.get("mimeType") == "application/vnd.google-apps.shortcut":
+        sd = f0.get("shortcutDetails", {}) or {}
+        target_id = sd.get("targetId", "")
+        if target_id:
+            log(f"[drive] subfolder '{sub_name}' is shortcut -> targetId={target_id}")
+            return target_id
+
+    return f0["id"]
+
 
 def download_latest_12_months_from_drive(creds: Credentials) -> List[Path]:
     drive = build_drive_service(creds)
