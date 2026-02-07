@@ -1,8 +1,7 @@
-pandas
-numpy
-openpyxl
-selenium
-webdriver-manager
-gspread
-google-auth
-google-api-python-client>=2
+pandas>=2.0
+numpy>=2.0
+openpyxl>=3.1.2
+gspread>=6.0
+google-auth>=2.0
+google-api-python-client>=2.0
+google-auth-httplib2>=0.2.0
