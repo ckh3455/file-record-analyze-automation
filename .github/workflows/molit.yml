@@ -12,24 +12,19 @@ jobs:
     env:
       CI: '1'
       PYTHONUNBUFFERED: '1'
-      # 로컬 저장 위치(스크립트가 Drive에서 내려받아 여기에 저장)
-      ARTIFACTS_DIR: 'artifacts'
+
+      # 스크립트가 Drive에서 내려받아 임시 저장할 로컬 폴더 (이름만 artifacts일 뿐, 이전 run artifact랑 무관)
+      ARTIFACTS_DIR: 'cache'
+
       MAX_SCAN_ROWS: '900'
 
-      # 필수: 구글시트 업데이트 대상
       SHEET_ID: ${{ secrets.SHEET_ID }}
-
-      # 필수: 서비스계정 JSON (문자열)
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # 필수: Drive에서 xlsx를 찾을 기준(둘 중 하나만 써도 됨)
-      # 1) 특정 폴더 안에서만 찾고 싶으면 DRIVE_FOLDER_ID 사용(권장)
+      # Drive 검색 (권장: 폴더ID)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
 
-      # 2) 폴더ID 없이 전 Drive에서 이름 패턴 검색만 할 거면 비워도 됨
-      # DRIVE_QUERY: "name contains '아파트' and name contains '.xlsx'"
-
-      # 선택: 공유드라이브 사용시
+      # 공유드라이브까지 모두 검색하려면 true
       DRIVE_SUPPORTS_ALL_DRIVES: 'true'
 
     steps:
@@ -45,14 +40,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Debug - env & tree
-        run: |
-          set -euxo pipefail
-          pwd
-          ls -al
-          ls -al scripts
-          python -V
 
       - name: Run analyze & update (Drive -> Sheets)
         run: |
