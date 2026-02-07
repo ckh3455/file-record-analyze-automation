@@ -12,10 +12,16 @@ jobs:
     env:
       CI: '1'
       PYTHONUNBUFFERED: '1'
+      TZ: Asia/Seoul
+
+      # 기존 환경변수 유지(다운로더에서 쓸 수 있음)
       ARTIFACTS_ONLY: '1'
       DOWNLOAD_TIMEOUT: '30'
       CLICK_RETRY_MAX: '15'
       CLICK_RETRY_WAIT: '1'
+
+      # 다운로더가 OUTPUT_DIR 지원하면 이 값 사용 가능 (지원 안 해도 output dir 만들어둠)
+      OUTPUT_DIR: output
 
     steps:
       - name: Checkout
@@ -25,9 +31,10 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # ubuntu-latest에서 chromium-browser 패키지가 없는 경우가 있어 chromium도 함께 시도
+          # ubuntu-latest에서 패키지명이 달라질 수 있어 2개 경로를 모두 시도
           sudo apt-get install -y chromium-browser chromium-chromedriver || sudo apt-get install -y chromium chromium-driver
-          # 가능한 경로를 순서대로 잡음
+
+          # Chrome binary path 설정
           if [ -x /usr/bin/chromium-browser ]; then
             echo "CHROME_BIN=/usr/bin/chromium-browser" >> "$GITHUB_ENV"
           elif [ -x /usr/bin/chromium ]; then
@@ -37,6 +44,7 @@ jobs:
             exit 1
           fi
 
+          # Driver path 설정
           if [ -x /usr/bin/chromedriver ]; then
             echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> "$GITHUB_ENV"
           elif [ -x /usr/bin/chromium-driver ]; then
@@ -53,38 +61,53 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Pre-debug (before run) - list dirs
+      - name: Prepare output dir
+        run: |
+          set -euxo pipefail
+          # 과거 실수로 output이 '파일'로 존재했던 케이스 방지
+          if [ -f output ]; then
+            echo "WARN: 'output' exists as a file. Removing it."
+            rm -f output
+          fi
+          mkdir -p output
+          ls -ald output
+
+      - name: Pre-debug (before run)
         run: |
           set -euxo pipefail
           pwd
           ls -al
           ls -al output || true
-          ls -al artifacts || true
 
-      - name: Run crawler & preprocess
+      # ✅ 생성 주체를 download_realdata.py로 통일
+      - name: Run downloader & preprocess
         run: |
           set -euxo pipefail
-          python scripts/rt_allinone.py
+          python download_realdata.py
 
-      - name: Post-debug (after run) - find xlsx
+      - name: Post-debug (after run) - list outputs
         run: |
           set -euxo pipefail
           echo "=== find xlsx (maxdepth 6) ==="
           find . -maxdepth 6 -type f -name "*.xlsx" -print
           echo "=== list output/ ==="
           ls -al output || true
-          echo "=== list artifacts/ ==="
-          ls -al artifacts || true
+
+      - name: Assert xlsx exists under output/
+        run: |
+          set -euxo pipefail
+          cnt=$(find output -type f -name "*.xlsx" | wc -l)
+          echo "xlsx in output/: $cnt"
+          test "$cnt" -gt 0
 
       - name: Upload artifacts (processed xlsx)
         uses: actions/upload-artifact@v4
         with:
           name: molit-xlsx
-          # 하위 폴더 포함해서 업로드(실제로 output/ 아래에 폴더가 생기는 경우를 커버)
           path: output/**/*.xlsx
           if-no-files-found: error
-          # 레포 최대치보다 큰 값은 자동으로 깎이니, 아예 3으로 명시(원하면 조정)
           retention-days: 3
