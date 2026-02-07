@@ -12,22 +12,25 @@ jobs:
     env:
       CI: '1'
       PYTHONUNBUFFERED: '1'
-
-      # analyze_and_update.py가 읽을 로컬 루트
-      ARTIFACTS_DIR: artifacts
+      # 로컬 저장 위치(스크립트가 Drive에서 내려받아 여기에 저장)
+      ARTIFACTS_DIR: 'artifacts'
       MAX_SCAN_ROWS: '900'
 
-      # === secrets ===
+      # 필수: 구글시트 업데이트 대상
       SHEET_ID: ${{ secrets.SHEET_ID }}
+
+      # 필수: 서비스계정 JSON (문자열)
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # Drive 폴더 (권장: ID)
+      # 필수: Drive에서 xlsx를 찾을 기준(둘 중 하나만 써도 됨)
+      # 1) 특정 폴더 안에서만 찾고 싶으면 DRIVE_FOLDER_ID 사용(권장)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-      # ID 없으면 이름으로 찾음(동명이면 위험)
-      DRIVE_FOLDER_NAME: ${{ vars.DRIVE_FOLDER_NAME || '아파트' }}
 
-      # 몇 개월치 다운로드/반영할지
-      DRIVE_MAX_MONTHS: '12'
+      # 2) 폴더ID 없이 전 Drive에서 이름 패턴 검색만 할 거면 비워도 됨
+      # DRIVE_QUERY: "name contains '아파트' and name contains '.xlsx'"
+
+      # 선택: 공유드라이브 사용시
+      DRIVE_SUPPORTS_ALL_DRIVES: 'true'
 
     steps:
       - name: Checkout
@@ -38,30 +41,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Fix directories (prevent "output is a file")
-        run: |
-          set -euxo pipefail
-          rm -f output
-          mkdir -p output
-          mkdir -p artifacts/output
-          mkdir -p analyze_report
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Analyze & update (Drive -> local -> Sheets)
+      - name: Debug - env & tree
+        run: |
+          set -euxo pipefail
+          pwd
+          ls -al
+          ls -al scripts
+          python -V
+
+      - name: Run analyze & update (Drive -> Sheets)
         run: |
           set -euxo pipefail
           python scripts/analyze_and_update.py
 
-      - name: Upload logs
+      - name: Upload logs (optional)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: molit-logs
-          path: |
-            analyze_report/**
-            artifacts/**
+          name: analyze-report
+          path: analyze_report/**
           if-no-files-found: warn
           retention-days: 3
