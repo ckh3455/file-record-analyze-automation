@@ -26,31 +26,36 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
-          # Drive API 사용 + Sheets 업데이트 필수
+          # Drive API / Sheets API (googleapiclient) 확실히 설치
           pip install -U google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          pip install -U pandas openpyxl numpy gspread google-auth requests
+          pip install -U gspread google-auth pandas openpyxl numpy requests
 
-      - name: Run analyze_and_update (Drive -> Local -> Sheets)
+      - name: Run analyze_and_update.py (Drive -> Sheets)
         env:
           CI: "1"
           PYTHONUNBUFFERED: "1"
 
+          # 너 레포 시크릿 이름 그대로 사용
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          # ★ 여기 중요: 레포 시크릿 이름이 GDRIVE_SA_JSON 이므로 SA_JSON에 매핑
+
+          # ★ analyze_and_update.py가 SA_JSON을 읽는 구조라면 이렇게 매핑해야 함
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
 
-          # 사용자가 준 상위 폴더(공유드라이브 폴더)
+          # 너가 준 "부동산자료" 폴더 ID (공유드라이브/공유폴더)
           DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
+
+          # 공유드라이브 대응 옵션(코드가 읽어야 함)
           DRIVE_SUPPORTS_ALL_DRIVES: "true"
 
+          # 로컬 임시 다운로드 폴더(코드가 사용하면 사용)
           DRIVE_DOWNLOAD_DIR: "drive_downloads"
-          MAX_SCAN_ROWS: "900"
         run: |
           set -euxo pipefail
-          echo "ENV CHECK:"
-          echo "SHEET_ID=${SHEET_ID:0:6}****"
-          echo "SA_JSON_LEN=${#SA_JSON}"
-          echo "DRIVE_PARENT_FOLDER_ID=$DRIVE_PARENT_FOLDER_ID"
+          echo "=== ENV CHECK ==="
+          echo "SHEET_ID set? -> $([ -n "${SHEET_ID}" ] && echo YES || echo NO)"
+          echo "SA_JSON length -> ${#SA_JSON}"
+          echo "DRIVE_PARENT_FOLDER_ID -> ${DRIVE_PARENT_FOLDER_ID}"
+          echo "DRIVE_SUPPORTS_ALL_DRIVES -> ${DRIVE_SUPPORTS_ALL_DRIVES}"
           python scripts/analyze_and_update.py
 
       - name: Upload analyze logs
