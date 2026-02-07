@@ -13,19 +13,21 @@ jobs:
       CI: '1'
       PYTHONUNBUFFERED: '1'
 
-      # === your secrets / vars ===
+      # analyze_and_update.py가 읽을 로컬 루트
+      ARTIFACTS_DIR: artifacts
+      MAX_SCAN_ROWS: '900'
+
+      # === secrets ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # Drive에서 "아파트 YYYYMM.xlsx"를 찾을 위치
-      # 1) 폴더ID가 있으면 이걸 권장 (가장 확실)
+      # Drive 폴더 (권장: ID)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-      # 2) 폴더ID가 없으면 폴더명으로 탐색(동명이 폴더가 있으면 위험)
+      # ID 없으면 이름으로 찾음(동명이면 위험)
       DRIVE_FOLDER_NAME: ${{ vars.DRIVE_FOLDER_NAME || '아파트' }}
 
-      # 분석 스크립트가 읽을 로컬 루트
-      ARTIFACTS_DIR: artifacts
-      MAX_SCAN_ROWS: '900'
+      # 몇 개월치 다운로드/반영할지
+      DRIVE_MAX_MONTHS: '12'
 
     steps:
       - name: Checkout
@@ -36,7 +38,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Fix output/artifacts directories (prevent "output is a file")
+      - name: Fix directories (prevent "output is a file")
         run: |
           set -euxo pipefail
           rm -f output
@@ -49,30 +51,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download monthly "아파트 YYYYMM.xlsx" from Google Drive to artifacts/output
-        run: |
-          set -euxo pipefail
-          python scripts/drive_fetch_apartment_xlsx.py
-
-      - name: Debug - list downloaded xlsx
-        run: |
-          set -euxo pipefail
-          echo "=== artifacts tree ==="
-          find artifacts -maxdepth 4 -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
-          echo "=== artifacts/output ==="
-          ls -al artifacts/output || true
-
-      - name: Analyze & update Google Sheet
+      - name: Analyze & update (Drive -> local -> Sheets)
         run: |
           set -euxo pipefail
           python scripts/analyze_and_update.py
 
-      - name: Upload artifacts (downloaded xlsx + logs)
+      - name: Upload logs
         uses: actions/upload-artifact@v4
         with:
-          name: molit-xlsx-and-logs
+          name: molit-logs
           path: |
-            artifacts/**/*.xlsx
             analyze_report/**
+            artifacts/**
           if-no-files-found: warn
           retention-days: 3
