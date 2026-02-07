@@ -2,7 +2,7 @@ name: molit
 
 on:
   schedule:
-    - cron: '05 0 * * *'   # UTC 00:05 = KST 09:05
+    - cron: '05 0 * * *'   # KST 09:05
   workflow_dispatch: {}
 
 jobs:
@@ -12,16 +12,20 @@ jobs:
     env:
       CI: '1'
       PYTHONUNBUFFERED: '1'
-      TZ: Asia/Seoul
 
-      # analyze_and_update.py 용
-      ARTIFACTS_DIR: artifacts
+      # === your secrets / vars ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # Drive pull 용 (둘 중 하나만 세팅)
+      # Drive에서 "아파트 YYYYMM.xlsx"를 찾을 위치
+      # 1) 폴더ID가 있으면 이걸 권장 (가장 확실)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-      # DRIVE_FOLDER_NAME: "아파트"
+      # 2) 폴더ID가 없으면 폴더명으로 탐색(동명이 폴더가 있으면 위험)
+      DRIVE_FOLDER_NAME: ${{ vars.DRIVE_FOLDER_NAME || '아파트' }}
+
+      # 분석 스크립트가 읽을 로컬 루트
+      ARTIFACTS_DIR: artifacts
+      MAX_SCAN_ROWS: '900'
 
     steps:
       - name: Checkout
@@ -32,32 +36,43 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Fix output/artifacts directories (prevent "output is a file")
+        run: |
+          set -euxo pipefail
+          rm -f output
+          mkdir -p output
+          mkdir -p artifacts/output
+          mkdir -p analyze_report
+
       - name: Install deps
         run: |
-          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Drive API 클라이언트가 requirements.txt에 없으면 추가 설치
-          pip install google-api-python-client
 
-      - name: Prepare dirs
+      - name: Download monthly "아파트 YYYYMM.xlsx" from Google Drive to artifacts/output
         run: |
           set -euxo pipefail
-          rm -rf artifacts || true
-          mkdir -p artifacts analyze_report
+          python scripts/drive_fetch_apartment_xlsx.py
 
-      - name: Pull latest xlsx from Google Drive
+      - name: Debug - list downloaded xlsx
         run: |
           set -euxo pipefail
-          python scripts/pull_from_drive.py
-
-      - name: Debug - list artifacts
-        run: |
-          set -euxo pipefail
-          ls -al artifacts
-          find artifacts -maxdepth 2 -type f -name "*.xlsx" -print
+          echo "=== artifacts tree ==="
+          find artifacts -maxdepth 4 -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
+          echo "=== artifacts/output ==="
+          ls -al artifacts/output || true
 
       - name: Analyze & update Google Sheet
         run: |
           set -euxo pipefail
           python scripts/analyze_and_update.py
+
+      - name: Upload artifacts (downloaded xlsx + logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: molit-xlsx-and-logs
+          path: |
+            artifacts/**/*.xlsx
+            analyze_report/**
+          if-no-files-found: warn
+          retention-days: 3
