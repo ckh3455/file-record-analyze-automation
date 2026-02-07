@@ -2,25 +2,33 @@ name: analyze-and-update-sheets
 
 on:
   schedule:
-    - cron: '05 0 * * *'  # KST 09:05
+    - cron: '05 0 * * *'   # KST 09:05
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+
     env:
       CI: '1'
       PYTHONUNBUFFERED: '1'
       TZ: Asia/Seoul
 
-      # Sheets 기록 대상
+      # === Required ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SA_JSON: ${{ secrets.SA_JSON }}
 
-      # Drive 입력 폴더(아파트 파일 폴더)
+      # === Drive source (Recommended) ===
+      # "아파트" 폴더 자체 ID를 쓰면 가장 확실함
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-      DRIVE_SUPPORTS_ALL_DRIVES: 'true'
+
+      # Shared Drive/공유드라이브에서 안 잡히면 true로 바꿔서 시도
+      DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
+
+      # Optional tuning
+      MAX_SCAN_ROWS: '900'
+      DOWNLOAD_DIR: 'drive_files'
 
     steps:
       - name: Checkout
@@ -36,6 +44,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 값 노출 없이 "주입 여부"만 확인
+      - name: Assert required env
+        run: |
+          python - <<'PY'
+import os
+def ok(k): return bool(os.environ.get(k,"").strip())
+need = ["SA_JSON","SHEET_ID","DRIVE_FOLDER_ID"]
+print({k: ok(k) for k in need})
+missing = [k for k in need if not ok(k)]
+if missing:
+  raise SystemExit("Missing env: " + ", ".join(missing))
+print("OK: required env present")
+PY
+
       - name: Run analyzer (Drive -> Sheets)
         run: |
           python scripts/analyze_and_update.py
@@ -46,4 +68,5 @@ jobs:
         with:
           name: analyze-report
           path: analyze_report/**
-          if-no-files-found: ignore
+          if-no-files-found: warn
+          retention-days: 3
