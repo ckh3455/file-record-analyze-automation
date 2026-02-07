@@ -1,34 +1,38 @@
 name: analyze-and-update-sheets
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 23 * * *"  # KST 08:30
-
-permissions:
-  contents: read
-  actions: read
+    - cron: '05 0 * * *'   # KST 09:05
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 30
     env:
       CI: "1"
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Seoul
+
+      # ===== Sheets update target =====
       SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
-      SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
-      SRC_REPO: ckh3455/file-automation
-      SRC_WORKFLOW: molit.yml
-      SRC_ARTIFACT: molit-xlsx
+      SA_JSON: ${{ secrets.SA_JSON }}
+
+      # ===== Drive source (IMPORTANT) =====
+      DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
+      DRIVE_SUBFOLDER_NAME: "아파트"
+      DRIVE_SUPPORTS_ALL_DRIVES: "true"   # 공유드라이브/공유항목이면 켜두는게 안전
+
+      # 옵션: 파일명 패턴이 다르면 여기서 조정(스크립트가 지원하는 경우)
+      # DRIVE_FILENAME_PREFIX: "아파트 "
+      # DRIVE_EXT: ".xlsx"
+
+      # 스캔 범위(너 스크립트 기본 900)
+      MAX_SCAN_ROWS: "900"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,200 +44,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # === 아티팩트 다운로드 + 파일명 날짜(YYMMDD) = 오늘(KST) 검사 + (백업) 수정시간 12h 신선도 ===
-      - name: Download artifacts with filename-date freshness guard (retry every 15 min)
-        id: fetch
-        shell: bash
-        env:
-          MAX_TRIES: "6"
-          RETRY_MIN: "15"
+      - name: Run analyze & update (Drive -> Sheets)
         run: |
-          set -euo pipefail
+          python scripts/analyze_and_update.py
 
-          echo "${SOURCE_REPO_PAT}" | gh auth login --with-token
-
-          rm -rf artifacts
-          mkdir -p artifacts
-
-          try=1
-          while :; do
-            echo "::group::[try ${try}] find latest SUCCESS run"
-            RUN_JSON="$(gh run list -R "${SRC_REPO}" \
-              --workflow "${SRC_WORKFLOW}" \
-              --status success \
-              --json databaseId,displayTitle,updatedAt \
-              --limit 1)"
-            echo "RUN_JSON=${RUN_JSON}"
-            RUN_ID="$(echo "${RUN_JSON}" | jq -r '.[0].databaseId // empty')"
-            RUN_UPDATED="$(echo "${RUN_JSON}" | jq -r '.[0].updatedAt // empty')"
-            RUN_TITLE="$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle // empty')"
-            echo "RUN_ID=${RUN_ID}"
-            echo "RUN_UPDATED(UTC)=${RUN_UPDATED}"
-            echo "RUN_TITLE=${RUN_TITLE}"
-            echo "::endgroup::"
-
-            rc=0
-            if [ -z "${RUN_ID}" ]; then
-              echo "::warning::No successful run found yet."
-              rc=66
-            else
-              echo "::group::List artifacts of the run"
-              ART_NAMES="$(gh api repos/${SRC_REPO}/actions/runs/${RUN_ID}/artifacts --jq '.artifacts[].name')"
-              echo "Artifacts on run ${RUN_ID}:"
-              echo "${ART_NAMES:-<none>}"
-              echo "::endgroup::"
-
-              rm -rf artifacts/*
-
-              # 1) 정확 이름 우선 다운로드
-              if [ -n "${ART_NAMES}" ] && grep -Fxq "${SRC_ARTIFACT}" <<<"${ART_NAMES}"; then
-                echo "::group::Download artifact (exact): ${SRC_ARTIFACT}"
-                if ! gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${SRC_ARTIFACT}" -D artifacts; then
-                  echo "::warning::Exact artifact download failed."
-                  rc=66
-                fi
-                echo "::endgroup::"
-              else
-                echo "::notice::'${SRC_ARTIFACT}' not found. Fallback: download all artifacts of the run."
-                if [ -n "${ART_NAMES}" ]; then
-                  while IFS= read -r NAME; do
-                    [ -z "${NAME}" ] && continue
-                    echo "::group::Download artifact (fallback): ${NAME}"
-                    gh run download "${RUN_ID}" -R "${SRC_REPO}" -n "${NAME}" -D artifacts || true
-                    echo "::endgroup::"
-                  done <<< "${ART_NAMES}"
-                else
-                  echo "::warning::This run has zero artifacts."
-                  rc=66
-                fi
-              fi
-
-              XLSX_COUNT="$(find artifacts -type f -name '*.xlsx' | wc -l | tr -d ' ')"
-              echo "xlsx files downloaded: ${XLSX_COUNT}"
-              if [ "${XLSX_COUNT}" -eq 0 ]; then
-                rc=66
-              fi
-            fi
-
-            # ✅ 1순위: 파일명 날짜(YYMMDD) = 오늘(KST) 검사 + 상세 로그
-            if [ ${rc} -eq 0 ]; then
-              echo "::group::Filename date check (YYMMDD == today KST)"
-              TODAY_YMD="$(date +'%y%m%d')"   # TZ=Asia/Seoul in job env
-              echo "TODAY_YMD(KST)=${TODAY_YMD}"
-              MATCH=0
-              # 상세 비교 로그
-              while IFS= read -r f; do
-                base="$(basename "$f")"
-                # 파일명에서 6자리 숫자 토큰 추출 (여러 개면 모두 비교)
-                ymd_tokens="$(echo "$base" | grep -Eo '[0-9]{6}' || true)"
-                if [ -z "$ymd_tokens" ]; then
-                  echo "NO-DATE  | $base"
-                  continue
-                fi
-                hit="NO"
-                while IFS= read -r tok; do
-                  [ -z "$tok" ] && continue
-                  if [ "$tok" = "$TODAY_YMD" ]; then
-                    hit="YES"
-                    MATCH=$((MATCH+1))
-                  fi
-                done <<< "$ymd_tokens"
-                if [ "$hit" = "YES" ]; then
-                  echo "MATCH    | $base (tokens: $ymd_tokens)"
-                else
-                  echo "MISMATCH | $base (tokens: $ymd_tokens)"
-                fi
-              done < <(find artifacts -type f -name '*.xlsx' | sort)
-
-              if [ "$MATCH" -gt 0 ]; then
-                echo "RESULT: Filename-date MATCH ✓  (matched_files=${MATCH})"
-                rc=0
-              else
-                echo "RESULT: No filename-date match → will use freshness fallback."
-                rc=1
-              fi
-              echo "::endgroup::"
-            fi
-
-            # 🔁 2순위 백업: 수정시간 신선도(<=12h, KST) + 상세 로그
-            if [ ${rc} -ne 0 ]; then
-              echo "::group::Freshness fallback (<=12h, KST)"
-              KST_NOW_SEC=$(( $(date -u +%s) + 9*3600 ))
-              mapfile -t LINES < <(find artifacts -type f -name '*.xlsx' -printf '%T@ %p\n' | sort -n)
-              if [ "${#LINES[@]}" -eq 0 ]; then
-                echo "No .xlsx → stale"
-                rc=66
-              else
-                echo "Last 10 files by mtime (KST):"
-                for line in "${LINES[@]: -10}"; do
-                  ts="${line%% *}"; file="${line#* }"
-                  ts_int="${ts%.*}"
-                  kst_time="$(date -d "@$((ts_int-9*3600))" -u +'%Y-%m-%d %H:%M:%S')"
-                  # 위는 UTC 출력이라 보기가 애매하니 그냥 초로 나이 출력
-                  age_sec=$(( KST_NOW_SEC - ts_int ))
-                  echo "- ${file} | age_sec=${age_sec}"
-                done
-                LAST_LINE="${LINES[-1]}"
-                LAST_TS_FLOAT="${LAST_LINE%% *}"
-                LAST_FILE="${LAST_LINE#* }"
-                LAST_TS_INT="${LAST_TS_FLOAT%.*}"
-                LAST_AGE_SEC=$(( KST_NOW_SEC - LAST_TS_INT ))
-                echo "latest file: ${LAST_FILE}"
-                echo "latest age sec: ${LAST_AGE_SEC}"
-                if [ "$LAST_AGE_SEC" -gt 43200 ]; then
-                  echo "RESULT: STALE (>12h) → retry"
-                  rc=66
-                else
-                  echo "RESULT: FRESH by age ✓"
-                  rc=0
-                fi
-              fi
-              echo "::endgroup::"
-            fi
-
-            if [ ${rc} -eq 0 ]; then
-              echo "Artifacts ready. Proceed."
-              break
-            fi
-
-            if [ ${try} -ge ${MAX_TRIES} ]; then
-              echo "::error::Not ready after ${try} tries."
-              exit 1
-            fi
-
-            echo "::notice::Retry in ${RETRY_MIN} minutes (next try: $((try+1))/${MAX_TRIES})."
-            sleep "$((RETRY_MIN*60))"
-            try=$((try+1))
-          done
-
-          echo "OK" > .fresh_ok
-
-      - name: List downloaded files
-        run: |
-          find artifacts -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort || true
-
-      - name: Run analysis & update
-        if: ${{ hashFiles('.fresh_ok') != '' }}
-        env:
-          ARTIFACTS_DIR: artifacts
-        run: |
-          python scripts/analyze_and_update.py \
-            --artifacts-dir artifacts \
-            --sheet-id "$SHEET_ID"
-
-      - name: Preview analyze_report (always)
-        if: always()
-        run: |
-          echo "== analyze_report tree =="; ls -alR analyze_report || true
-          echo "---- latest.log (head) ----"; sed -n '1,220p' analyze_report/latest.log || true
-          echo "---- run logs list ----"; ls -al analyze_report/run-*.log 2>/dev/null || true
-          echo "---- where_written.txt ----"; cat analyze_report/where_written.txt 2>/dev/null || true
-
-      - name: Upload report
+      - name: Upload analyze report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: analyze-report
           path: analyze_report/**
-          retention-days: 14
-          compression-level: 6
+          if-no-files-found: warn
+          retention-days: 3
