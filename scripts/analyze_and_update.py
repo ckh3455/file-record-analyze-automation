@@ -2,40 +2,42 @@
 from __future__ import annotations
 
 """
-scripts/analyze_and_update.py (전체본/최종본: Drive -> Local(cache) -> Sheets)
+analyze_and_update.py (Drive -> Local -> Sheets) 단일 전체본
 
-✅ 이번 수정의 목표(사용자 요구사항 반영)
-- "아티팩트(깃헙 run artifact)에서 파일을 찾는 일"이 **절대 발생하지 않게** 함
-  → 이 스크립트는 오직 **Google Drive에서 '아파트 YYYYMM.xlsx'** 를 찾아 내려받아 처리
-- 시트 구조/분류 로직(전국/서울 월탭, 거래요약, 압구정동 탭)은 **바꾸지 않음**
-- 파일을 찾는 방식만 변경: Drive에서 월별 파일을 찾아(최근 12개월) 처리
+요구사항 반영(핵심):
+1) artifacts 폴더/깃허브 액션 아티팩트 의존 완전 제거
+   - 구글 드라이브(공유드라이브 포함)에서 '아파트 YYYYMM.xlsx'만 찾아 다운로드 후 처리
+2) '오늘 날짜' 라벨을 항상 ISO("YYYY-MM-DD") 문자열 그대로 기록
+   - values_batch_update: valueInputOption="RAW" 사용 (USER_ENTERED 금지)
+3) 날짜 행 탐색: A2:A{MAX_SCAN_ROWS} 고정 스캔
+   - 같은 날짜 있으면 update, 없으면 첫 빈행에 append
+4) 쓰기 직후 verify 로그
+5) 집계 시 strip() 적용(특수공백 포함)
+6) 압구정동 탭 업데이트에서 NaN/Inf JSON 에러 방지(값 안전 문자열화)
 
-✅ 추가 안정화
-- Drive가 공유드라이브(Shared Drive)인 경우에도 검색되도록
-  corpora=allDrives + supportsAllDrives/includeItemsFromAllDrives 적용
-- googleapiclient 미설치 오류 방지(요구사항: requirements.txt에 google-api-python-client 필요)
-- "[apgu] Out of range float values are not JSON compliant" 방지:
-  batchUpdate 요청(request body)을 JSON-safe로 정리( NaN/inf 제거 )
-
-환경변수(GitHub Actions)
+환경변수:
 - SHEET_ID: 대상 구글시트 ID
 - SA_JSON 또는 SA_PATH: 서비스계정 JSON(문자열 또는 파일경로)
 
-Drive 입력(택 1 권장)
-- DRIVE_FOLDER_ID: '아파트 YYYYMM.xlsx' 파일이 들어있는 폴더ID (권장)
-- DRIVE_QUERY: Drive files.list 쿼리(고급 사용자용)
+Drive 입력:
+- DRIVE_FOLDER_ID (권장): '아파트 YYYYMM.xlsx'가 들어있는 폴더 ID
+- DRIVE_QUERY (옵션): 폴더ID 없이 Drive 검색 쿼리(Drive v3 q syntax)
+- DRIVE_SUPPORTS_ALL_DRIVES (기본 true): 공유드라이브 지원
+- DRIVE_DOWNLOAD_DIR (기본 'drive_downloads'): 다운로드 저장 경로
 
-Drive 옵션
-- DRIVE_SUPPORTS_ALL_DRIVES: "true"/"false" (기본 true 권장)
-- DRIVE_MAX_MONTHS: 기본 12
-- ARTIFACTS_DIR: 기본 'cache' (런타임 임시 폴더. GitHub artifact와 무관)
+기타:
+- MAX_SCAN_ROWS (기본 900)
 
-주의
-- GitHub Actions 워크플로우(YAML) 안에 남아있는 "find artifacts" 디버그 step은
-  스크립트와 무관하게 계속 찍힙니다. 스크립트 차원에서는 artifacts 다운로드를 절대 하지 않습니다.
+파일명 규칙(Drive에서 찾는 대상):
+- 정확히 '아파트 202510.xlsx' 형태를 우선(공백 1개)
+- 다만 현실에서 '아파트_202510.xlsx' 같은 변형이 있을 수 있어 보조 패턴도 허용(옵션)
 """
 
-import os, re, json, time, random, math, io
+import os
+import re
+import json
+import time
+import random
 from pathlib import Path
 from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional, Union
@@ -43,29 +45,24 @@ from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import pandas as pd
 import gspread
-from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
-
-# ✅ Drive API (requirements.txt에 google-api-python-client 필요)
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import AuthorizedSession
 
 # ===================== 설정 =====================
 LOG_DIR = Path("analyze_report")
-
-# 런타임 임시 폴더(이름만 artifacts일 뿐 GitHub run artifact와 무관).
-# 사용자 혼동 방지 위해 기본 cache 권장.
-ARTIFACTS_DIR = Path(os.environ.get("ARTIFACTS_DIR", "cache"))
+RUN_LOG = LOG_DIR / "latest.log"
 
 SUMMARY_SHEET_NAME = "거래요약"
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "900"))
 
-# Drive
+# Drive 관련
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 DRIVE_QUERY = os.environ.get("DRIVE_QUERY", "").strip()
 DRIVE_SUPPORTS_ALL_DRIVES = os.environ.get("DRIVE_SUPPORTS_ALL_DRIVES", "true").strip().lower() in ("1", "true", "yes", "y")
-DRIVE_MAX_MONTHS = int(os.environ.get("DRIVE_MAX_MONTHS", "12"))
+DRIVE_DOWNLOAD_DIR = Path(os.environ.get("DRIVE_DOWNLOAD_DIR", "drive_downloads"))
 
+# ===================== 컬럼/지역 =====================
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
     "강남구", "압구정동",
@@ -98,7 +95,6 @@ def _ensure_logdir():
         pass
 
 _ensure_logdir()
-RUN_LOG = LOG_DIR / "latest.log"
 
 def log(msg: str):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -131,37 +127,173 @@ def _retry(fn, *a, **kw):
                 continue
             raise
 
-# ===================== JSON-safe (NaN/inf 제거) =====================
-def _json_safe(obj):
-    """
-    googleapiclient는 allow_nan=False로 직렬화되는 경우가 있어 NaN/inf가 있으면 죽습니다.
-    batchUpdate 요청(requests) 등에 NaN/inf가 섞여도 안전하도록 정리합니다.
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, (str, int, bool)):
-        return obj
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-    if isinstance(obj, (np.floating,)):
-        v = float(obj)
-        if math.isnan(v) or math.isinf(v):
-            return 0.0
-        return v
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    return str(obj)
+# ===================== 인증 =====================
+def load_creds():
+    sa_json = os.environ.get("SA_JSON", "").strip()
+    sa_path = os.environ.get("SA_PATH", "").strip()
 
-# ===================== 이름/정규화/캐시 =====================
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", "", str(s or "").replace("\u3000", "").strip())
+    if sa_json:
+        info = json.loads(sa_json)
+    elif sa_path:
+        info = json.loads(Path(sa_path).read_text(encoding="utf-8"))
+    else:
+        raise RuntimeError("SA_JSON 또는 SA_PATH 환경변수가 필요합니다.")
 
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
+# ===================== Drive (googleapiclient 없이 HTTP) =====================
+DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+
+def drive_list_files(session: AuthorizedSession, q: str, page_size: int = 200) -> List[dict]:
+    """
+    Drive v3 files.list 를 HTTP로 호출.
+    공유드라이브까지 포함하려면 supportsAllDrives/includeItemsFromAllDrives를 true로.
+    """
+    files: List[dict] = []
+    page_token = None
+    params_base = {
+        "q": q,
+        "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,size,parents)",
+        "pageSize": str(page_size),
+    }
+    if DRIVE_SUPPORTS_ALL_DRIVES:
+        params_base["supportsAllDrives"] = "true"
+        params_base["includeItemsFromAllDrives"] = "true"
+        # corpora를 고정하면 누락될 수 있어 allDrives 권장
+        params_base["corpora"] = "allDrives"
+
+    while True:
+        params = dict(params_base)
+        if page_token:
+            params["pageToken"] = page_token
+        url = f"{DRIVE_API_BASE}/files"
+        r = session.get(url, params=params, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"Drive list failed: {r.status_code} {r.text[:500]}")
+        data = r.json()
+        files.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+def drive_download_file(session: AuthorizedSession, file_id: str, out_path: Path):
+    """
+    Drive v3 files.get?alt=media 다운로드
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{DRIVE_API_BASE}/files/{file_id}"
+    params = {"alt": "media"}
+    if DRIVE_SUPPORTS_ALL_DRIVES:
+        params["supportsAllDrives"] = "true"
+    r = session.get(url, params=params, stream=True, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive download failed: {r.status_code} {r.text[:500]}")
+    with out_path.open("wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+# ===================== 파일명(월) 파싱 =====================
+# Drive 파일명 기준: '아파트 202510.xlsx'
+APT_YYYYMM_RE = re.compile(r"^아파트[\s_]+(20\d{2})(0[1-9]|1[0-2])\.xlsx$", re.IGNORECASE)
+
+def yymm_from_yyyymm(yyyymm: str) -> str:
+    y = int(yyyymm[:4])
+    m = int(yyyymm[4:])
+    return f"{y%100:02d}/{m:02d}"
+
+def titles_from_yyyymm(yyyymm: str) -> Tuple[str, str, str]:
+    y = int(yyyymm[:4])
+    m = int(yyyymm[4:])
+    return (f"전국 {y}년 {m}월", f"서울 {y}년 {m}월", f"{y%100:02d}/{m:02d}")
+
+def pick_apt_month_files_from_drive(session: AuthorizedSession) -> Dict[str, dict]:
+    """
+    Drive에서 '아파트 YYYYMM.xlsx' 파일들을 찾아 (YYYYMM -> file meta) 매핑.
+    동일 월에 여러개면 modifiedTime 최신을 선택.
+    """
+    if DRIVE_FOLDER_ID:
+        q = f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
+        log(f"[drive] using DRIVE_FOLDER_ID, q={q}")
+        cand = drive_list_files(session, q=q, page_size=500)
+    else:
+        if not DRIVE_QUERY:
+            raise RuntimeError("DRIVE_FOLDER_ID(권장) 또는 DRIVE_QUERY 환경변수가 필요합니다.")
+        # 사용자가 준 쿼리 + 기본 trashed=false 강제
+        q = DRIVE_QUERY
+        if "trashed" not in q:
+            q = f"({q}) and trashed=false"
+        log(f"[drive] using DRIVE_QUERY, q={q}")
+        cand = drive_list_files(session, q=q, page_size=500)
+
+    best: Dict[str, dict] = {}
+    matched = 0
+
+    for f in cand:
+        name = (f.get("name") or "").strip()
+        m = APT_YYYYMM_RE.match(name)
+        if not m:
+            continue
+        matched += 1
+        yyyymm = f"{m.group(1)}{m.group(2)}"
+        prev = best.get(yyyymm)
+        if prev is None:
+            best[yyyymm] = f
+        else:
+            # modifiedTime 최신
+            if (f.get("modifiedTime") or "") > (prev.get("modifiedTime") or ""):
+                best[yyyymm] = f
+
+    log(f"[drive] listed={len(cand)} matched={matched} (pattern: 아파트 YYYYMM.xlsx) unique_months={len(best)}")
+    if not best:
+        hint = (
+            "Drive에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.\n"
+            "1) 서비스계정이 공유드라이브/폴더에 '뷰어 이상'으로 공유되어 있는지\n"
+            "2) DRIVE_FOLDER_ID가 '파일이 들어있는 폴더' ID가 맞는지\n"
+            "3) 파일명이 정확히 '아파트 202510.xlsx' 형태인지(밑줄/공백 포함)\n"
+            "4) 공유드라이브면 DRIVE_SUPPORTS_ALL_DRIVES=true 인지\n"
+        )
+        raise RuntimeError(hint)
+    return best
+
+def download_latest_12_months(session: AuthorizedSession) -> List[Path]:
+    """
+    Drive에서 월별 파일을 찾고, 최신 12개월(월 기준)만 로컬로 다운로드.
+    return: 로컬 xlsx 경로 리스트 (과거->현재 순)
+    """
+    best = pick_apt_month_files_from_drive(session)
+
+    # YYYYMM 정렬키
+    def key_yyyymm(k: str):
+        return (int(k[:4]), int(k[4:]))
+
+    # 최신 12개 선별 후 과거->현재로 정렬
+    yyyymm_sorted = sorted(best.keys(), key=key_yyyymm, reverse=True)[:12]
+    yyyymm_sorted = sorted(yyyymm_sorted, key=key_yyyymm)
+
+    log(f"[drive] months_to_download={yyyymm_sorted}")
+
+    DRIVE_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    out_paths: List[Path] = []
+    for yyyymm in yyyymm_sorted:
+        meta = best[yyyymm]
+        fid = meta["id"]
+        name = meta["name"]
+        out_path = DRIVE_DOWNLOAD_DIR / name
+        # 매번 overwrite
+        drive_download_file(session, fid, out_path)
+        sz = out_path.stat().st_size if out_path.exists() else 0
+        log(f"[drive] downloaded: {name} -> {out_path} size={sz}")
+        out_paths.append(out_path)
+
+    return out_paths
+
+# ===================== Sheets 유틸 =====================
 _WS_VALUES_CACHE: Dict[int, List[List[str]]] = {}
 
 def _invalidate_cache(ws: Optional[gspread.Worksheet]):
@@ -178,7 +310,6 @@ def _get_all_values_cached(ws: gspread.Worksheet) -> List[List[str]]:
     _WS_VALUES_CACHE[ws.id] = vals
     return vals
 
-# ===================== gspread “쓰기” 래퍼(캐시 무효화 보장) =====================
 def ws_update(ws: gspread.Worksheet, values, range_name: str):
     resp = _retry(ws.update, values, range_name)
     _invalidate_cache(ws)
@@ -189,29 +320,31 @@ def ws_clear(ws: gspread.Worksheet):
     _invalidate_cache(ws)
     return resp
 
-def batch_format(ws: gspread.Worksheet, requests: List[dict]):
-    if not requests:
-        return None
-    safe = _json_safe(requests)
-    return _retry(ws.spreadsheet.batch_update, {"requests": safe})
-
-def ws_batch_clear(ws: gspread.Worksheet, ranges: List[str]):
-    resp = _retry(ws.batch_clear, ranges)
-    _invalidate_cache(ws)
-    return resp
-
-def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    resp = _retry(ws.spreadsheet.values_batch_update, body=body)
-    _invalidate_cache(ws)
-    return resp
-
 def a1_col(n: int) -> str:
     s = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
+
+def values_batch_update_raw(ws: gspread.Worksheet, data: List[Dict]):
+    """
+    IMPORTANT:
+    - valueInputOption=RAW 로 고정
+    - ISO 날짜를 '2026-02-07' 그대로 셀에 넣기 위해 USER_ENTERED 금지
+    """
+    body = {"valueInputOption": "RAW", "data": data}
+    resp = _retry(ws.spreadsheet.values_batch_update, body=body)
+    _invalidate_cache(ws)
+    return resp
+
+def batch_format(ws: gspread.Worksheet, requests: List[dict]):
+    if not requests:
+        return None
+    return _retry(ws.spreadsheet.batch_update, {"requests": requests})
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", "", str(s or "").replace("\u3000", "").strip())
 
 def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
     tgt = _norm(wanted)
@@ -227,68 +360,6 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
         ws = _retry(sh.add_worksheet, title=title, rows=rows, cols=cols)
         log(f"[ws] created: {title}")
     return ws
-
-from urllib.parse import quote
-def log_focus_link(ws: gspread.Worksheet, row_idx: int, last_col_index: int, sheet_id: str):
-    try:
-        a1_last = a1_col(last_col_index if last_col_index >= 1 else 1)
-        range_a1 = f"{ws.title}!A{row_idx}:{a1_last}{row_idx}"
-        link = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}&range={quote(range_a1)}"
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with (LOG_DIR / "where_written.txt").open("a", encoding="utf-8") as f:
-            f.write(f"[{ws.title}] wrote row {row_idx} → {range_a1}\n")
-            f.write(f"Open here: {link}\n")
-    except Exception:
-        pass
-
-# ===================== 년월 정규화 =====================
-YM_RE = re.compile(r"(\d{4})년\s*(\d{1,2})월")
-
-def yymm_from_title(title: str) -> Optional[str]:
-    m = YM_RE.search(title or "")
-    if not m:
-        return None
-    y, mm = int(m.group(1)), int(m.group(2))
-    if not (1 <= mm <= 12):
-        return None
-    return f"{y%100:02d}/{mm:02d}"
-
-def ym_from_filename(fname: str):
-    """
-    ✅ 기존(전국 2503_260205.xlsx 등) + ✅ Drive형(아파트 202510.xlsx 등) 둘 다 지원
-    반환: (전국탭명, 서울탭명, 'YY/MM')
-    """
-    s = str(fname or "").strip()
-
-    # 1) Drive형: 아파트 202510.xlsx / 아파트_202510.xlsx / 아파트202510.xlsx
-    m = re.search(r"아파트[\s_]*([12]\d{3})(0[1-9]|1[0-2])\.xlsx$", s, re.IGNORECASE)
-    if m:
-        y, mm = int(m.group(1)), int(m.group(2))
-        return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{y%100:02d}/{mm:02d}"
-
-    # 2) 기존형: 2503_260205, 2602_260205 등 (YYMM)
-    m = re.search(r"\b(\d{2})(\d{2})[_\-\.\s]", s)
-    if m:
-        yy, mm = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            y = 2000 + yy
-            return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{yy:02d}/{mm:02d}"
-
-    # 3) 202510 같은 6자리(YYYYMM)
-    m = re.search(r"\b(20\d{2})(\d{2})\b", s)
-    if m:
-        y, mm = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{y%100:02d}/{mm:02d}"
-
-    # 4) 한글형
-    m = re.search(r"(20\d{2})\s*년\s*(\d{1,2})\s*월", s)
-    if m:
-        y, mm = int(m.group(1)), int(m.group(2))
-        if 1 <= mm <= 12:
-            return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{y%100:02d}/{mm:02d}"
-
-    return None, None, None
 
 # ===================== 날짜 파싱 =====================
 _DATE_PATS = [
@@ -316,18 +387,53 @@ def parse_any_date(x) -> Optional[date]:
                 return None
     return None
 
-# ===================== 파일/읽기/집계 =====================
+# ===================== 날짜 행 찾기(고정범위 스캔) =====================
+def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
+    target = parse_any_date(date_label) or parse_any_date(str(date_label))
+    if not target:
+        return 2
+
+    rng = f"A2:A{MAX_SCAN_ROWS}"
+    col = _retry(ws.get, rng) or []  # [[val],[val],...]
+    first_empty = None
+
+    for offset, row in enumerate(col, start=2):
+        v = row[0] if row else ""
+        if not v:
+            if first_empty is None:
+                first_empty = offset
+            continue
+        d = parse_any_date(v)
+        if d and d == target:
+            return offset
+
+    if first_empty is not None:
+        return first_empty
+    return min(MAX_SCAN_ROWS + 1, 5000)
+
+# ===================== 월 시트 생성/확보 =====================
+def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
+    ws = fuzzy_ws(sh, title)
+    if ws is not None:
+        return ws
+    ws = get_or_create_ws(sh, title, rows=1200, cols=40)
+    header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
+    ws_update(ws, [header], "A1")
+    _invalidate_cache(ws)
+    log(f"[ws] created from scratch: {title}")
+    return ws
+
+# ===================== 데이터 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     """
-    - 기존: sheet_name='data'
-    - Drive형 파일에서 'data' 시트가 없을 수 있으므로 fallback: 첫 시트
+    Drive에서 받은 xlsx는 시트명이 일정치 않을 수 있으므로:
+    - 우선 'data' 시트 시도
+    - 실패하면 첫 시트로 fallback
     """
     try:
         df = pd.read_excel(path, sheet_name="data", dtype=str)
     except Exception:
-        xl = pd.ExcelFile(path)
-        first = xl.sheet_names[0]
-        df = pd.read_excel(path, sheet_name=first, dtype=str)
+        df = pd.read_excel(path, sheet_name=0, dtype=str)
 
     df = df.fillna("")
     for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
@@ -350,11 +456,10 @@ def round2(v) -> str:
 
 def _strip_col(df: pd.DataFrame, col: str):
     if col in df.columns:
-        df[col] = df[col].astype(str).map(lambda x: str(x).replace("\u3000"," ").strip())
+        df[col] = df[col].astype(str).map(lambda x: str(x).replace("\u3000", " ").replace("\u00a0"," ").strip())
     return df
 
 def agg_all_stats(df: pd.DataFrame):
-    """df로부터 '전국/광역/서울/구/압구정동' 카운트, 중앙값, 평균"""
     counts = {col: 0 for col in SUMMARY_COLS}
     med = {col: "" for col in SUMMARY_COLS}
     mean = {col: "" for col in SUMMARY_COLS}
@@ -410,42 +515,19 @@ def agg_all_stats(df: pd.DataFrame):
 
     return counts, med, mean
 
-# ===================== 월 시트(전국/서울) 생성/확보 =====================
-def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
-    ws = fuzzy_ws(sh, title)
-    if ws is not None:
-        return ws
+# ===================== 월 탭 기록 =====================
+from urllib.parse import quote
 
-    ws = get_or_create_ws(sh, title, rows=800, cols=40)
-    header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
-    ws_update(ws, [header], "A1")
-    _invalidate_cache(ws)
-    log(f"[ws] created from scratch: {title}")
-    return ws
-
-# ===================== 날짜 행 찾기(고정범위 스캔) =====================
-def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
-    """A2:A{MAX_SCAN_ROWS} 고정범위 스캔 -> 같은 날짜면 그 행, 없으면 첫 빈행."""
-    target = parse_any_date(date_label) or parse_any_date(str(date_label))
-    if not target:
-        return 2
-
-    rng = f"A2:A{MAX_SCAN_ROWS}"
-    col = _retry(ws.get, rng) or []   # [[val],[val],...]
-    first_empty = None
-    for offset, row in enumerate(col, start=2):
-        v = row[0] if row else ""
-        if not v:
-            if first_empty is None:
-                first_empty = offset
-            continue
-        d = parse_any_date(v)
-        if d and d == target:
-            return offset
-
-    if first_empty is not None:
-        return first_empty
-    return min(MAX_SCAN_ROWS + 1, 5000)
+def log_focus_link(ws: gspread.Worksheet, row_idx: int, last_col_index: int, sheet_id: str):
+    try:
+        a1_last = a1_col(last_col_index if last_col_index >= 1 else 1)
+        range_a1 = f"{ws.title}!A{row_idx}:{a1_last}{row_idx}"
+        link = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={ws.id}&range={quote(range_a1)}"
+        with (LOG_DIR / "where_written.txt").open("a", encoding="utf-8") as f:
+            f.write(f"[{ws.title}] wrote row {row_idx} -> {range_a1}\n")
+            f.write(f"Open here: {link}\n")
+    except Exception:
+        pass
 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int], sheet_id: str):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
@@ -453,12 +535,13 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
 
     sheet_prefix = f"'{ws.title}'!"
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
+
     for col_name, val in values_by_colname.items():
         if col_name in hmap:
             c = hmap[col_name]
             payload.append({"range": f"{sheet_prefix}{a1_col(c)}{row_idx}", "values": [[int(val)]]})
 
-    values_batch_update(ws, payload)
+    values_batch_update_raw(ws, payload)
     log(f"[ws] {ws.title} -> {date_iso} row={row_idx} (wrote {len(payload)} cells incl. date)")
     log_focus_link(ws, row_idx, len(header or []), sheet_id)
 
@@ -474,134 +557,7 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
     except Exception as e:
         log(f"[verify] failed: {e}")
 
-# ===================== 인증/시트/Drive 열기 =====================
-def load_creds():
-    sa_json = os.environ.get("SA_JSON", "").strip()
-    sa_path = os.environ.get("SA_PATH", "").strip()
-
-    if sa_json:
-        info = json.loads(sa_json)
-    elif sa_path:
-        info = json.loads(Path(sa_path).read_text(encoding="utf-8"))
-    else:
-        raise RuntimeError("SA_JSON 또는 SA_PATH 환경변수가 필요합니다.")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",  # ✅ Drive 읽기만
-    ]
-    return Credentials.from_service_account_info(info, scopes=scopes)
-
-# ===================== Drive -> Local 다운로드 =====================
-def drive_list_apartment_xlsx(drive) -> List[dict]:
-    """
-    Drive에서 '아파트 YYYYMM.xlsx' 조회
-    - DRIVE_FOLDER_ID 있으면 그 폴더 내부로 제한(권장)
-    - 없으면 전체 Drive(내 드라이브 + 공유드라이브)에서 검색
-    """
-    files: List[dict] = []
-    page_token = None
-
-    base_q = "trashed=false and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
-
-    if DRIVE_FOLDER_ID:
-        q = f"'{DRIVE_FOLDER_ID}' in parents and {base_q}"
-    elif DRIVE_QUERY:
-        q = f"({DRIVE_QUERY}) and {base_q}"
-    else:
-        q = f"name contains '아파트' and {base_q}"
-
-    kwargs_common = dict(
-        q=q,
-        fields="nextPageToken, files(id, name, modifiedTime)",
-        pageSize=200,
-        supportsAllDrives=DRIVE_SUPPORTS_ALL_DRIVES,
-        includeItemsFromAllDrives=DRIVE_SUPPORTS_ALL_DRIVES,
-    )
-    if DRIVE_SUPPORTS_ALL_DRIVES:
-        kwargs_common["corpora"] = "allDrives"
-
-    while True:
-        resp = drive.files().list(pageToken=page_token, **kwargs_common).execute()
-        batch = resp.get("files", [])
-
-        for f in batch:
-            name = f.get("name", "") or ""
-            m = re.search(r"아파트[\s_]*([12]\d{3})(0[1-9]|1[0-2])\.xlsx$", name, re.IGNORECASE)
-            if m:
-                files.append(f)
-
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-    return files
-
-def drive_download_file(drive, file_id: str, out_path: Path):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.FileIO(out_path, "wb")
-    downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-        # status.progress() available
-    fh.close()
-
-def prepare_month_files_from_drive(drive) -> List[Path]:
-    """
-    Drive에서 월별로 최신 파일만 선택하고(동일월 여러개면 modifiedTime 최신),
-    최근 DRIVE_MAX_MONTHS개월만 로컬(ARTIFACTS_DIR/drive/)에 다운로드 후 Path 리스트 반환.
-    """
-    matched = drive_list_apartment_xlsx(drive)
-    log(f"[drive] matched files={len(matched)} (pattern: 아파트 YYYYMM.xlsx)")
-
-    if not matched:
-        raise RuntimeError(
-            "Drive에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다. "
-            "1) 서비스계정이 폴더/파일에 공유되어 있는지, "
-            "2) DRIVE_FOLDER_ID가 맞는지, "
-            "3) 공유드라이브라면 DRIVE_SUPPORTS_ALL_DRIVES=true 인지 확인하세요."
-        )
-
-    # 월별 최신 선택
-    best_by_ym: Dict[str, dict] = {}
-    for f in matched:
-        nat_title, seoul_title, ym = ym_from_filename(f.get("name", ""))
-        if not ym:
-            continue
-        prev = best_by_ym.get(ym)
-        if prev is None:
-            best_by_ym[ym] = f
-            continue
-        # modifiedTime 비교(문자열 ISO)
-        if (f.get("modifiedTime") or "") > (prev.get("modifiedTime") or ""):
-            best_by_ym[ym] = f
-
-    def ym_key(ym: str):
-        yy, mm = ym.split("/")
-        return (2000 + int(yy), int(mm))
-
-    ym_sorted = sorted(best_by_ym.keys(), key=ym_key, reverse=True)[:DRIVE_MAX_MONTHS]
-    ym_sorted = sorted(ym_sorted, key=ym_key)  # 과거→현재 처리
-    log(f"[drive] months_to_process={ym_sorted}")
-
-    out_dir = ARTIFACTS_DIR / "drive"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_paths: List[Path] = []
-    for ym in ym_sorted:
-        f = best_by_ym[ym]
-        name = f.get("name", f"{ym}.xlsx")
-        fid = f["id"]
-        out_path = out_dir / name
-        log(f"[drive] download: {name} (id={fid}) -> {out_path}")
-        drive_download_file(drive, fid, out_path)
-        out_paths.append(out_path)
-
-    return out_paths
-
-# ===================== 압구정동(법정동) 스냅샷/변동사항 기록 =====================
+# ===================== 압구정동 스냅샷 =====================
 APGU_SHEET_NAME = "압구정동"
 APGU_BASE_SHEET_NAME = "압구정동_base"
 
@@ -623,13 +579,15 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
         cc = _canon_col(cand)
         if cc in cols:
             return cols[cc]
+
     def norm2(x):
         x = _canon_col(x)
-        x = re.sub(r"\s+","",x)
-        x = x.replace("㎡","m²").replace("m2","m²")
-        x = x.replace("(","").replace(")","").replace("[","").replace("]","")
-        x = x.replace(".","").replace(",","")
+        x = re.sub(r"\s+", "", x)
+        x = x.replace("㎡", "m²").replace("m2", "m²")
+        x = x.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+        x = x.replace(".", "").replace(",", "")
         return x
+
     cols2 = {norm2(c): c for c in df.columns}
     for cand in candidates:
         k = norm2(cand)
@@ -676,7 +634,6 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     for c in ["본번","부번"]:
         df[c] = df[c].astype(str).str.strip().replace({"nan":""})
-
     df["동"] = df["동"].astype(str).str.strip().replace({"nan":""})
     df["층"] = df["층"].astype(str).str.strip().replace({"nan":""})
 
@@ -706,13 +663,41 @@ def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     out = pd.DataFrame(rows, columns=header[:len(rows[0])] if rows else header)
     return out
 
-def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
+def _df_to_values_safe(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
+    """
+    NaN/Inf JSON 문제 방지:
+    - 모든 값을 문자열로 강제
+    - NaN/Inf/None -> ""
+    """
     df2 = df.copy()
     for h in header:
         if h not in df2.columns:
             df2[h] = ""
+
     df2 = df2[header]
-    return df2.astype(str).values.tolist()
+
+    def conv(x):
+        try:
+            if x is None:
+                return ""
+            # numpy/pandas nan/inf
+            if isinstance(x, float):
+                if np.isnan(x) or np.isinf(x):
+                    return ""
+            if isinstance(x, (np.floating, np.integer)):
+                # np.nan 체크
+                if isinstance(x, np.floating) and (np.isnan(x) or np.isinf(x)):
+                    return ""
+                return str(x)
+            s = str(x)
+            if s.lower() in ("nan", "inf", "-inf"):
+                return ""
+            return s
+        except Exception:
+            return ""
+
+    values = df2.applymap(conv).values.tolist()
+    return values
 
 def _hide_sheet(ws: gspread.Worksheet):
     try:
@@ -739,7 +724,7 @@ def _set_text_color(ws: gspread.Worksheet, start_row: int, end_row: int, start_c
             "cell": {
                 "userEnteredFormat": {
                     "textFormat": {
-                        "foregroundColor": {"red": r, "green": g, "blue": b}
+                        "foregroundColor": {"red": float(r), "green": float(g), "blue": float(b)}
                     }
                 }
             },
@@ -777,12 +762,11 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
     if prev.empty:
         prev_set = set()
     else:
-        prev_key = prev.copy()
-        if "__k" in prev_key.columns:
-            prev_set = set(prev_key["__k"].astype(str).tolist())
+        if "__k" in prev.columns:
+            prev_set = set(prev["__k"].astype(str).tolist())
         else:
-            prev_key = _ensure_cols(prev_key)
-            pk = _make_key_df(prev_key)
+            prev2 = _ensure_cols(prev)
+            pk = _make_key_df(prev2)
             pk["__k"] = pk.apply(lambda r: "|".join(r.values.tolist()), axis=1)
             prev_set = set(pk["__k"].tolist())
 
@@ -808,43 +792,15 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
     cur_out = cur.copy()
     if "변동" not in cur_out.columns:
         cur_out.insert(0, "변동", "")
-    values_cur = _df_to_values(cur_out, header2)
-
-    df_all_key = _make_key_df(_ensure_cols(df_all))
-    df_all_key["__k"] = df_all_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-
-    key_to_row = {}
-    need = set(added_keys) | set(removed_keys)
-    if need:
-        mask = df_all_key["__k"].isin(list(need))
-        sub = df_all.loc[mask.values].copy()
-        sub = _ensure_cols(sub)
-        sub_key = _make_key_df(sub)
-        sub_key["__k"] = sub_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-        for i, k in enumerate(sub_key["__k"].tolist()):
-            if k not in key_to_row:
-                key_to_row[k] = sub.iloc[i]
-
-    def row_from_key(k: str) -> pd.Series:
-        if k in key_to_row:
-            return key_to_row[k]
-        parts = k.split("|")
-        cols = ["광역","구","법정동","본번","부번","단지명","_면적_key","계약년","계약월","계약일","거래금액(만원)","동","층"]
-        d = {c: parts[i] if i < len(parts) else "" for i, c in enumerate(cols)}
-        d["전용면적(m²)"] = d.pop("_면적_key","")
-        return pd.Series(d)
+    values_cur = _df_to_values_safe(cur_out, header2)
 
     diff_rows = []
+    # removed
     for k in removed_keys:
-        r = row_from_key(k)
-        rr = r.to_dict()
-        rr["변동"] = "삭제"
-        diff_rows.append(rr)
+        diff_rows.append({"변동": "삭제", "__k": k})
+    # added
     for k in added_keys:
-        r = row_from_key(k)
-        rr = r.to_dict()
-        rr["변동"] = "추가"
-        diff_rows.append(rr)
+        diff_rows.append({"변동": "추가", "__k": k})
 
     start_row = 2
     if values_cur:
@@ -852,16 +808,13 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
 
     diff_start = start_row + len(values_cur) + 2
     if diff_rows:
-        df_diff = pd.DataFrame(diff_rows)
-        df_diff = _ensure_cols(df_diff)
-        if "변동" not in df_diff.columns:
-            df_diff.insert(0, "변동", "")
-        values_diff = _df_to_values(df_diff, header2)
-
+        # diff 섹션은 최소정보로라도 표기 (NaN 이슈 완전 회피)
         ws_update(ws_main, [["변동사항(삭제=빨강, 추가=파랑)"] + [""]*(len(header2)-1)],
                   f"A{diff_start-1}:{a1_col(len(header2))}{diff_start-1}")
-        ws_update(ws_main, values_diff,
-                  f"A{diff_start}:{a1_col(len(header2))}{diff_start+len(values_diff)-1}")
+        df_diff = pd.DataFrame(diff_rows)
+        # header2에 없는 컬럼은 빈칸
+        values_diff = _df_to_values_safe(df_diff, header2)
+        ws_update(ws_main, values_diff, f"A{diff_start}:{a1_col(len(header2))}{diff_start+len(values_diff)-1}")
 
         del_n = len(removed_keys)
         add_n = len(added_keys)
@@ -870,22 +823,16 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
         if add_n:
             _set_text_color(ws_main, diff_start+del_n, diff_start+del_n+add_n-1, 1, len(header2), (0.0,0.2,0.85))
 
-    base_header = ["__k"] + [c for c in APGU_KEY_COLS if c in cur.columns] + ["전용면적(m²)"]
-    base_header = list(dict.fromkeys(base_header))
+    # base 시트에는 key만 저장 (안정적으로)
+    base_header = ["__k"]
     ws_clear(ws_base)
     ws_update(ws_base, [base_header], "A1")
-
-    base_df2 = _ensure_cols(cur.copy())
-    kdf = _make_key_df(base_df2)
-    kdf["__k"] = kdf.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-    base_df2["__k"] = kdf["__k"].values
-    if "전용면적(m²)" not in base_df2.columns:
-        base_df2["전용면적(m²)"] = ""
-    base_vals = _df_to_values(base_df2, base_header)
+    base_vals = [[k] for k in sorted(list(cur_set))]
     if base_vals:
-        ws_update(ws_base, base_vals, f"A2:{a1_col(len(base_header))}{len(base_vals)+1}")
+        ws_update(ws_base, base_vals, f"A2:A{len(base_vals)+1}")
     _hide_sheet(ws_base)
-    log("[apgu] updated main/base")
+
+    log("[apgu] updated main/base (safe-key mode)")
 
 # ===================== 메인 =====================
 def main():
@@ -897,47 +844,39 @@ def main():
 
     creds = load_creds()
 
-    # Sheets
+    # 1) Drive에서 월별 파일 다운로드 (artifacts 절대 사용 안 함)
+    session = AuthorizedSession(creds)
+    xlsx_paths = download_latest_12_months(session)
+    if not xlsx_paths:
+        raise RuntimeError("Drive에서 다운로드된 xlsx가 없습니다.")
+
+    # 2) Sheets 연결
     gc = gspread.authorize(creds)
     sh = _retry(gc.open_by_key, sheet_id)
 
-    # Drive
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    today_iso = datetime.now().date().isoformat()
 
-    today_iso = datetime.now().date().isoformat()  # ✅ 항상 ISO
-
-    # ✅ Drive에서 월 파일 준비 (아티팩트 사용 안 함)
-    xlsx_paths = prepare_month_files_from_drive(drive)
-    if not xlsx_paths:
-        log("[drive] no xlsx downloaded. stop.")
-        return
-
-    # 월별(ym)로 다시 정렬/선별(안전)
-    best_by_ym: Dict[str, Path] = {}
-    for p in xlsx_paths:
-        nat_title, seoul_title, ym = ym_from_filename(p.name)
-        if not ym:
-            continue
-        prev = best_by_ym.get(ym)
-        if prev is None or p.stat().st_mtime > prev.stat().st_mtime:
-            best_by_ym[ym] = p
-
-    def ym_key(ym: str):
-        yy, mm = ym.split("/")
-        return (2000 + int(yy), int(mm))
-
-    ym_sorted = sorted(best_by_ym.keys(), key=ym_key, reverse=True)[:DRIVE_MAX_MONTHS]
-    ym_sorted = sorted(ym_sorted, key=ym_key)
-    log(f"[input] months_to_process={ym_sorted}")
-
+    # 3) 월별 처리
     df_all_frames: List[pd.DataFrame] = []
     summary_rows = []  # (ym, counts, med, mean)
 
-    for ym in ym_sorted:
-        p = best_by_ym[ym]
-        nat_title, seoul_title, _ = ym_from_filename(p.name)
-        if not nat_title:
+    # 로컬 파일명에서 YYYYMM 추출
+    month_items: List[Tuple[str, Path]] = []
+    for p in xlsx_paths:
+        name = p.name.strip()
+        m = APT_YYYYMM_RE.match(name)
+        if not m:
             continue
+        yyyymm = f"{m.group(1)}{m.group(2)}"
+        month_items.append((yyyymm, p))
+
+    # 과거->현재
+    month_items.sort(key=lambda x: (int(x[0][:4]), int(x[0][4:])))
+
+    months_yy_mm = []
+    for yyyymm, p in month_items:
+        nat_title, seoul_title, ym = titles_from_yyyymm(yyyymm)
+        months_yy_mm.append(ym)
 
         log(f"[file] {p.name}")
         df = read_month_df(p)
@@ -963,8 +902,7 @@ def main():
 
     # ---- 거래요약 탭 ----
     ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = ym_sorted
-    header = ["구분"] + months
+    header = ["구분"] + months_yy_mm
     ws_update(ws_sum, [header], "A1")
 
     lookup = {ym: (c, m1, m2) for ym, c, m1, m2 in summary_rows}
@@ -980,7 +918,7 @@ def main():
         "압구정동 평균가(억)": [],
     }
 
-    for ym in months:
+    for ym in months_yy_mm:
         c, md, mn = lookup[ym]
         row_map["전국 거래건수"].append(int(c.get("전국", 0)))
         row_map["전국 중앙값(억)"].append(md.get("전국", ""))
@@ -992,9 +930,12 @@ def main():
         row_map["압구정동 중앙값(억)"].append(md.get("압구정동", ""))
         row_map["압구정동 평균가(억)"].append(mn.get("압구정동", ""))
 
-    out_rows = [[k] + arr for k, arr in row_map.items()]
+    out_rows = []
+    for k, arr in row_map.items():
+        out_rows.append([k] + arr)
+
     ws_update(ws_sum, out_rows, f"A2:{a1_col(len(header))}{len(out_rows)+1}")
-    log(f"[summary] wrote rows={len(out_rows)} months={len(months)}")
+    log(f"[summary] wrote rows={len(out_rows)} months={len(months_yy_mm)}")
 
     # ---- 압구정동 탭 ----
     try:
