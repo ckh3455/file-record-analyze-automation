@@ -9,26 +9,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CI: "1"
-      PYTHONUNBUFFERED: "1"
-
-      # ====== 필수 ======
-      SHEET_ID: ${{ secrets.SHEET_ID }}
-      SA_JSON: ${{ secrets.SA_JSON }}
-
-      # ====== Drive 입력 (권장: 상위폴더만) ======
-      # 사용자가 준 링크: https://drive.google.com/drive/folders/1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E
-      DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
-
-      # 공유드라이브면 true 필수
-      DRIVE_SUPPORTS_ALL_DRIVES: "true"
-
-      # (선택) 다운로드 저장 폴더
-      DRIVE_DOWNLOAD_DIR: "drive_downloads"
-
-      # (선택) 날짜 스캔 범위
-      MAX_SCAN_ROWS: "900"
 
     steps:
       - name: Checkout
@@ -46,22 +26,35 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
-          # requirements.txt에 없더라도 실행에 필요한 최소 패키지 보강
-          pip install -U \
-            pandas openpyxl numpy \
-            gspread google-auth google-auth-oauthlib google-auth-httplib2
+          # Drive + Sheets 동작에 필요한 최소 패키지 보강
+          pip install -U pandas openpyxl numpy gspread google-auth google-auth-oauthlib google-auth-httplib2 requests
 
-      - name: Debug - list scripts
+      # ★ 핵심: 여기서 env를 "step 단"으로 확실히 주입 (job env 누락/오타 방지)
+      - name: Run analyze_and_update (Drive -> Local -> Sheets)
+        env:
+          CI: "1"
+          PYTHONUNBUFFERED: "1"
+
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SA_JSON: ${{ secrets.SA_JSON }}
+
+          # 사용자가 준 상위 폴더: 부동산자료 (공유드라이브 폴더)
+          DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
+
+          # 공유드라이브 지원
+          DRIVE_SUPPORTS_ALL_DRIVES: "true"
+
+          # 로컬 다운로드 폴더
+          DRIVE_DOWNLOAD_DIR: "drive_downloads"
+
+          # 날짜 스캔 범위
+          MAX_SCAN_ROWS: "900"
         run: |
           set -euxo pipefail
-          pwd
-          ls -al
-          ls -al scripts
-          python -c "import gspread, google.auth; print('deps OK')"
-
-      - name: Run analyze & update (Drive -> Sheets)
-        run: |
-          set -euxo pipefail
+          echo "ENV CHECK:"
+          echo "SHEET_ID=${SHEET_ID:0:6}****"
+          echo "DRIVE_PARENT_FOLDER_ID=$DRIVE_PARENT_FOLDER_ID"
+          echo "DRIVE_SUPPORTS_ALL_DRIVES=$DRIVE_SUPPORTS_ALL_DRIVES"
           python scripts/analyze_and_update.py
 
       - name: Upload analyze logs
