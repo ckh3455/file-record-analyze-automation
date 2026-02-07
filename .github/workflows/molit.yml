@@ -14,26 +14,26 @@ jobs:
     timeout-minutes: 30
 
     env:
+      CI: "1"
       PYTHONUNBUFFERED: "1"
       TZ: "Asia/Seoul"
 
-      # === 기록할 구글시트 ===
+      # === 대상 구글시트 ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
 
       # === 서비스계정 JSON ===
-      # (너가 이미 쓰던 시크릿 이름이 GDRIVE_SA_JSON이면 그대로 사용)
-      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+      SA_JSON: ${{ secrets.SA_JSON }}
 
-      # === Drive 폴더 지정 ===
-      # 부모폴더(부동산자료) ID 또는 URL 가능. (네가 준 링크의 ID)
+      # === Drive 폴더 설정(필수) ===
+      # 네가 준 "부동산자료" 폴더 ID
       DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
       DRIVE_SUBFOLDER_NAME: "아파트"
 
-      # 공유드라이브/공유폴더 호환
+      # 공유드라이브/바로가기 대응 옵션
       DRIVE_SUPPORTS_ALL_DRIVES: "true"
       DRIVE_CORPUS: "allDrives"
 
-      # (선택) 날짜행 스캔 범위
+      # 시트 날짜행 스캔 범위(선택)
       MAX_SCAN_ROWS: "900"
 
     steps:
@@ -52,8 +52,8 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
-          # Drive API 필수 (requirements.txt에 없어도 여기서 보강)
-          pip install "google-api-python-client>=2.0.0" "google-auth>=2.0.0" "google-auth-httplib2>=0.2.0" "google-auth-oauthlib>=1.0.0"
+          # Drive API 모듈 확실히 설치
+          pip install "google-api-python-client>=2.0.0" "google-auth>=2.0.0" "google-auth-httplib2>=0.2.0"
 
       - name: Run analyzer (Drive -> Sheets)
         run: |
