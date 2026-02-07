@@ -54,3 +54,10 @@ jobs:
           path: analyze_report/**
           if-no-files-found: warn
           retention-days: 3
+
+          env:
+  SHEET_ID: ${{ secrets.SHEET_ID }}
+  SA_JSON:  ${{ secrets.SA_JSON }}
+  DRIVE_PARENT_FOLDER_ID: "1Og3ksryf4L25sjl-w3fKDn2U5OlWLt9E"
+  DRIVE_SUPPORTS_ALL_DRIVES: "true"
+
