@@ -1,70 +1,78 @@
 name: analyze-and-update-sheets
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '10 0 * * *'   # KST 09:10
-  workflow_dispatch: {}
+    - cron: "10 1 * * *" # KST 10:10 (UTC 01:10)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analyze-and-update-sheets
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CI: '1'
-      PYTHONUNBUFFERED: '1'
-      TZ: Asia/Seoul
 
-      # --- Google Sheet target ---
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+
+      # === REQUIRED ===
       SHEET_ID: ${{ secrets.SHEET_ID }}
 
-      # --- Service Account JSON (레포에 있는 기존 시크릿명 호환) ---
-      GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+      # 서비스계정 JSON (네 레포 시크릿 이름이 GDRIVE_SA_JSON이면 여기로 매핑)
+      SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
 
-      # --- Drive folder (아파트 폴더 자체 ID) ---
+      # '아파트' 폴더 자체의 폴더 ID (아파트 200601.xlsx 같은 파일들이 들어있는 그 폴더)
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+
+      # 공유드라이브면 true
       DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
 
-      # 파일명 패턴 (네 드라이브 실제 파일명: "아파트 200601.xlsx")
-      DRIVE_FILE_REGEX: '^아파트\s*(\d{6})\.xlsx$'
-
-      # 월탭 날짜행 스캔 범위
-      MAX_SCAN_ROWS: '900'
+      # (옵션) 파일명 정규식 커스터마이즈 가능
+      # DRIVE_FILE_REGEX: '^아파트\s*(\d{6})\.xlsx$'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            gspread google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client \
+            pandas numpy openpyxl
 
-      - name: Debug env presence
+      - name: Sanity check env
         run: |
           python - <<'PY'
-          import os, sys
-          need = ["SHEET_ID","GDRIVE_SA_JSON","DRIVE_FOLDER_ID","DRIVE_SUPPORTS_ALL_DRIVES"]
+          import os
+          need = ["SHEET_ID","SA_JSON","DRIVE_FOLDER_ID","DRIVE_SUPPORTS_ALL_DRIVES"]
           miss = [k for k in need if not os.getenv(k)]
-          print("Missing:", miss)
           if miss:
-            sys.exit(1)
-          print({k: True for k in need})
+            raise SystemExit(f"Missing env: {miss}")
+          print("ENV OK:", {k: True for k in need})
           PY
 
-      - name: Run analyze & update (Drive -> Sheets)
+      - name: Run analyzer (Drive -> Sheets
         run: |
           python scripts/analyze_and_update.py
 
-      - name: Upload analyze logs
-        if: always()
+      # 로그는 실패할 때만 올려서 헷갈리지 않게
+      - name: Upload analyze_report on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: analyze-report
-          path: analyze_report/*
-          if-no-files-found: warn
+          path: analyze_report
           retention-days: 3
