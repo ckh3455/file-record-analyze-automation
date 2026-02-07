@@ -5,4 +5,4 @@ selenium
 webdriver-manager
 gspread
 google-auth
-
+google-api-python-client>=2
