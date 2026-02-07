@@ -14,40 +14,18 @@ jobs:
       PYTHONUNBUFFERED: '1'
       TZ: Asia/Seoul
 
-      DOWNLOAD_TIMEOUT: '30'
-      CLICK_RETRY_MAX: '15'
-      CLICK_RETRY_WAIT: '1'
+      # analyze_and_update.py 용
+      ARTIFACTS_DIR: artifacts
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SA_JSON: ${{ secrets.SA_JSON }}
 
-      OUTPUT_DIR: output
-      RT_DOWNLOADS_DIR: _rt_downloads
+      # Drive pull 용 (둘 중 하나만 세팅)
+      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      # DRIVE_FOLDER_NAME: "아파트"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install Chromium & Chromedriver
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver || sudo apt-get install -y chromium chromium-driver
-
-          if [ -x /usr/bin/chromium-browser ]; then
-            echo "CHROME_BIN=/usr/bin/chromium-browser" >> "$GITHUB_ENV"
-          elif [ -x /usr/bin/chromium ]; then
-            echo "CHROME_BIN=/usr/bin/chromium" >> "$GITHUB_ENV"
-          else
-            echo "Chromium not found" >&2
-            exit 1
-          fi
-
-          if [ -x /usr/bin/chromedriver ]; then
-            echo "CHROMEDRIVER_BIN=/usr/bin/chromedriver" >> "$GITHUB_ENV"
-          elif [ -x /usr/bin/chromium-driver ]; then
-            echo "CHROMEDRIVER_BIN=/usr/bin/chromium-driver" >> "$GITHUB_ENV"
-          else
-            echo "Chromedriver not found" >&2
-            exit 1
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,97 +37,27 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Drive API 클라이언트가 requirements.txt에 없으면 추가 설치
+          pip install google-api-python-client
 
-      - name: Prepare directories
+      - name: Prepare dirs
         run: |
           set -euxo pipefail
+          rm -rf artifacts || true
+          mkdir -p artifacts analyze_report
 
-          # output dir
-          if [ -f "${OUTPUT_DIR}" ]; then
-            echo "WARN: '${OUTPUT_DIR}' exists as a file. Removing it."
-            rm -f "${OUTPUT_DIR}"
-          fi
-          mkdir -p "${OUTPUT_DIR}"
-
-          # _rt_downloads dir (다운로더가 쓰는 경우가 많음)
-          if [ -f "${RT_DOWNLOADS_DIR}" ]; then
-            echo "WARN: '${RT_DOWNLOADS_DIR}' exists as a file. Removing it."
-            rm -f "${RT_DOWNLOADS_DIR}"
-          fi
-          mkdir -p "${RT_DOWNLOADS_DIR}"
-
-          # analyze_report dir (analyze_and_update.py가 쓰는 로그 경로)
-          if [ -f analyze_report ]; then
-            echo "WARN: 'analyze_report' exists as a file. Removing it."
-            rm -f analyze_report
-          fi
-          mkdir -p analyze_report
-
-          echo "=== dirs ==="
-          ls -ald "${OUTPUT_DIR}" "${RT_DOWNLOADS_DIR}" analyze_report
-
-      - name: Debug - list repo
+      - name: Pull latest xlsx from Google Drive
         run: |
           set -euxo pipefail
-          pwd
-          ls -al
-          echo "=== scripts/ ==="
-          ls -al scripts || true
+          python scripts/pull_from_drive.py
 
-      - name: Run downloader (auto-detect)
+      - name: Debug - list artifacts
         run: |
           set -euxo pipefail
+          ls -al artifacts
+          find artifacts -maxdepth 2 -type f -name "*.xlsx" -print
 
-          # 가능한 후보들(레포마다 이름이 조금씩 다름)
-          CANDIDATES=(
-            "scripts/download_realdata.py"
-            "scripts/rt_allinone.py"
-            "download_realdata.py"
-          )
-
-          FOUND=""
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ]; then
-              # 파일이 비었는지(0바이트) 간단 체크
-              if [ "$(wc -c < "$f")" -gt 20 ]; then
-                FOUND="$f"
-                break
-              fi
-            fi
-          done
-
-          if [ -z "$FOUND" ]; then
-            echo "ERROR: No runnable downloader script found."
-            echo "Tried: ${CANDIDATES[*]}"
-            echo "Existing scripts:"
-            ls -al scripts || true
-            exit 2
-          fi
-
-          echo "Running: $FOUND"
-          python "$FOUND"
-
-      - name: Post-debug - outputs
+      - name: Analyze & update Google Sheet
         run: |
           set -euxo pipefail
-          echo "=== find xlsx ==="
-          find . -maxdepth 6 -type f -name "*.xlsx" -print
-          echo "=== list output/ ==="
-          ls -al output || true
-          echo "=== list _rt_downloads/ ==="
-          ls -al _rt_downloads || true
-
-      - name: Assert xlsx exists under output/
-        run: |
-          set -euxo pipefail
-          cnt=$(find output -type f -name "*.xlsx" | wc -l)
-          echo "xlsx in output/: $cnt"
-          test "$cnt" -gt 0
-
-      - name: Upload artifacts (xlsx)
-        uses: actions/upload-artifact@v4
-        with:
-          name: molit-xlsx
-          path: output/**/*.xlsx
-          if-no-files-found: error
-          retention-days: 3
+          python scripts/analyze_and_update.py
