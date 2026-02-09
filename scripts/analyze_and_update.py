@@ -2,32 +2,29 @@
 from __future__ import annotations
 
 """
-analyze_and_update.py (정리본 / 폴더ID 확정 + 시트 자동선택 + 압구정동 diff 폭증 방지)
+analyze_and_update.py (정리본 / 스냅샷과 변동사항 분리 + diff 폭증 방지)
 
-핵심 수정(압구정동 삭제/추가 폭증 원인 해결):
-1) '광역/구/법정동' 문자열 정규화(전각공백/NBSP/strip) 적용
-2) diff 키(__k) 생성 시, prev/base 와 cur/오늘 데이터에 "동일한 키용 표준화" 적용
-   - 본번/부번 제로패딩(4자리)
-   - 동/층/단지명 등 '-' 처리, 공백 정리
-   - 계약년/월/일/거래금액은 정수 문자열로 고정
-3) prev(base) 재처리에 _ensure_cols(prev) 사용 금지 (빈칸이 0으로 바뀌어 키가 흔들리는 문제 방지)
+핵심:
+- 압구정동 시트는 2구역으로 쓴다.
+  1) 스냅샷: 현재 데이터만(변동 칼럼은 항상 공백)
+  2) 변동사항: 삭제/추가만 별도 섹션으로 기록(색상 적용)
 
-전제:
-- DRIVE_FOLDER_ID는 '아파트' 폴더 자체 ID(또는 URL)로 정확히 설정되어 있음
-- 서비스계정에 해당 폴더 접근 권한이 있음(검증 완료)
+- 삭제 행은 "어제 base"에서 그대로 가져온다(정확).
+- 추가 행은 "오늘 스냅샷"에서 그대로 가져온다(정확).
+- base는 매 실행마다 "오늘 스냅샷"으로 갱신되어, 다음 실행 시 어제 대비 diff가 나온다.
 
 필수 ENV:
 - SHEET_ID
 - SA_JSON 또는 SA_PATH (또는 GDRIVE_SA_JSON도 허용)
-- DRIVE_FOLDER_ID
-- DRIVE_SUPPORTS_ALL_DRIVES: "true" 권장(공유드라이브면 사실상 필수)
+- DRIVE_FOLDER_ID (아파트 폴더 자체 ID/URL)
+- DRIVE_SUPPORTS_ALL_DRIVES: "true" 권장
 
 선택 ENV:
 - DRIVE_FILE_REGEX: 기본 r"^아파트\\s*(\\d{6})\\.xlsx$"
-- DRIVE_SCAN_MAX_FILES: list pageSize(기본 1000, Drive API 최대 1000)
+- DRIVE_SCAN_MAX_FILES: 기본 1000(Drive API max)
 - DOWNLOAD_DIR: 기본 "_drive_downloads"
 - MAX_SCAN_ROWS: 기본 900
-- EXCEL_SHEET_NAME: 시트명 강제(권장X: 월별로 달라질 수 있음)
+- EXCEL_SHEET_NAME: 시트명 강제(권장X)
 """
 
 import os, re, json, time, random
@@ -42,7 +39,6 @@ from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
@@ -184,7 +180,6 @@ def drive_list_files(
     page_size: int = 1000,
     fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size)"
 ):
-    # Drive API hard limit: 1000
     try:
         page_size = int(page_size)
     except Exception:
@@ -221,15 +216,10 @@ def get_folder_meta(drive, folder_id: str, supports_all_drives: bool) -> dict:
     ).execute()
 
 def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
-    """
-    폴더 내 xlsx만 list -> 파일명 regex로 YYYYMM 추출 -> 최신 12개월 선택
-    Drive 호출: files.get(folder meta) 1회 + files.list (보통 1회, 페이지 많으면 토큰만큼)
-    """
     meta = get_folder_meta(drive, folder_id, supports_all_drives)
     drive_id = meta.get("driveId")
     corpora = "drive" if (supports_all_drives and drive_id) else "allDrives"
 
-    # 폴더 내 xlsx만 제한
     q = (
         f"'{folder_id}' in parents and trashed=false "
         f"and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
@@ -266,7 +256,6 @@ def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives
         except Exception:
             return 0.0
 
-    # 동일 월(YYYYMM)은 최신 modifiedTime만
     best_by_ym: Dict[str, dict] = {}
     for ym, it in matched:
         cur = best_by_ym.get(ym)
@@ -382,11 +371,6 @@ def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     payload = {"requests": _clean(requests)}
     return _retry(ws.spreadsheet.batch_update, payload)
 
-def ws_batch_clear(ws: gspread.Worksheet, ranges: List[str]):
-    resp = _retry(ws.batch_clear, ranges)
-    _invalidate_cache(ws)
-    return resp
-
 def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
     tgt = re.sub(r"\s+", "", wanted.strip())
     for ws in sh.worksheets():
@@ -489,13 +473,6 @@ def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.
 
 # ===================== 파일 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
-    """
-    우선순위:
-    1) EXCEL_SHEET_NAME 지정 시: 그 시트(없으면 에러)
-    2) 기본: 'Sheet1' 있으면 Sheet1
-    3) 없으면: 'data' 또는 'data' 포함 시트(대소문자/공백 무시)
-    4) 그래도 없으면: 컬럼 헤더 점수화로 자동 선택
-    """
     forced = os.environ.get("EXCEL_SHEET_NAME", "").strip()
 
     try:
@@ -509,9 +486,7 @@ def read_month_df(path: Path) -> pd.DataFrame:
 
     if forced:
         if forced not in sheet_names:
-            raise RuntimeError(
-                f"{path.name}: EXCEL_SHEET_NAME='{forced}' 인데 시트가 없습니다. available={sheet_names}"
-            )
+            raise RuntimeError(f"{path.name}: EXCEL_SHEET_NAME='{forced}' 인데 시트가 없습니다. available={sheet_names}")
         picked = forced
         log(f"[excel] {path.name} -> forced '{picked}'")
     else:
@@ -521,10 +496,8 @@ def read_month_df(path: Path) -> pd.DataFrame:
         else:
             def norm(s: str) -> str:
                 return re.sub(r"\s+", "", str(s or "")).lower()
-
             norm_map = {norm(n): n for n in sheet_names}
             picked = None
-
             if "data" in norm_map:
                 picked = norm_map["data"]
             else:
@@ -532,11 +505,9 @@ def read_month_df(path: Path) -> pd.DataFrame:
                     if "data" in k:
                         picked = v
                         break
-
             if picked is None:
                 must_tokens = ["거래금액", "계약년", "계약월", "계약일", "광역", "구", "법정동", "전용면적", "단지명"]
                 best_name, best_score = sheet_names[0], -1
-
                 for sname in sheet_names:
                     try:
                         df_head = pd.read_excel(path, sheet_name=sname, nrows=5)
@@ -547,7 +518,6 @@ def read_month_df(path: Path) -> pd.DataFrame:
                             best_name = sname
                     except Exception:
                         continue
-
                 picked = best_name
                 log(f"[excel] {path.name} -> auto-picked '{picked}' score={best_score} candidates={sheet_names}")
             else:
@@ -672,17 +642,12 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 def _norm_text_series(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
-        .str.replace("\u3000", " ", regex=False)  # 전각공백
-        .str.replace("\u00a0", " ", regex=False)  # NBSP
+        .str.replace("\u3000", " ", regex=False)
+        .str.replace("\u00a0", " ", regex=False)
         .str.strip()
     )
 
 def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    NOTE:
-    - 이 함수는 '분석/출력'에 필요한 컬럼을 확보하는 용도
-    - 키 생성용 표준화는 _make_key_df()에서 별도로 "동일 규칙"으로 처리한다
-    """
     df = df.copy()
 
     area_col = _pick_col(df, ["전용면적(m²)", "전용면적(m2)", "전용면적(㎡)", "전용면적"])
@@ -717,24 +682,23 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
 
-    # ✅ 지역 컬럼 정규화(압구정동 필터 흔들림 방지)
+    # 지역 컬럼 정규화
     for c in ["광역","구","법정동"]:
-        if c in df.columns:
-            df[c] = _norm_text_series(df[c])
+        df[c] = _norm_text_series(df[c])
 
-    # 숫자 컬럼은 분석용으로만 정수화(키는 _make_key_df에서 다시 안전하게 문자열로 고정)
-    for c in ["계약년","계약월","계약일","거래금액(만원)"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
+    # 텍스트 컬럼 정규화
     for c in ["본번","부번","동","층","단지명","전용면적(m²)"]:
         if c in df.columns:
             df[c] = _norm_text_series(df[c])
 
+    # 숫자 컬럼 (분석용)
+    for c in ["계약년","계약월","계약일","거래금액(만원)"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df["_면적_num"] = pd.to_numeric(df["전용면적(m²)"], errors="coerce")
     return df
 
-
-# ---- 키용 표준화(삭제/추가 폭증 방지의 핵심) ----
+# ---- 키용 표준화 ----
 def _norm_dash_blank(x: object) -> str:
     s = str(x or "").strip()
     s = s.replace("\u3000", " ").replace("\u00a0", " ").strip()
@@ -747,25 +711,18 @@ def _zfill4(x: object) -> str:
     return s.zfill(4) if s.isdigit() else s
 
 def _to_int_str(x: object) -> str:
-    # "", "-", "700000.0" 등 -> "0" or "700000"
     v = pd.to_numeric(pd.Series([x]), errors="coerce").fillna(0).astype(int).iloc[0]
     return str(int(v))
 
 def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    prev/base 와 cur/오늘 데이터에 반드시 '같은 규칙'으로 키를 만든다.
-    - 여기서만 키용 표준화를 수행한다.
-    """
     df2 = df.copy()
 
-    # 면적 키
+    # 면적
     if "_면적_num" in df2.columns:
         df2["_면적_key"] = pd.to_numeric(df2["_면적_num"], errors="coerce").round(2).fillna(-1)
     else:
-        # prev/base에서 _면적_num이 없을 수 있음
-        area_col = "전용면적(m²)" if "전용면적(m²)" in df2.columns else None
-        if area_col:
-            df2["_면적_key"] = pd.to_numeric(df2[area_col], errors="coerce").round(2).fillna(-1)
+        if "전용면적(m²)" in df2.columns:
+            df2["_면적_key"] = pd.to_numeric(df2["전용면적(m²)"], errors="coerce").round(2).fillna(-1)
         else:
             df2["_면적_key"] = -1
 
@@ -775,7 +732,6 @@ def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = ""
         df2[c] = df2[c].map(_norm_dash_blank)
 
-    # 번호/동/층
     for c in ["본번","부번"]:
         if c not in df2.columns:
             df2[c] = ""
@@ -787,7 +743,6 @@ def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = ""
         df2[c] = df2[c].map(_norm_dash_blank)
 
-    # 숫자: 정수 문자열로 고정
     for c in ["계약년","계약월","계약일","거래금액(만원)"]:
         if c not in df2.columns:
             df2[c] = 0
@@ -802,7 +757,7 @@ def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = ""
     return df2[key_cols].astype(str)
 
-
+# ---- 시트 IO ----
 def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     vals = _get_all_values_cached(ws)
     if not vals:
@@ -855,155 +810,176 @@ def _set_text_color(ws: gspread.Worksheet, start_row: int, end_row: int, start_c
     }]
     batch_format(ws, req)
 
+
 def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
+    """
+    ✅ 출력 정책(사용자 요구사항):
+    - 스냅샷은 "현재 데이터만" 기록(변동 칼럼 공백)
+    - 삭제/추가는 스냅샷에 섞지 않고 '변동사항' 섹션에만 기록
+    """
     if df_all is None or df_all.empty:
         log("[apgu] skipped: df_all empty")
         return
 
     df_all = _ensure_cols(df_all)
 
-    # ✅ 법정동 필터도 정규화 기반으로
-    bd = df_all["법정동"].astype(str)
-    bd = bd.str.replace("\u3000"," ", regex=False).str.replace("\u00a0"," ", regex=False).str.strip()
+    # 압구정동 필터(정규화 기반)
+    bd = df_all["법정동"].astype(str).str.replace("\u3000"," ", regex=False).str.replace("\u00a0"," ", regex=False).str.strip()
     cur = df_all[bd == "압구정동"].copy()
-
     if cur.empty:
         log("[apgu] no rows for 압구정동")
         return
 
+    # 날짜 정렬용
     cur["_dt"] = pd.to_datetime(
         cur["계약년"].map(_to_int_str) + "-" + cur["계약월"].map(_to_int_str) + "-" + cur["계약일"].map(_to_int_str),
         errors="coerce",
     )
     cur = cur.sort_values(["_dt", "거래금액(만원)"], ascending=[True, False]).drop(columns=["_dt"])
 
-    # ✅ 키 생성(표준화 적용)
+    # 오늘 스냅샷 키 생성
     cur_key = _make_key_df(cur)
     cur_key["__k"] = cur_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-    cur_set = set(cur_key["__k"].tolist())
+    cur_with_k = cur.copy()
+    cur_with_k["__k"] = cur_key["__k"].values
+    cur_set = set(cur_with_k["__k"].tolist())
 
-    ws_main = get_or_create_ws(sh, APGU_SHEET_NAME, rows=2000, cols=40)
-    ws_base = get_or_create_ws(sh, APGU_BASE_SHEET_NAME, rows=2000, cols=40)
+    ws_main = get_or_create_ws(sh, APGU_SHEET_NAME, rows=5000, cols=60)
+    ws_base = get_or_create_ws(sh, APGU_BASE_SHEET_NAME, rows=5000, cols=60)
     _hide_sheet(ws_base)
 
-    prev = _ws_to_df(ws_base)
-    if prev.empty:
+    # base(어제) 로드
+    prev_df = _ws_to_df(ws_base)
+    if prev_df.empty:
+        prev_df = pd.DataFrame(columns=["__k"])
         prev_set = set()
     else:
-        if "__k" in prev.columns:
-            prev_set = set(prev["__k"].astype(str).tolist())
+        if "__k" in prev_df.columns:
+            prev_df["__k"] = prev_df["__k"].astype(str)
+            prev_set = set(prev_df["__k"].tolist())
         else:
-            # ❗️중요: prev에 _ensure_cols를 적용하지 않는다(빈칸->0 변형 방지)
-            pk = _make_key_df(prev)
+            # 과거 베이스에 __k가 없다면 즉시 생성(호환)
+            pk = _make_key_df(prev_df)
             pk["__k"] = pk.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-            prev_set = set(pk["__k"].tolist())
+            prev_df["__k"] = pk["__k"].values
+            prev_set = set(prev_df["__k"].tolist())
 
     added_keys = sorted(list(cur_set - prev_set))
     removed_keys = sorted(list(prev_set - cur_set))
     log(f"[apgu] snapshot rows={len(cur)} added={len(added_keys)} removed={len(removed_keys)}")
 
-    # 메인 시트 헤더
-    ws_main_vals = _get_all_values_cached(ws_main)
-    if ws_main_vals and ws_main_vals[0]:
-        header = [str(x).strip() for x in ws_main_vals[0] if str(x).strip()]
+    # =========================
+    # (1) MAIN: 스냅샷만 기록
+    # =========================
+    # 헤더: 기존 메인 헤더를 존중하되, 없으면 cur.columns 기반
+    main_vals = _get_all_values_cached(ws_main)
+    if main_vals and main_vals[0]:
+        base_header = [str(x).strip() for x in main_vals[0] if str(x).strip()]
+        # 혹시 __k 같은게 과거에 들어있으면 제거
+        base_header = [h for h in base_header if h != "__k"]
     else:
-        header = list(cur.columns)
+        base_header = [c for c in cur.columns if c != "__k"]
 
-    header2 = ["변동"] + header if "변동" not in header else header
+    # 변동 컬럼은 항상 첫 칼럼으로 유지
+    if "변동" in base_header:
+        base_header = [h for h in base_header if h != "변동"]
+    header_snapshot = ["변동"] + base_header
 
     ws_clear(ws_main)
-    ws_update(ws_main, [header2], "A1")
+    ws_update(ws_main, [header_snapshot], "A1")
 
-    cur_out = cur.copy()
-    if "변동" not in cur_out.columns:
-        cur_out.insert(0, "변동", "")
-    values_cur = _df_to_values(cur_out, header2)
+    # 스냅샷 DF: 변동은 공백만
+    snap_df = cur.copy()
+    snap_df.insert(0, "변동", "")
+    snap_values = _df_to_values(snap_df, header_snapshot)
+    if snap_values:
+        ws_update(ws_main, snap_values, f"A2:{a1_col(len(header_snapshot))}{len(snap_values)+1}")
 
-    # diff 구간 생성
-    need = set(added_keys) | set(removed_keys)
+    # =========================
+    # (2) MAIN: 변동사항 섹션 추가
+    # =========================
+    diff_start = 2 + len(snap_values) + 2  # 한 줄 띄우기
 
-    # 키 -> 대표 row 매핑(가능하면 실제 df_all에서 가져옴)
-    df_all_key = _make_key_df(df_all)
-    df_all_key["__k"] = df_all_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
+    if added_keys or removed_keys:
+        # 제목 라인
+        title = f"변동사항 (기준: 어제 base 대비) / 실행일: {datetime.now().date().isoformat()}"
+        ws_update(
+            ws_main,
+            [[title] + [""]*(len(header_snapshot)-1)],
+            f"A{diff_start}:{a1_col(len(header_snapshot))}{diff_start}"
+        )
 
-    key_to_row = {}
-    if need:
-        mask = df_all_key["__k"].isin(list(need))
-        sub = df_all.loc[mask.values].copy()
-        sub = _ensure_cols(sub)
-        sub_key = _make_key_df(sub)
-        sub_key["__k"] = sub_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-        for i, k in enumerate(sub_key["__k"].tolist()):
-            if k not in key_to_row:
-                key_to_row[k] = sub.iloc[i]
+        # 삭제: prev_df에서 그대로 가져옴(정확)
+        del_df = pd.DataFrame()
+        if removed_keys and not prev_df.empty:
+            del_df = prev_df[prev_df["__k"].isin(removed_keys)].copy()
+            if not del_df.empty:
+                if "변동" in del_df.columns:
+                    del_df["변동"] = "삭제"
+                else:
+                    del_df.insert(0, "변동", "삭제")
 
-    def row_from_key(k: str) -> pd.Series:
-        if k in key_to_row:
-            return key_to_row[k]
-        parts = k.split("|")
-        cols = ["광역","구","법정동","본번","부번","단지명","_면적_key","계약년","계약월","계약일","거래금액(만원)","동","층"]
-        d = {c: parts[i] if i < len(parts) else "" for i,c in enumerate(cols)}
-        d["전용면적(m²)"] = d.pop("_면적_key","")
-        return pd.Series(d)
+        # 추가: 오늘 스냅샷에서 그대로 가져옴(정확)
+        add_df = pd.DataFrame()
+        if added_keys:
+            add_df = cur_with_k[cur_with_k["__k"].isin(added_keys)].copy()
+            # __k는 출력에서 제외
+            if "__k" in add_df.columns:
+                add_df = add_df.drop(columns=["__k"])
+            if "변동" in add_df.columns:
+                add_df["변동"] = "추가"
+            else:
+                add_df.insert(0, "변동", "추가")
 
-    diff_rows = []
-    for k in removed_keys:
-        rr = row_from_key(k).to_dict()
-        rr["변동"] = "삭제"
-        diff_rows.append(rr)
-    for k in added_keys:
-        rr = row_from_key(k).to_dict()
-        rr["변동"] = "추가"
-        diff_rows.append(rr)
+        # 삭제/추가 합치기(삭제 먼저)
+        out_diff = []
+        if not del_df.empty:
+            # __k는 출력에서 제외
+            if "__k" in del_df.columns:
+                del_df = del_df.drop(columns=["__k"])
+            out_diff.append(del_df)
+        if not add_df.empty:
+            out_diff.append(add_df)
 
-    # 메인 스냅샷 쓰기
-    start_row = 2
-    if values_cur:
-        ws_update(ws_main, values_cur, f"A{start_row}:{a1_col(len(header2))}{start_row+len(values_cur)-1}")
+        diff_df = pd.concat(out_diff, ignore_index=True) if out_diff else pd.DataFrame(columns=header_snapshot)
 
-    # diff 표
-    diff_start = start_row + len(values_cur) + 2
-    if diff_rows:
-        df_diff = pd.DataFrame(diff_rows)
-        df_diff = _ensure_cols(df_diff)
-        if "변동" not in df_diff.columns:
-            df_diff.insert(0, "변동", "")
-        values_diff = _df_to_values(df_diff, header2)
+        # 헤더 정렬(없으면 빈칸)
+        diff_values = _df_to_values(diff_df, header_snapshot)
 
-        ws_update(ws_main, [["변동사항(삭제=빨강, 추가=파랑)"] + [""]*(len(header2)-1)],
-                  f"A{diff_start-1}:{a1_col(len(header2))}{diff_start-1}")
-        ws_update(ws_main, values_diff, f"A{diff_start}:{a1_col(len(header2))}{diff_start+len(values_diff)-1}")
+        diff_rows_start = diff_start + 1
+        if diff_values:
+            ws_update(
+                ws_main,
+                diff_values,
+                f"A{diff_rows_start}:{a1_col(len(header_snapshot))}{diff_rows_start+len(diff_values)-1}"
+            )
 
-        del_n = len(removed_keys)
-        add_n = len(added_keys)
-        if del_n:
-            _set_text_color(ws_main, diff_start, diff_start+del_n-1, 1, len(header2), (0.85,0.0,0.0))
-        if add_n:
-            _set_text_color(ws_main, diff_start+del_n, diff_start+del_n+add_n-1, 1, len(header2), (0.0,0.2,0.85))
+            # 색상 적용: 삭제 빨강 / 추가 파랑
+            del_n = 0 if del_df.empty else len(del_df)
+            add_n = 0 if add_df.empty else len(add_df)
+            if del_n:
+                _set_text_color(ws_main, diff_rows_start, diff_rows_start+del_n-1, 1, len(header_snapshot), (0.85, 0.0, 0.0))
+            if add_n:
+                _set_text_color(ws_main, diff_rows_start+del_n, diff_rows_start+del_n+add_n-1, 1, len(header_snapshot), (0.0, 0.2, 0.85))
 
-    # base 저장(다음 실행 비교용)
-    # ✅ base에는 __k를 반드시 저장해서 다음번엔 prev 재구성 없이 바로 set 비교
-    base_header = ["__k"] + [c for c in APGU_KEY_COLS if c in cur.columns] + ["전용면적(m²)"]
-    base_header = list(dict.fromkeys(base_header))
+    # =========================
+    # (3) BASE: 오늘 스냅샷 저장(다음 실행 비교용)
+    # =========================
+    # base는 __k 포함해서 저장
+    base_cols = ["__k"] + [c for c in cur.columns if c != "__k"]
+    base_cols = list(dict.fromkeys(base_cols))
+
     ws_clear(ws_base)
-    ws_update(ws_base, [base_header], "A1")
+    ws_update(ws_base, [base_cols], "A1")
 
-    base_df2 = _ensure_cols(cur.copy())
-
-    # __k 재생성(표준화 동일)
-    kdf = _make_key_df(base_df2)
-    kdf["__k"] = kdf.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-    base_df2["__k"] = kdf["__k"].values
-
-    if "전용면적(m²)" not in base_df2.columns:
-        base_df2["전용면적(m²)"] = ""
-
-    base_vals = _df_to_values(base_df2, base_header)
+    base_save = cur_with_k.copy()
+    # base_save에는 __k가 있음
+    base_vals = _df_to_values(base_save, base_cols)
     if base_vals:
-        ws_update(ws_base, base_vals, f"A2:{a1_col(len(base_header))}{len(base_vals)+1}")
+        ws_update(ws_base, base_vals, f"A2:{a1_col(len(base_cols))}{len(base_vals)+1}")
     _hide_sheet(ws_base)
 
-    log("[apgu] updated main/base")
+    log("[apgu] updated: snapshot(top) + diff(section) + base(saved)")
 
 
 # ===================== 메인 =====================
