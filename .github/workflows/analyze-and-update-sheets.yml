@@ -3,7 +3,7 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 21 * * *"  # 필요시 조정
+    - cron: "0 0 * * *"  # 필요시 조정
 
 jobs:
   run:
