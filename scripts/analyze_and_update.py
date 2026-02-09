@@ -2,30 +2,27 @@
 from __future__ import annotations
 
 """
-analyze_and_update.py (최종본)
+analyze_and_update.py (정리본 / 폴더ID 확정 버전)
+
+전제:
+- DRIVE_FOLDER_ID는 '아파트' 폴더 자체 ID(또는 폴더 URL)로 정확히 설정되어 있음
+- 서비스계정에 해당 폴더 접근 권한이 있음(검증 완료)
 
 목표:
-- Google Drive(공유드라이브 포함)에서 '아파트 YYYYMM.xlsx' 파일을 직접 읽어온다 (artifacts 사용/다운로드/폴백 없음)
-- 최신 12개월을 선별해 로컬로 다운로드 후 기존 시트 구조(전국/서울 월탭 + 거래요약 + 압구정동/압구정동_base)를 업데이트한다
-- Shared Drive 이슈(바로가기/폴더ID 혼동/404) 대응:
-  - DRIVE_FOLDER_ID가 틀리거나 shortcut일 때도 자동 해소/탐색
-  - supportsAllDrives / includeItemsFromAllDrives / corpora=drive 처리
-- 환경변수/시크릿 누락 시 즉시 명확한 에러 메시지
+- Drive에서 '아파트 YYYYMM.xlsx' 최신 12개월만 내려받아 처리 (Drive 호출 최소화)
+- Google Sheets 업데이트: 전국/서울 월탭 + 거래요약 + 압구정동/압구정동_base
 
 필수 ENV:
-- SHEET_ID: 기록 대상 구글시트 ID
-- SA_JSON 또는 SA_PATH: 서비스계정 JSON(전체)
-  (또는 GitHub Secret 관행에 맞춰 GDRIVE_SA_JSON 도 허용)
-- DRIVE_FOLDER_ID: '아파트' 폴더 ID 또는 폴더 URL (공유드라이브 내부의 '아파트 폴더 자체' 권장)
-  (만약 DRIVE_FOLDER_ID가 부모폴더라면, 아래 DRIVE_SUBFOLDER_NAME='아파트'로 하위탐색 가능)
-- DRIVE_SUPPORTS_ALL_DRIVES: "true" (공유드라이브면 필수)
+- SHEET_ID
+- SA_JSON 또는 SA_PATH (또는 GDRIVE_SA_JSON도 허용)
+- DRIVE_FOLDER_ID
+- DRIVE_SUPPORTS_ALL_DRIVES: "true" 권장(공유드라이브면 사실상 필수)
 
 선택 ENV:
-- DRIVE_SUBFOLDER_NAME: 기본 "아파트"
 - DRIVE_FILE_REGEX: 기본 r"^아파트\\s*(\\d{6})\\.xlsx$"
-- DRIVE_SCAN_MAX_FILES: 목록조회 pageSize(기본 4000)
-- DOWNLOAD_DIR: 다운로드 디렉토리(기본 "_drive_downloads")
-- MAX_SCAN_ROWS: 월탭 A열 스캔 범위(기본 900)
+- DRIVE_SCAN_MAX_FILES: list pageSize(기본 1000, Drive API 최대 1000)
+- DOWNLOAD_DIR: 기본 "_drive_downloads"
+- MAX_SCAN_ROWS: 기본 900
 """
 
 import os, re, json, time, random
@@ -50,11 +47,11 @@ SUMMARY_SHEET_NAME = "거래요약"
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "900"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "_drive_downloads"))
 
-DRIVE_SUBFOLDER_NAME = os.environ.get("DRIVE_SUBFOLDER_NAME", "아파트").strip() or "아파트"
 DRIVE_FILE_REGEX = os.environ.get("DRIVE_FILE_REGEX", r"^아파트\s*(\d{6})\.xlsx$")
 APT_FILE_RE = re.compile(DRIVE_FILE_REGEX)
 
-DRIVE_SCAN_MAX_FILES = int(os.environ.get("DRIVE_SCAN_MAX_FILES", "4000"))
+# Drive files.list pageSize max = 1000
+DRIVE_SCAN_MAX_FILES = int(os.environ.get("DRIVE_SCAN_MAX_FILES", "1000"))
 
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
@@ -145,7 +142,6 @@ def a1_col(n: int) -> str:
 
 # ===================== 인증 =====================
 def _get_sa_json_env() -> str:
-    # ✅ 핵심 수정: SA_JSON이 없으면 GDRIVE_SA_JSON을 사용
     return (os.environ.get("SA_JSON") or os.environ.get("GDRIVE_SA_JSON") or "").strip()
 
 def load_creds():
@@ -168,26 +164,23 @@ def load_creds():
 def build_drive(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-# ===================== Drive helpers (공유드라이브/shortcut/404 대응) =====================
-def drive_list_drives(drive, page_size: int = 100):
-    out, token = [], None
-    while True:
-        resp = drive.drives().list(
-            pageSize=page_size,
-            pageToken=token,
-            fields="nextPageToken, drives(id,name)"
-        ).execute()
-        out.extend(resp.get("drives", []))
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    return out
+# ===================== Drive (폴더ID 확정/최소호출) =====================
+def drive_list_files(
+    drive,
+    q: str,
+    supports_all_drives: bool,
+    corpora: str = "allDrives",
+    drive_id: Optional[str] = None,
+    page_size: int = 1000,
+    fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size)"
+):
+    # Drive API hard limit: 1000
+    try:
+        page_size = int(page_size)
+    except Exception:
+        page_size = 1000
+    page_size = max(1, min(page_size, 1000))
 
-def drive_list_files(drive, q: str, supports_all_drives: bool,
-                     corpora: str = "allDrives",
-                     drive_id: Optional[str] = None,
-                     page_size: int = 1000,
-                     fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size,shortcutDetails)"):
     kwargs = dict(
         q=q,
         fields=fields,
@@ -210,117 +203,33 @@ def drive_list_files(drive, q: str, supports_all_drives: bool,
             break
     return out
 
-def get_meta_safe(drive, file_id: str, supports_all_drives: bool) -> Optional[dict]:
-    try:
-        return drive.files().get(
-            fileId=file_id,
-            fields="id,name,mimeType,driveId,parents,shortcutDetails",
-            supportsAllDrives=supports_all_drives
-        ).execute()
-    except HttpError as e:
-        log(f"[drive] meta get failed file_id={file_id}: {e}")
-        return None
+def get_folder_meta(drive, folder_id: str, supports_all_drives: bool) -> dict:
+    return drive.files().get(
+        fileId=folder_id,
+        fields="id,name,mimeType,driveId,parents",
+        supportsAllDrives=supports_all_drives
+    ).execute()
 
-def resolve_shortcut_id(meta: dict) -> Optional[str]:
-    if not meta:
-        return None
-    if meta.get("mimeType") == "application/vnd.google-apps.shortcut":
-        sd = meta.get("shortcutDetails") or {}
-        return sd.get("targetId")
-    return None
-
-def resolve_folder_id(drive, folder_id_or_url: str, supports_all_drives: bool) -> Tuple[str, Optional[str]]:
+def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
     """
-    1) folder_id_or_url이 폴더ID(또는 URL)이면 meta 조회
-       - shortcut이면 targetId로 해소
-    2) meta 조회가 404/None이면: 공유드라이브 전체에서 '아파트' 폴더 자동탐색(파일 패턴 기반)
-    반환: (folder_id, drive_id)
+    폴더 내 xlsx만 타이트하게 list -> 파일명 regex로 YYYYMM 추출 -> 최신 12개월 선택
+    Drive 호출: files.list (보통 1회, 많아도 페이지 토큰만큼)
     """
-    fid = _extract_id(folder_id_or_url)
+    meta = get_folder_meta(drive, folder_id, supports_all_drives)
+    drive_id = meta.get("driveId")
 
-    if fid:
-        meta = get_meta_safe(drive, fid, supports_all_drives)
-        if meta:
-            target = resolve_shortcut_id(meta)
-            if target:
-                log(f"[drive] folder is shortcut -> targetId={target}")
-                meta2 = get_meta_safe(drive, target, supports_all_drives)
-                if meta2:
-                    return meta2["id"], meta2.get("driveId")
-            return meta["id"], meta.get("driveId")
-
-    # 자동탐색
-    log("[drive] auto-discovering folder by name/pattern in shared drives...")
-    drives = drive_list_drives(drive)
-    log(f"[drive] visible shared drives={len(drives)}")
-
-    best_folder = None
-    best_drive_id = None
-    best_score = -1
-
-    for d in drives:
-        did = d.get("id")
-        if not did:
-            continue
-
-        q_folder = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{DRIVE_SUBFOLDER_NAME}'"
-        folders = drive_list_files(
-            drive, q_folder, supports_all_drives,
-            corpora="drive", drive_id=did, page_size=200,
-            fields="nextPageToken, files(id,name,mimeType,driveId,parents,shortcutDetails)"
-        )
-
-        for f in folders:
-            folder_id = f.get("id")
-            if not folder_id:
-                continue
-
-            # shortcut 폴더면 target 해소
-            target = resolve_shortcut_id(f)
-            if target:
-                f2 = get_meta_safe(drive, target, supports_all_drives)
-                if f2:
-                    folder_id = f2["id"]
-
-            q_items = f"'{folder_id}' in parents and trashed=false"
-            items = drive_list_files(
-                drive, q_items, supports_all_drives,
-                corpora="drive", drive_id=did, page_size=2000
-            )
-
-            score = 0
-            for it in items:
-                name = it.get("name", "")
-                if APT_FILE_RE.match(name):
-                    score += 1
-
-            if score > best_score:
-                best_score = score
-                best_folder = folder_id
-                best_drive_id = did
-
-    if not best_folder or best_score <= 0:
-        raise RuntimeError(
-            "Drive에서 아파트 폴더/파일을 찾지 못했습니다.\n"
-            "- 서비스계정 이메일이 공유드라이브 멤버(또는 해당 폴더 공유)인지\n"
-            "- 폴더명이 '아파트'인지\n"
-            "- 파일명이 '아파트 202510.xlsx' 형식인지\n"
-            "- DRIVE_SUPPORTS_ALL_DRIVES=true인지 확인하세요."
-        )
-
-    log(f"[drive] auto-discovered folder id={best_folder} driveId={best_drive_id} matched={best_score}")
-    return best_folder, best_drive_id
-
-def pick_latest_12_months_from_drive(drive, folder_id_or_url: str, supports_all_drives: bool) -> List[dict]:
-    folder_id, drive_id = resolve_folder_id(drive, folder_id_or_url, supports_all_drives)
-
-    # 폴더 안의 파일 목록
-    q = f"'{folder_id}' in parents and trashed=false"
     corpora = "drive" if (supports_all_drives and drive_id) else "allDrives"
+
+    # 폴더 내 xlsx만(가능하면 mimeType으로 먼저 거름)
+    q = (
+        f"'{folder_id}' in parents and trashed=false "
+        f"and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
+    )
+
     items = drive_list_files(
         drive, q, supports_all_drives,
         corpora=corpora, drive_id=drive_id,
-        page_size=min(DRIVE_SCAN_MAX_FILES, 4000),
+        page_size=min(DRIVE_SCAN_MAX_FILES, 1000),
     )
 
     matched = []
@@ -331,15 +240,14 @@ def pick_latest_12_months_from_drive(drive, folder_id_or_url: str, supports_all_
             ym = m.group(1)  # YYYYMM
             matched.append((ym, it))
 
-    log(f"[drive] listed items={len(items)} matched_apt={len(matched)} folder={folder_id}")
+    log(f"[drive] listed_xlsx={len(items)} matched_apt_xlsx={len(matched)} folder={folder_id}")
 
     if not matched:
         raise RuntimeError(
             "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.\n"
-            "1) DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지\n"
-            "2) 서비스계정이 그 폴더(공유드라이브)에 공유/멤버인지\n"
-            "3) DRIVE_SUPPORTS_ALL_DRIVES=true인지\n"
-            "4) 파일명 패턴(DRIVE_FILE_REGEX)이 맞는지 확인하세요."
+            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지\n"
+            "- 파일명이 '아파트 202602.xlsx' 형식인지\n"
+            "- DRIVE_FILE_REGEX가 맞는지 확인하세요."
         )
 
     def ts(it):
@@ -375,25 +283,16 @@ def download_latest_12_months_from_drive(creds) -> List[Path]:
     supports_all_drives = _bool_env("DRIVE_SUPPORTS_ALL_DRIVES", True)
 
     folder_env = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-    parent_env = os.environ.get("DRIVE_PARENT_FOLDER_ID", "").strip()
+    if not folder_env:
+        raise RuntimeError("DRIVE_FOLDER_ID 환경변수가 필요합니다. ('아파트' 폴더 자체 ID/URL)")
 
-    if not folder_env and not parent_env:
-        raise RuntimeError("DRIVE_FOLDER_ID(권장) 또는 DRIVE_PARENT_FOLDER_ID 중 하나가 필요합니다.")
+    folder_id = _extract_id(folder_env)
+    if not folder_id:
+        raise RuntimeError("DRIVE_FOLDER_ID에서 폴더 ID를 추출하지 못했습니다. 폴더 URL 또는 ID를 확인하세요.")
 
     drive = build_drive(creds)
 
-    if parent_env and not folder_env:
-        # 부모폴더 아래에서 subfolder 이름으로 탐색 → folder_env로 대체
-        parent_id, parent_drive_id = resolve_folder_id(drive, parent_env, supports_all_drives)
-        corpora = "drive" if (supports_all_drives and parent_drive_id) else "allDrives"
-        q = f"'{parent_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{DRIVE_SUBFOLDER_NAME}'"
-        folders = drive_list_files(drive, q, supports_all_drives, corpora=corpora, drive_id=parent_drive_id, page_size=50)
-        if not folders:
-            raise RuntimeError(f"부모폴더 아래에서 '{DRIVE_SUBFOLDER_NAME}' 폴더를 찾지 못했습니다. 부모폴더 ID/공유를 확인하세요.")
-        folder_env = folders[0]["id"]
-        log(f"[drive] found subfolder '{DRIVE_SUBFOLDER_NAME}' id={folder_env}")
-
-    picked = pick_latest_12_months_from_drive(drive, folder_env, supports_all_drives)
+    picked = pick_latest_12_months_from_folder(drive, folder_id, supports_all_drives)
 
     paths: List[Path] = []
     for it in picked:
@@ -401,7 +300,7 @@ def download_latest_12_months_from_drive(creds) -> List[Path]:
         fid = it.get("id", "")
         if not fid:
             continue
-        out = DOWNLOAD_DIR / name
+        out = DOWNLOAD_DIR / name  # ✅ 원본 파일명 유지
         log(f"[drive] downloading: {name}")
         download_file_from_drive(drive, fid, out, supports_all_drives)
         paths.append(out)
@@ -437,7 +336,6 @@ def ws_clear(ws: gspread.Worksheet):
     return resp
 
 def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
-    # NaN/inf 방지: USER_ENTERED로 쓰더라도 values 내부는 반드시 JSON-safe
     safe_data = []
     for d in data:
         vals = d.get("values", [])
@@ -462,7 +360,6 @@ def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
 def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     if not requests:
         return None
-    # NaN/inf 방지: requests 내부 float 검사(특히 색상/서식 값)
     def _clean(obj):
         if isinstance(obj, dict):
             return {k: _clean(v) for k, v in obj.items()}
@@ -496,10 +393,7 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
     return ws
 
 # ===================== 월탭 이름/파일명 처리 =====================
-YM_RE = re.compile(r"(\d{4})년\s*(\d{1,2})월")
-
 def ym_from_apt_filename(fname: str):
-    # fname: "아파트 202510.xlsx" -> 전국/서울 탭명 + yy/mm
     s = str(fname or "")
     m = re.search(r"(20\d{2})(\d{2})", s)
     if not m:
@@ -568,18 +462,6 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
 
     values_batch_update(ws, payload)
     log(f"[ws] {ws.title} -> {date_iso} row={row_idx} wrote_cells={len(payload)}")
-
-    # verify
-    try:
-        last_col = a1_col(max(1, len(header)))
-        vrng = f"A{row_idx}:{last_col}{row_idx}"
-        got = _retry(ws.get, vrng) or []
-        if got:
-            row = got[0]
-            view = row[:6] + (["..."] if len(row) > 10 else []) + (row[-2:] if len(row) > 8 else [])
-            log(f"[verify] {ws.title} {vrng} -> {view}")
-    except Exception as e:
-        log(f"[verify] failed: {e}")
 
 def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
     ws = fuzzy_ws(sh, title)
@@ -781,8 +663,7 @@ def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     for r in rows:
         rr = r + [""] * (maxw - len(r))
         norm_rows.append(rr)
-    out = pd.DataFrame(norm_rows, columns=header[:maxw])
-    return out
+    return pd.DataFrame(norm_rows, columns=header[:maxw])
 
 def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
     df2 = df.copy()
@@ -867,10 +748,7 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
     else:
         header = list(cur.columns)
 
-    if "변동" not in header:
-        header2 = ["변동"] + header
-    else:
-        header2 = header
+    header2 = ["변동"] + header if "변동" not in header else header
 
     ws_clear(ws_main)
     ws_update(ws_main, [header2], "A1")
@@ -906,13 +784,11 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
 
     diff_rows = []
     for k in removed_keys:
-        r = row_from_key(k)
-        rr = r.to_dict()
+        rr = row_from_key(k).to_dict()
         rr["변동"] = "삭제"
         diff_rows.append(rr)
     for k in added_keys:
-        r = row_from_key(k)
-        rr = r.to_dict()
+        rr = row_from_key(k).to_dict()
         rr["변동"] = "추가"
         diff_rows.append(rr)
 
@@ -965,13 +841,12 @@ def main():
     if not sheet_id:
         raise RuntimeError("SHEET_ID 환경변수가 필요합니다.")
 
-    # ✅ 핵심 수정: SA_JSON / GDRIVE_SA_JSON / SA_PATH 체크
     if not _get_sa_json_env() and not os.environ.get("SA_PATH", "").strip():
         raise RuntimeError("SA_JSON(또는 GDRIVE_SA_JSON) 또는 SA_PATH 환경변수가 필요합니다.")
 
     creds = load_creds()
 
-    # 1) Drive에서 최신 12개월 xlsx 다운로드 (artifacts 사용 없음)
+    # 1) Drive에서 최신 12개월 xlsx 다운로드
     xlsx_paths = download_latest_12_months_from_drive(creds)
     if not xlsx_paths:
         log("[drive] no files downloaded. stop.")
@@ -985,14 +860,12 @@ def main():
 
     # 3) 월별 처리
     df_all_frames: List[pd.DataFrame] = []
-    summary_rows = []  # (yy/mm, counts, med, mean)
+    summary_rows = []
 
-    # 파일명에서 yy/mm 정렬
     def ym_key(yymm: str):
         yy, mm = yymm.split("/")
         return (2000 + int(yy), int(mm))
 
-    # 파일 -> yymm 매핑
     file_map: Dict[str, Path] = {}
     for p in xlsx_paths:
         nat_title, seoul_title, yymm = ym_from_apt_filename(p.name)
@@ -1014,14 +887,12 @@ def main():
         counts, med, mean = agg_all_stats(df)
         summary_rows.append((yymm, counts, med, mean))
 
-        # 전국 월탭
         ws_nat = ensure_month_ws(sh, nat_title, "전국")
         header_nat = ["날짜"] + NATION_REGIONS
         values_nat = {k: int(counts.get(k, 0)) for k in NATION_REGIONS if k != "총합계"}
         values_nat["총합계"] = int(counts.get("전국", 0))
         write_month_sheet(ws_nat, today_iso, header_nat, values_nat)
 
-        # 서울 월탭
         ws_seoul = ensure_month_ws(sh, seoul_title, "서울")
         header_seoul = ["날짜"] + SEOUL_REGIONS
         values_seoul = {k: int(counts.get(k, 0)) for k in SEOUL_REGIONS if k != "총합계"}
@@ -1061,10 +932,7 @@ def main():
         row_map["압구정동 중앙값(억)"].append(md.get("압구정동", ""))
         row_map["압구정동 평균가(억)"].append(mn.get("압구정동", ""))
 
-    out_rows = []
-    for k, arr in row_map.items():
-        out_rows.append([k] + arr)
-
+    out_rows = [[k] + arr for k, arr in row_map.items()]
     ws_update(ws_sum, out_rows, f"A2:{a1_col(len(header))}{len(out_rows)+1}")
     log(f"[summary] wrote rows={len(out_rows)} months={len(months)}")
 
