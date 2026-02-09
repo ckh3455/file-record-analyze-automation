@@ -1,12 +1,10 @@
-name: analyze-and-update-sheets
+name: drive-permission-verify
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 21 * * *"
 
 jobs:
-  run:
+  verify:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,10 +16,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install minimal deps for verification
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install google-api-python-client google-auth
 
       - name: Prepare report dir
         shell: bash
@@ -34,31 +32,107 @@ jobs:
           mkdir -p analyze_report
           ls -la
 
-      - name: Debug env (mask)
+      - name: Show SA client_email + raw envs
         env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
-          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
           python - <<'PY'
-          import os
-          need = ["SHEET_ID","DRIVE_FOLDER_ID","DRIVE_SUPPORTS_ALL_DRIVES","SA_JSON"]
-          missing = [k for k in need if not os.environ.get(k)]
-          print("missing:", missing)
-          raise SystemExit(1 if missing else 0)
+          import os, json
+          info = json.loads(os.environ["SA_JSON"])
+          print("client_email =", info.get("client_email"))
+          print("DRIVE_FOLDER_ID(raw) =", repr(os.environ.get("DRIVE_FOLDER_ID","")))
+          print("DRIVE_SUPPORTS_ALL_DRIVES(raw) =", repr(os.environ.get("DRIVE_SUPPORTS_ALL_DRIVES","")))
           PY
 
-      - name: Run analyze_and_update
+      - name: Drive folder meta + children list check
         env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
-          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
-          python scripts/analyze_and_update.py
+          python - <<'PY'
+          import os, json, re, sys
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
 
-      - name: Upload analyze report
+          def extract_id(x: str) -> str:
+            x = (x or "").strip()
+            m = re.search(r"/folders/([a-zA-Z0-9_-]+)", x)
+            if m: return m.group(1)
+            m = re.search(r"id=([a-zA-Z0-9_-]+)", x)
+            if m: return m.group(1)
+            return x
+
+          def to_bool(v: str, default=True) -> bool:
+            if v is None: return default
+            v = str(v).strip().lower()
+            return v in ("1","true","yes","y","on")
+
+          info = json.loads(os.environ["SA_JSON"])
+          creds = Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"]
+          )
+          drive = build("drive","v3",credentials=creds,cache_discovery=False)
+
+          supports = to_bool(os.environ.get("DRIVE_SUPPORTS_ALL_DRIVES","true"), True)
+          fid = extract_id(os.environ.get("DRIVE_FOLDER_ID",""))
+
+          if not fid:
+            print("ERROR: DRIVE_FOLDER_ID is empty")
+            sys.exit(2)
+
+          print("using folder id =", fid)
+          print("supportsAllDrives =", supports)
+
+          # 1) 폴더 메타
+          try:
+            meta = drive.files().get(
+              fileId=fid,
+              fields="id,name,mimeType,driveId,parents,owners",
+              supportsAllDrives=supports
+            ).execute()
+            print("FOLDER_META =", meta)
+          except HttpError as e:
+            print("FOLDER_META_ERROR =", e)
+            # 여기서 404면 거의 항상 (a) 권한 없음 (b) 폴더ID 틀림
+            sys.exit(3)
+
+          # 2) 자식 목록
+          try:
+            resp = drive.files().list(
+              q=f"'{fid}' in parents and trashed=false",
+              pageSize=20,
+              fields="files(id,name,mimeType,driveId,parents),nextPageToken",
+              supportsAllDrives=supports,
+              includeItemsFromAllDrives=supports,
+              corpora="allDrives"
+            ).execute()
+            files = resp.get("files", [])
+            print("CHILDREN_COUNT =", len(files))
+            for f in files:
+              print(" -", f.get("name"), "|", f.get("mimeType"), "|", f.get("id"))
+          except HttpError as e:
+            print("CHILDREN_LIST_ERROR =", e)
+            sys.exit(4)
+
+          print("OK: folder meta + children list succeeded.")
+          PY
+
+      # 선택: 실제 스크립트도 실행해보고 싶으면 아래를 켜세요.
+      # - name: Run analyze_and_update (optional)
+      #   env:
+      #     SHEET_ID: ${{ secrets.SHEET_ID }}
+      #     DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      #     DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
+      #     SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+      #   run: |
+      #     python scripts/analyze_and_update.py
+
+      - name: Upload analyze report (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
