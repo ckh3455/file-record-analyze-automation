@@ -24,7 +24,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Prepare report dir
-        run: mkdir -p analyze_report
+        shell: bash
+        run: |
+          set -e
+          if [ -f analyze_report ]; then
+            echo "analyze_report is a FILE. removing it..."
+            rm -f analyze_report
+          fi
+          mkdir -p analyze_report
+          ls -la
 
       - name: Debug env (mask)
         env:
@@ -41,13 +49,6 @@ jobs:
           raise SystemExit(1 if missing else 0)
           PY
 
-      - name: Locate script
-        run: |
-          echo "=== repo root ==="
-          ls -la
-          echo "=== find analyze_and_update*.py ==="
-          find . -maxdepth 5 -type f -name "analyze_and_update*.py" -print
-
       - name: Run analyze_and_update
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -55,11 +56,7 @@ jobs:
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
-          set -e
-          SCRIPT="$(find . -maxdepth 5 -type f -name "analyze_and_update*.py" | head -n 1)"
-          echo "SCRIPT=$SCRIPT"
-          test -n "$SCRIPT"
-          python "$SCRIPT"
+          python scripts/analyze_and_update.py
 
       - name: Upload analyze report
         if: always()
