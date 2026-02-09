@@ -3,7 +3,7 @@ name: analyze-and-update-sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 21 * * *"  # KST 06:15 (UTC 21:15) 예시
+    - cron: "15 21 * * *"
 
 jobs:
   run:
@@ -23,13 +23,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # (선택) env 체크 - 여기서 SA_JSON을 기대하면 반드시 env로 내려줘야 함
+      - name: Prepare report dir
+        run: mkdir -p analyze_report
+
       - name: Debug env (mask)
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
-          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}   # ✅ 핵심
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
           python - <<'PY'
           import os
@@ -39,14 +41,25 @@ jobs:
           raise SystemExit(1 if missing else 0)
           PY
 
+      - name: Locate script
+        run: |
+          echo "=== repo root ==="
+          ls -la
+          echo "=== find analyze_and_update*.py ==="
+          find . -maxdepth 5 -type f -name "analyze_and_update*.py" -print
+
       - name: Run analyze_and_update
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
-          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}   # ✅ 핵심
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
-          python analyze_and_update.py
+          set -e
+          SCRIPT="$(find . -maxdepth 5 -type f -name "analyze_and_update*.py" | head -n 1)"
+          echo "SCRIPT=$SCRIPT"
+          test -n "$SCRIPT"
+          python "$SCRIPT"
 
       - name: Upload analyze report
         if: always()
@@ -54,3 +67,4 @@ jobs:
         with:
           name: analyze_report
           path: analyze_report/
+          if-no-files-found: warn
