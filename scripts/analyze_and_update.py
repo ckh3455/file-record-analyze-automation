@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 """
-analyze_and_update.py (정리본 / 폴더ID 확정 버전)
+analyze_and_update.py (정리본 / 폴더ID 확정 + 시트 자동선택)
 
 전제:
-- DRIVE_FOLDER_ID는 '아파트' 폴더 자체 ID(또는 폴더 URL)로 정확히 설정되어 있음
+- DRIVE_FOLDER_ID는 '아파트' 폴더 자체 ID(또는 URL)로 정확히 설정되어 있음
 - 서비스계정에 해당 폴더 접근 권한이 있음(검증 완료)
 
 목표:
@@ -23,6 +23,7 @@ analyze_and_update.py (정리본 / 폴더ID 확정 버전)
 - DRIVE_SCAN_MAX_FILES: list pageSize(기본 1000, Drive API 최대 1000)
 - DOWNLOAD_DIR: 기본 "_drive_downloads"
 - MAX_SCAN_ROWS: 기본 900
+- EXCEL_SHEET_NAME: 시트명 강제(권장X: 월별로 달라질 수 있음)
 """
 
 import os, re, json, time, random
@@ -213,14 +214,13 @@ def get_folder_meta(drive, folder_id: str, supports_all_drives: bool) -> dict:
 def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
     """
     폴더 내 xlsx만 타이트하게 list -> 파일명 regex로 YYYYMM 추출 -> 최신 12개월 선택
-    Drive 호출: files.list (보통 1회, 많아도 페이지 토큰만큼)
+    Drive 호출: files.get(folder meta) 1회 + files.list (보통 1회, 페이지가 많으면 토큰만큼)
     """
     meta = get_folder_meta(drive, folder_id, supports_all_drives)
     drive_id = meta.get("driveId")
-
     corpora = "drive" if (supports_all_drives and drive_id) else "allDrives"
 
-    # 폴더 내 xlsx만(가능하면 mimeType으로 먼저 거름)
+    # 폴더 내 xlsx만 먼저 제한
     q = (
         f"'{folder_id}' in parents and trashed=false "
         f"and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
@@ -475,8 +475,71 @@ def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.
 
 # ===================== 파일 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="Sheet1", dtype=str)
-    df = df.fillna("")
+    """
+    우선순위:
+    1) EXCEL_SHEET_NAME 지정 시: 그 시트(없으면 에러)
+    2) 기본: 'Sheet1' 있으면 Sheet1
+    3) 없으면: 'data' 또는 'data' 포함 시트(대소문자/공백 무시)
+    4) 그래도 없으면: 컬럼 헤더 점수화로 자동 선택
+    """
+    forced = os.environ.get("EXCEL_SHEET_NAME", "").strip()
+
+    try:
+        xls = pd.ExcelFile(path)
+        sheet_names = list(xls.sheet_names or [])
+    except Exception as e:
+        raise RuntimeError(f"엑셀 파일을 열 수 없습니다: {path} ({e})")
+
+    if not sheet_names:
+        raise RuntimeError(f"엑셀 시트가 없습니다: {path.name}")
+
+    if forced:
+        if forced not in sheet_names:
+            raise RuntimeError(
+                f"{path.name}: EXCEL_SHEET_NAME='{forced}' 인데 시트가 없습니다. available={sheet_names}"
+            )
+        picked = forced
+        log(f"[excel] {path.name} -> forced '{picked}'")
+    else:
+        if "Sheet1" in sheet_names:
+            picked = "Sheet1"
+            log(f"[excel] {path.name} -> picked 'Sheet1'")
+        else:
+            def norm(s: str) -> str:
+                return re.sub(r"\s+", "", str(s or "")).lower()
+
+            norm_map = {norm(n): n for n in sheet_names}
+            picked = None
+
+            if "data" in norm_map:
+                picked = norm_map["data"]
+            else:
+                for k, v in norm_map.items():
+                    if "data" in k:
+                        picked = v
+                        break
+
+            if picked is None:
+                must_tokens = ["거래금액", "계약년", "계약월", "계약일", "광역", "구", "법정동", "전용면적", "단지명"]
+                best_name, best_score = sheet_names[0], -1
+
+                for sname in sheet_names:
+                    try:
+                        df_head = pd.read_excel(path, sheet_name=sname, nrows=5)
+                        cols = [str(c) for c in df_head.columns]
+                        score = sum(1 for t in must_tokens if any(t in c for c in cols))
+                        if score > best_score:
+                            best_score = score
+                            best_name = sname
+                    except Exception:
+                        continue
+
+                picked = best_name
+                log(f"[excel] {path.name} -> auto-picked '{picked}' score={best_score} candidates={sheet_names}")
+            else:
+                log(f"[excel] {path.name} -> picked '{picked}' candidates={sheet_names}")
+
+    df = pd.read_excel(path, sheet_name=picked, dtype=str).fillna("")
     for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -742,9 +805,9 @@ def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
     removed_keys = sorted(list(prev_set - cur_set))
     log(f"[apgu] snapshot rows={len(cur)} added={len(added_keys)} removed={len(removed_keys)}")
 
-    main_vals = _get_all_values_cached(ws_main)
-    if main_vals and main_vals[0]:
-        header = [str(x).strip() for x in main_vals[0] if str(x).strip()]
+    ws_main_vals = _get_all_values_cached(ws_main)
+    if ws_main_vals and ws_main_vals[0]:
+        header = [str(x).strip() for x in ws_main_vals[0] if str(x).strip()]
     else:
         header = list(cur.columns)
 
