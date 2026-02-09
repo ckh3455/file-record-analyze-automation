@@ -475,7 +475,7 @@ def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.
 
 # ===================== 파일 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="data", dtype=str)
+    df = pd.read_excel(path, sheet_name="Sheet1", dtype=str)
     df = df.fillna("")
     for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
         if c in df.columns:
