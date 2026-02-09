@@ -1,13 +1,18 @@
-name: verify-drive-folder-access
+name: analyze-and-update-sheets
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "15 21 * * *"  # 필요시 조정
 
 jobs:
-  verify:
+  run:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -16,90 +21,46 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install google-api-python-client google-auth
+          pip install -r requirements.txt
 
-      - name: Verify service account + folder access
+      - name: Prepare report dir (keep names as-is)
+        shell: bash
+        run: |
+          set -e
+          if [ -f analyze_report ]; then
+            echo "analyze_report is a FILE. removing it..."
+            rm -f analyze_report
+          fi
+          mkdir -p analyze_report
+
+      - name: Debug env (mask)
         env:
-          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
           python - <<'PY'
-          import os, json, re, sys
-          from google.oauth2.service_account import Credentials
-          from googleapiclient.discovery import build
-          from googleapiclient.errors import HttpError
-
-          def extract_id(x: str) -> str:
-              x = (x or "").strip()
-              m = re.search(r"/folders/([a-zA-Z0-9_-]+)", x)
-              if m: return m.group(1)
-              m = re.search(r"id=([a-zA-Z0-9_-]+)", x)
-              if m: return m.group(1)
-              return x
-
-          def to_bool(v: str, default=True) -> bool:
-              if v is None: return default
-              v = str(v).strip().lower()
-              return v in ("1","true","yes","y","on")
-
-          # 1) 어떤 서비스계정으로 실행 중인지
-          info = json.loads(os.environ["SA_JSON"])
-          client_email = info.get("client_email")
-          print("client_email =", client_email)
-
-          # 2) 폴더ID 정규화
-          raw = os.environ.get("DRIVE_FOLDER_ID","")
-          fid = extract_id(raw)
-          supports = to_bool(os.environ.get("DRIVE_SUPPORTS_ALL_DRIVES","true"), True)
-          print("DRIVE_FOLDER_ID(raw) =", repr(raw))
-          print("using folder id =", fid)
-          print("supportsAllDrives =", supports)
-
-          if not fid:
-              print("ERROR: DRIVE_FOLDER_ID is empty")
-              sys.exit(2)
-
-          # 3) Drive API 호출
-          creds = Credentials.from_service_account_info(
-              info,
-              scopes=["https://www.googleapis.com/auth/drive.readonly"]
-          )
-          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-          # 3-1) 폴더 메타 (여기서 404면: ID 틀림 또는 권한 없음 또는 서비스계정 불일치)
-          try:
-              meta = drive.files().get(
-                  fileId=fid,
-                  fields="id,name,mimeType,driveId,parents",
-                  supportsAllDrives=supports
-              ).execute()
-              print("FOLDER_META =", meta)
-          except HttpError as e:
-              print("FOLDER_META_ERROR =", e)
-              print("\nLikely causes:")
-              print(" - DRIVE_FOLDER_ID is not the actual folder id (copied wrong)")
-              print(" - The service account above does NOT have permission to that folder")
-              print(" - The folder is in a different Drive/Shared Drive than expected")
-              sys.exit(3)
-
-          # 3-2) 자식 목록 20개
-          try:
-              resp = drive.files().list(
-                  q=f"'{fid}' in parents and trashed=false",
-                  pageSize=20,
-                  fields="files(id,name,mimeType)",
-                  supportsAllDrives=supports,
-                  includeItemsFromAllDrives=supports,
-                  corpora="allDrives"
-              ).execute()
-              files = resp.get("files", [])
-              print("CHILDREN_COUNT =", len(files))
-              for f in files:
-                  print(" -", f.get("name"), "|", f.get("mimeType"))
-          except HttpError as e:
-              print("CHILDREN_LIST_ERROR =", e)
-              sys.exit(4)
-
-          print("OK: Access verified.")
+          import os
+          need = ["SHEET_ID","DRIVE_FOLDER_ID","DRIVE_SUPPORTS_ALL_DRIVES","SA_JSON"]
+          missing = [k for k in need if not os.environ.get(k)]
+          print("missing:", missing)
+          raise SystemExit(1 if missing else 0)
           PY
+
+      - name: Run analyze_and_update (original Drive filenames preserved)
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          python scripts/analyze_and_update.py
+
+      - name: Upload analyze report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze_report
+          path: analyze_report/
+          if-no-files-found: warn
