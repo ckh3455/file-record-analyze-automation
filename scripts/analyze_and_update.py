@@ -15,6 +15,7 @@ analyze_and_update.py (최종본)
 필수 ENV:
 - SHEET_ID: 기록 대상 구글시트 ID
 - SA_JSON 또는 SA_PATH: 서비스계정 JSON(전체)
+  (또는 GitHub Secret 관행에 맞춰 GDRIVE_SA_JSON 도 허용)
 - DRIVE_FOLDER_ID: '아파트' 폴더 ID 또는 폴더 URL (공유드라이브 내부의 '아파트 폴더 자체' 권장)
   (만약 DRIVE_FOLDER_ID가 부모폴더라면, 아래 DRIVE_SUBFOLDER_NAME='아파트'로 하위탐색 가능)
 - DRIVE_SUPPORTS_ALL_DRIVES: "true" (공유드라이브면 필수)
@@ -143,8 +144,12 @@ def a1_col(n: int) -> str:
     return s
 
 # ===================== 인증 =====================
+def _get_sa_json_env() -> str:
+    # ✅ 핵심 수정: SA_JSON이 없으면 GDRIVE_SA_JSON을 사용
+    return (os.environ.get("SA_JSON") or os.environ.get("GDRIVE_SA_JSON") or "").strip()
+
 def load_creds():
-    sa_json = os.environ.get("SA_JSON", "").strip()
+    sa_json = _get_sa_json_env()
     sa_path = os.environ.get("SA_PATH", "").strip()
 
     if sa_json:
@@ -152,7 +157,7 @@ def load_creds():
     elif sa_path:
         info = json.loads(Path(sa_path).read_text(encoding="utf-8"))
     else:
-        raise RuntimeError("SA_JSON 또는 SA_PATH 환경변수가 필요합니다.")
+        raise RuntimeError("SA_JSON(또는 GDRIVE_SA_JSON) 또는 SA_PATH 환경변수가 필요합니다.")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -770,7 +775,6 @@ def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     rows = vals[1:]
     if not header:
         return pd.DataFrame()
-    # 행마다 길이가 달라도 DataFrame 생성되게 정렬
     maxw = max([len(r) for r in rows], default=len(header))
     header = header + [""] * (maxw - len(header))
     norm_rows = []
@@ -786,7 +790,6 @@ def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
         if h not in df2.columns:
             df2[h] = ""
     df2 = df2[header]
-    # JSON-safe string
     return df2.replace([np.inf, -np.inf], "").fillna("").astype(str).values.tolist()
 
 def _hide_sheet(ws: gspread.Worksheet):
@@ -962,9 +965,9 @@ def main():
     if not sheet_id:
         raise RuntimeError("SHEET_ID 환경변수가 필요합니다.")
 
-    # SA_JSON 필수 체크를 가장 먼저
-    if not os.environ.get("SA_JSON", "").strip() and not os.environ.get("SA_PATH", "").strip():
-        raise RuntimeError("SA_JSON 또는 SA_PATH 환경변수가 필요합니다.")
+    # ✅ 핵심 수정: SA_JSON / GDRIVE_SA_JSON / SA_PATH 체크
+    if not _get_sa_json_env() and not os.environ.get("SA_PATH", "").strip():
+        raise RuntimeError("SA_JSON(또는 GDRIVE_SA_JSON) 또는 SA_PATH 환경변수가 필요합니다.")
 
     creds = load_creds()
 
