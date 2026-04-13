@@ -5,9 +5,10 @@ from __future__ import annotations
 analyze_and_update.py
 
 핵심:
-- Drive의 '아파트 YYYYMM.xlsx' 파일을 읽어 최신 12개월 월별 집계를 시트에 기록
+- Drive의 '아파트 YYYYMM.xlsx' 파일을 읽어 최근 5개월만 월별 집계를 시트에 기록
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
+- 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
 - 압구정동 탭은 스냅샷/변동사항 분리
 
 필수 ENV:
@@ -115,7 +116,6 @@ def _throttle(sec: float = 0.60):
     _LAST = _t.time()
 
 
-
 def _retry(fn, *a, **kw):
     base = 0.8
     for i in range(7):
@@ -136,7 +136,6 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
-
 def _extract_id(x: str) -> str:
     if not x:
         return ""
@@ -150,7 +149,6 @@ def _extract_id(x: str) -> str:
     return x
 
 
-
 def a1_col(n: int) -> str:
     s = ""
     while n > 0:
@@ -162,7 +160,6 @@ def a1_col(n: int) -> str:
 # ===================== 인증 =====================
 def _get_sa_json_env() -> str:
     return (os.environ.get("SA_JSON") or os.environ.get("GDRIVE_SA_JSON") or "").strip()
-
 
 
 def load_creds():
@@ -181,7 +178,6 @@ def load_creds():
         "https://www.googleapis.com/auth/drive",
     ]
     return Credentials.from_service_account_info(info, scopes=scopes)
-
 
 
 def build_drive(creds):
@@ -227,14 +223,12 @@ def drive_list_files(
     return out
 
 
-
 def get_folder_meta(drive, folder_id: str, supports_all_drives: bool) -> dict:
     return drive.files().get(
         fileId=folder_id,
         fields="id,name,mimeType,driveId,parents",
         supportsAllDrives=supports_all_drives,
     ).execute()
-
 
 
 def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
@@ -268,12 +262,9 @@ def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives:
 
     if not matched:
         raise RuntimeError(
-            "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.
-"
-            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지
-"
-            "- 파일명이 '아파트 202602.xlsx' 형식인지
-"
+            "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.\n"
+            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지\n"
+            "- 파일명이 '아파트 202602.xlsx' 형식인지\n"
             "- DRIVE_FILE_REGEX가 맞는지 확인하세요."
         )
 
@@ -290,11 +281,10 @@ def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives:
         if not cur or ts(it) > ts(cur):
             best_by_ym[ym] = it
 
-    # 최신 5개월만 선택, 이후 최신월이 앞에 오도록 유지
+    # 최신 5개월만, 최신월이 앞에 오도록 유지
     yms = sorted(best_by_ym.keys(), reverse=True)[:5]
     log(f"[drive] months_to_process={yms}")
     return [best_by_ym[ym] for ym in yms]
-
 
 
 def download_file_from_drive(drive, file_id: str, out_path: Path, supports_all_drives: bool):
@@ -306,7 +296,6 @@ def download_file_from_drive(drive, file_id: str, out_path: Path, supports_all_d
         while not done:
             _, done = downloader.next_chunk()
     return out_path
-
 
 
 def download_latest_5_months_from_drive(creds) -> List[Path]:
@@ -350,7 +339,6 @@ def _invalidate_cache(ws: Optional[gspread.Worksheet]):
         pass
 
 
-
 def _get_all_values_cached(ws: gspread.Worksheet) -> List[List[str]]:
     if ws.id in _WS_VALUES_CACHE:
         return _WS_VALUES_CACHE[ws.id]
@@ -359,19 +347,16 @@ def _get_all_values_cached(ws: gspread.Worksheet) -> List[List[str]]:
     return vals
 
 
-
 def ws_update(ws: gspread.Worksheet, values, range_name: str):
     resp = _retry(ws.update, values, range_name)
     _invalidate_cache(ws)
     return resp
 
 
-
 def ws_clear(ws: gspread.Worksheet):
     resp = _retry(ws.clear)
     _invalidate_cache(ws)
     return resp
-
 
 
 def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
@@ -397,7 +382,6 @@ def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
     return resp
 
 
-
 def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     if not requests:
         return None
@@ -415,7 +399,6 @@ def batch_format(ws: gspread.Worksheet, requests: List[dict]):
     return _retry(ws.spreadsheet.batch_update, payload)
 
 
-
 def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
     tgt = re.sub(r"\s+", "", wanted.strip())
     for ws in sh.worksheets():
@@ -423,7 +406,6 @@ def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet
             log(f"[ws] matched: '{ws.title}' (wanted='{wanted}')")
             return ws
     return None
-
 
 
 def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols: int = 20) -> gspread.Worksheet:
@@ -473,7 +455,6 @@ def parse_any_date(x) -> Optional[date]:
     return None
 
 
-
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
     target = parse_any_date(date_label) or parse_any_date(str(date_label))
     if not target:
@@ -498,7 +479,6 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, 
     return min(MAX_SCAN_ROWS + 1, 5000)
 
 
-
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_iso)
@@ -514,21 +494,17 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
     log(f"[ws] {ws.title} -> {date_iso} row={row_idx} wrote_cells={len(payload)}")
 
 
-
 def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
     expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
 
-    # 1) 탭 검색
     ws = fuzzy_ws(sh, title)
 
-    # 2) 없으면 새로 생성 + 헤더 작성
     if ws is None:
         ws = _retry(sh.add_worksheet, title=title, rows=800, cols=max(40, len(expected_header) + 5))
         ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
         log(f"[ws] created from scratch: {title}")
         return ws
 
-    # 3) 있으면 헤더 확인 후 필요시 보정
     vals = _get_all_values_cached(ws)
     current_header = vals[0] if vals else []
     current_header = [str(x).strip() for x in current_header]
@@ -603,14 +579,12 @@ def read_month_df(path: Path) -> pd.DataFrame:
     return df
 
 
-
 def eok_series(ser) -> pd.Series:
     s = pd.Series(ser)
     s = pd.to_numeric(s, errors="coerce").dropna()
     if s.empty:
         return pd.Series([], dtype=float)
     return s / 10000.0
-
 
 
 def round2(v) -> str:
@@ -620,12 +594,10 @@ def round2(v) -> str:
         return ""
 
 
-
 def _strip_col(df: pd.DataFrame, col: str):
     if col in df.columns:
         df[col] = df[col].astype(str).map(lambda x: str(x).replace("\u3000", " ").strip())
     return df
-
 
 
 def agg_all_stats(df: pd.DataFrame):
@@ -690,7 +662,6 @@ def _canon_col(s: str) -> str:
     return str(s or "").strip().replace("\u00a0", " ").replace("\u3000", " ")
 
 
-
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = {_canon_col(c): c for c in df.columns}
     for cand in candidates:
@@ -714,7 +685,6 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-
 def _norm_text_series(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
@@ -722,7 +692,6 @@ def _norm_text_series(s: pd.Series) -> pd.Series:
         .str.replace("\u00a0", " ", regex=False)
         .str.strip()
     )
-
 
 
 def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -774,7 +743,6 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
 def _norm_dash_blank(x: object) -> str:
     s = str(x or "").strip().replace("\u3000", " ").replace("\u00a0", " ").strip()
     if s in ("-", "—", "nan", "NaN", "None"):
@@ -782,17 +750,14 @@ def _norm_dash_blank(x: object) -> str:
     return s
 
 
-
 def _zfill4(x: object) -> str:
     s = _norm_dash_blank(x)
     return s.zfill(4) if s.isdigit() else s
 
 
-
 def _to_int_str(x: object) -> str:
     v = pd.to_numeric(pd.Series([x]), errors="coerce").fillna(0).astype(int).iloc[0]
     return str(int(v))
-
 
 
 def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -836,7 +801,6 @@ def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
     return df2[key_cols].astype(str)
 
 
-
 def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     vals = _get_all_values_cached(ws)
     if not vals:
@@ -854,7 +818,6 @@ def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     return pd.DataFrame(norm_rows, columns=header[:maxw])
 
 
-
 def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
     df2 = df.copy()
     for h in header:
@@ -862,7 +825,6 @@ def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
             df2[h] = ""
     df2 = df2[header]
     return df2.replace([np.inf, -np.inf], "").fillna("").astype(str).values.tolist()
-
 
 
 def _hide_sheet(ws: gspread.Worksheet):
@@ -875,7 +837,6 @@ def _hide_sheet(ws: gspread.Worksheet):
         }])
     except Exception:
         pass
-
 
 
 def _set_text_color(ws: gspread.Worksheet, start_row: int, end_row: int, start_col: int, end_col: int, rgb: Tuple[float, float, float]):
@@ -894,7 +855,6 @@ def _set_text_color(ws: gspread.Worksheet, start_row: int, end_row: int, start_c
         }
     }]
     batch_format(ws, req)
-
 
 
 def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
@@ -1060,10 +1020,11 @@ def main():
 
     file_map: Dict[str, Path] = {}
     for p in xlsx_paths:
-        nat_title, seoul_title, yymm = ym_from_apt_filename(p.name)
+        _, _, yymm = ym_from_apt_filename(p.name)
         if yymm:
             file_map[yymm] = p
 
+    # 최신월이 앞쪽
     yms = sorted(file_map.keys(), key=ym_key, reverse=True)
     log(f"[input] months_to_process={yms}")
 
@@ -1092,7 +1053,7 @@ def main():
         write_month_sheet(ws_seoul, today_iso, header_seoul, values_seoul)
 
     ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = [x[0] for x in summary_rows]
+    months = [x[0] for x in summary_rows]  # 이미 최신월 -> 과거월 순서
     header = ["구분"] + months
     ws_update(ws_sum, [header], f"A1:{a1_col(len(header))}1")
 
