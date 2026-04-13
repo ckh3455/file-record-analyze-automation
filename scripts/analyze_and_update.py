@@ -237,7 +237,7 @@ def get_folder_meta(drive, folder_id: str, supports_all_drives: bool) -> dict:
 
 
 
-def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
+def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives: bool) -> List[dict]:
     meta = get_folder_meta(drive, folder_id, supports_all_drives)
     drive_id = meta.get("driveId")
     corpora = "drive" if (supports_all_drives and drive_id) else "allDrives"
@@ -268,9 +268,12 @@ def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives
 
     if not matched:
         raise RuntimeError(
-            "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.\n"
-            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지\n"
-            "- 파일명이 '아파트 202602.xlsx' 형식인지\n"
+            "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.
+"
+            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지
+"
+            "- 파일명이 '아파트 202602.xlsx' 형식인지
+"
             "- DRIVE_FILE_REGEX가 맞는지 확인하세요."
         )
 
@@ -287,8 +290,8 @@ def pick_latest_12_months_from_folder(drive, folder_id: str, supports_all_drives
         if not cur or ts(it) > ts(cur):
             best_by_ym[ym] = it
 
-    yms = sorted(best_by_ym.keys(), reverse=True)[:12]
-    yms = sorted(yms)
+    # 최신 5개월만 선택, 이후 최신월이 앞에 오도록 유지
+    yms = sorted(best_by_ym.keys(), reverse=True)[:5]
     log(f"[drive] months_to_process={yms}")
     return [best_by_ym[ym] for ym in yms]
 
@@ -306,7 +309,7 @@ def download_file_from_drive(drive, file_id: str, out_path: Path, supports_all_d
 
 
 
-def download_latest_12_months_from_drive(creds) -> List[Path]:
+def download_latest_5_months_from_drive(creds) -> List[Path]:
     supports_all_drives = _bool_env("DRIVE_SUPPORTS_ALL_DRIVES", True)
 
     folder_env = os.environ.get("DRIVE_FOLDER_ID", "").strip()
@@ -318,7 +321,7 @@ def download_latest_12_months_from_drive(creds) -> List[Path]:
         raise RuntimeError("DRIVE_FOLDER_ID에서 폴더 ID를 추출하지 못했습니다. 폴더 URL 또는 ID를 확인하세요.")
 
     drive = build_drive(creds)
-    picked = pick_latest_12_months_from_folder(drive, folder_id, supports_all_drives)
+    picked = pick_latest_5_months_from_folder(drive, folder_id, supports_all_drives)
 
     paths: List[Path] = []
     for it in picked:
@@ -1039,7 +1042,7 @@ def main():
         raise RuntimeError("SA_JSON(또는 GDRIVE_SA_JSON) 또는 SA_PATH 환경변수가 필요합니다.")
 
     creds = load_creds()
-    xlsx_paths = download_latest_12_months_from_drive(creds)
+    xlsx_paths = download_latest_5_months_from_drive(creds)
     if not xlsx_paths:
         log("[drive] no files downloaded. stop.")
         return
@@ -1061,7 +1064,7 @@ def main():
         if yymm:
             file_map[yymm] = p
 
-    yms = sorted(file_map.keys(), key=ym_key)
+    yms = sorted(file_map.keys(), key=ym_key, reverse=True)
     log(f"[input] months_to_process={yms}")
 
     for yymm in yms:
