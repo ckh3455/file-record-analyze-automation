@@ -6,12 +6,13 @@ import re
 import json
 import time
 import random
+import calendar
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
@@ -23,8 +24,9 @@ from googleapiclient.http import MediaIoBaseDownload
 LOG_DIR = Path("analyze_report")
 RUN_LOG = LOG_DIR / "latest.log"
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "_drive_downloads"))
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 DRIVE_FILE_REGEX = os.environ.get("DRIVE_FILE_REGEX", r"^아파트\s*(\d{6})\.xlsx$")
 APT_FILE_RE = re.compile(DRIVE_FILE_REGEX)
@@ -36,6 +38,15 @@ MONTH_WS_MIN_COLS = int(os.environ.get("MONTH_WS_MIN_COLS", "40"))
 
 SUMMARY_SHEET_NAME = "거래요약"
 
+SUMMARY_METRICS = [
+    "거래건수",
+    "중앙값(단위:억)",
+    "평균가(단위:억)",
+    "전월대비 건수증감",
+    "예상건수",
+]
+
+# 월별 탭 헤더
 SEOUL_REGIONS = [
     "강남구", "강동구", "강북구", "강서구", "관악구", "광진구", "구로구", "금천구", "노원구", "도봉구",
     "동대문구", "동작구", "마포구", "서대문구", "서초구", "성동구", "성북구", "송파구", "양천구", "영등포구",
@@ -43,9 +54,10 @@ SEOUL_REGIONS = [
 ]
 
 NATION_REGIONS = [
-    "강원도", "경기도", "경상남도", "경상북도", "광주광역시", "대구광역시", "대전광역시", "부산광역시",
-    "서울특별시", "세종특별자치시", "울산광역시", "인천광역시", "전라남도", "전북특별자치도", "제주특별자치도",
-    "충청남도", "충청북도", "총합계"
+    "전국", "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시",
+    "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원도",
+    "충청북도", "충청남도", "전북특별자치도", "전라남도",
+    "경상북도", "경상남도", "제주특별자치도"
 ]
 
 
@@ -111,6 +123,13 @@ def a1_col(n: int) -> str:
     return s
 
 
+def round2(v) -> str:
+    try:
+        return f"{float(v):.2f}"
+    except Exception:
+        return ""
+
+
 # ===================== 인증 =====================
 def _get_sa_json_env() -> str:
     return (os.environ.get("SA_JSON") or os.environ.get("GDRIVE_SA_JSON") or "").strip()
@@ -149,7 +168,6 @@ def drive_list_files(
     fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size)",
 ):
     page_size = max(1, min(int(page_size), 1000))
-
     kwargs = dict(
         q=q,
         fields=fields,
@@ -341,7 +359,6 @@ def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
 def parse_any_date(x) -> Optional[date]:
     if x is None:
         return None
-
     if isinstance(x, datetime):
         return x.date()
     if isinstance(x, date):
@@ -360,15 +377,6 @@ def parse_any_date(x) -> Optional[date]:
     if not s:
         return None
 
-    if re.fullmatch(r"\d+(?:\.\d+)?", s):
-        try:
-            base = date(1899, 12, 30)
-            days = int(float(s))
-            if 1 <= days <= 60000:
-                return base + timedelta(days=days)
-        except Exception:
-            pass
-
     patterns = [
         r"(\d{4})-(\d{1,2})-(\d{1,2})",
         r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})",
@@ -383,10 +391,8 @@ def parse_any_date(x) -> Optional[date]:
             try:
                 if len(m.groups()) == 3:
                     return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                else:
-                    # 연도가 없는 "4월 16일" 형식은 비교용으로는 오늘 연도 사용
-                    today = datetime.now().date()
-                    return date(today.year, int(m.group(1)), int(m.group(2)))
+                today = datetime.now().date()
+                return date(today.year, int(m.group(1)), int(m.group(2)))
             except Exception:
                 return None
 
@@ -419,9 +425,13 @@ def month_sheet_titles(year: int, month: int) -> Dict[str, List[str]]:
     }
 
 
-def preferred_sheet_title(level: str, year: int, month: int) -> str:
-    yy = year % 100
-    return f"{level} {yy}년 {month}월"
+def detect_date_style(ws: gspread.Worksheet) -> str:
+    vals = _get_all_values_cached(ws)
+    if len(vals) >= 2 and len(vals[1]) >= 1:
+        s = str(vals[1][0]).strip()
+        if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", s):
+            return "iso"
+    return "korean"
 
 
 def date_label_for_sheet(d: date, style: str = "korean") -> str:
@@ -430,20 +440,7 @@ def date_label_for_sheet(d: date, style: str = "korean") -> str:
     return f"{d.month}월 {d.day}일"
 
 
-def detect_date_style(ws: gspread.Worksheet) -> str:
-    vals = _get_all_values_cached(ws)
-    if len(vals) >= 2 and len(vals[1]) >= 1:
-        sample = vals[1][0]
-        if parse_any_date(sample):
-            s = str(sample).strip()
-            if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", s):
-                return "iso"
-            if "월" in s and "일" in s:
-                return "korean"
-    return "korean"
-
-
-# ===================== 월별 탭 찾기/생성 =====================
+# ===================== 월별 탭 =====================
 def find_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) -> Optional[gspread.Worksheet]:
     for cand in month_sheet_titles(year, month)[level]:
         ws = fuzzy_ws(sh, cand)
@@ -458,7 +455,7 @@ def ensure_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) 
 
     ws = find_month_ws(sh, level, year, month)
     if ws is None:
-        title = preferred_sheet_title(level, year, month)
+        title = f"{level} {year % 100}년 {month}월"
         ws = _retry(sh.add_worksheet, title=title, rows=MONTH_WS_MIN_ROWS, cols=min_cols)
         ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
         log(f"[ws] created: {title}")
@@ -473,7 +470,6 @@ def ensure_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) 
         return ws
 
     header = [str(x).strip() for x in vals[0]]
-    # A1이 비어 있고 B1부터 헤더가 있던 시트도 지원
     if header and header[0] == "":
         header[0] = "날짜"
 
@@ -486,25 +482,16 @@ def ensure_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) 
     return ws
 
 
-# ===================== 날짜행 탐색 =====================
 def find_or_append_date_row(ws: gspread.Worksheet, target_label: str) -> int:
-    """
-    A열 기준:
-    1) 같은 날짜가 있으면 그 행
-    2) 없으면 첫 빈 행
-    3) 빈 행도 없으면 마지막 사용 행 다음 줄
-    """
     target = parse_any_date(target_label)
     if not target:
         return 2
 
-    # A열 전체 값을 직접 읽는다. 중간 빈 칸을 놓치지 않기 위해 A2:A2000 범위 사용.
-    # 현재 구조상 충분히 넉넉하게 본다.
     ensure_ws_size(ws, min_rows=MONTH_WS_MIN_ROWS, min_cols=MONTH_WS_MIN_COLS)
     col = _retry(ws.get, f"A2:A{ws.row_count}") or []
 
     first_empty = None
-    last_used = 1  # 헤더 행
+    last_used = 1
 
     for idx, row in enumerate(col, start=2):
         v = row[0] if row else ""
@@ -526,7 +513,6 @@ def find_or_append_date_row(ws: gspread.Worksheet, target_label: str) -> int:
     return last_used + 1
 
 
-# ===================== 기록 =====================
 def write_month_sheet(ws: gspread.Worksheet, target_day: date, header: List[str], values_by_colname: Dict[str, int]):
     style = detect_date_style(ws)
     date_label = date_label_for_sheet(target_day, style=style)
@@ -551,7 +537,7 @@ def write_month_sheet(ws: gspread.Worksheet, target_day: date, header: List[str]
     log(f"[ws] {ws.title} -> {date_label} row={row_idx} wrote_cells={len(payload)}")
 
 
-# ===================== 월 파일 읽기/집계 =====================
+# ===================== 데이터 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     forced = os.environ.get("EXCEL_SHEET_NAME", "").strip()
 
@@ -589,11 +575,21 @@ def _strip_col(df: pd.DataFrame, col: str):
     return df
 
 
-def agg_counts(df: pd.DataFrame):
-    counts = {}
+def eok_series(ser) -> pd.Series:
+    s = pd.Series(ser)
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if s.empty:
+        return pd.Series([], dtype=float)
+    return s / 10000.0
+
+
+def agg_all_stats(df: pd.DataFrame):
+    counts: Dict[str, int] = {}
+    med: Dict[str, str] = {}
+    mean: Dict[str, str] = {}
 
     if df is None or df.empty:
-        return counts
+        return counts, med, mean
 
     df = df.copy()
     _strip_col(df, "광역")
@@ -601,49 +597,160 @@ def agg_counts(df: pd.DataFrame):
     _strip_col(df, "법정동")
 
     counts["전국"] = int(len(df))
+    s_all = eok_series(df.get("거래금액(만원)", []))
+    if not s_all.empty:
+        med["전국"] = round2(s_all.median())
+        mean["전국"] = round2(s_all.mean())
 
     if "광역" in df.columns:
         for prov, sub in df.groupby("광역"):
             prov = str(prov).strip()
-            counts[prov] = counts.get(prov, 0) + int(len(sub))
+            counts[prov] = int(len(sub))
+            s = eok_series(sub.get("거래금액(만원)", []))
+            if not s.empty:
+                med[prov] = round2(s.median())
+                mean[prov] = round2(s.mean())
 
     seoul = df[df.get("광역", "") == "서울특별시"].copy()
     counts["서울"] = int(len(seoul))
+    if len(seoul) > 0:
+        s = eok_series(seoul.get("거래금액(만원)", []))
+        if not s.empty:
+            med["서울"] = round2(s.median())
+            mean["서울"] = round2(s.mean())
 
     if "구" in seoul.columns:
         for gu, sub in seoul.groupby("구"):
             gu = str(gu).strip()
-            counts[gu] = counts.get(gu, 0) + int(len(sub))
+            counts[gu] = int(len(sub))
+            s = eok_series(sub.get("거래금액(만원)", []))
+            if not s.empty:
+                med[gu] = round2(s.median())
+                mean[gu] = round2(s.mean())
 
-    return counts
+    return counts, med, mean
 
 
-# ===================== 거래요약(옵션) =====================
-def update_summary_if_exists(sh: gspread.Spreadsheet, summary_rows: List[Tuple[str, Dict[str, int]]]):
-    ws = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
-    if ws is None:
-        log("[summary] skip: 거래요약 시트 없음")
-        return
+def estimate_counts(counts: Dict[str, int], target_year: int, target_month: int, run_day: date) -> Dict[str, int]:
+    """
+    당월이면 실행일까지의 건수를 월말 기준으로 단순 비례 추정.
+    과거월이면 실제 건수 그대로.
+    """
+    days_in_month = calendar.monthrange(target_year, target_month)[1]
+    is_current_month = (target_year == run_day.year and target_month == run_day.month)
 
-    months = [x[0] for x in summary_rows]  # 최신월 -> 과거월
-    header = ["구분"] + months
-    ensure_ws_size(ws, min_rows=50, min_cols=max(20, len(header) + 2))
-    ws_update(ws, [header], f"A1:{a1_col(len(header))}1")
+    est: Dict[str, int] = {}
+    for k, v in counts.items():
+        if not is_current_month:
+            est[k] = int(v)
+        else:
+            elapsed = max(1, run_day.day)
+            est[k] = int(round(v / elapsed * days_in_month))
+    return est
 
-    lookup = {ym: counts for ym, counts in summary_rows}
-    row_map = {
-        "전국 거래건수": [],
-        "서울 거래건수": [],
+
+# ===================== 거래요약 세로 블록 =====================
+def get_summary_header_map(ws: gspread.Worksheet) -> Dict[str, int]:
+    vals = _get_all_values_cached(ws)
+    if not vals:
+        return {}
+    header = vals[0]
+    hmap = {}
+    for i, h in enumerate(header, start=1):
+        key = str(h).strip()
+        if key:
+            hmap[key] = i
+    return hmap
+
+
+def find_or_create_summary_block(ws: gspread.Worksheet, ym_label: str) -> Dict[str, int]:
+    """
+    A열=월, B열=항목 구조.
+    ym_label 블록이 있으면 그 5개 행을 반환.
+    없으면 맨 아래에 새로 5행 블록 생성.
+    """
+    vals = _get_all_values_cached(ws)
+    rows = vals if vals else []
+
+    # 기존 블록 찾기
+    for r_idx in range(2, len(rows) + 1):
+        row = rows[r_idx - 1]
+        a = str(row[0]).strip() if len(row) >= 1 else ""
+        b = str(row[1]).strip() if len(row) >= 2 else ""
+        if a == ym_label and b == "거래건수":
+            return {
+                "거래건수": r_idx,
+                "중앙값(단위:억)": r_idx + 1,
+                "평균가(단위:억)": r_idx + 2,
+                "전월대비 건수증감": r_idx + 3,
+                "예상건수": r_idx + 4,
+            }
+
+    # 새 블록 추가 위치
+    last_used = len(rows)
+    if last_used < 1:
+        last_used = 1
+    start_row = last_used + 1
+
+    ensure_ws_size(ws, min_rows=start_row + 10, min_cols=max(ws.col_count, 5))
+
+    block_values = [
+        [ym_label, "거래건수"],
+        [ym_label, "중앙값(단위:억)"],
+        [ym_label, "평균가(단위:억)"],
+        [ym_label, "전월대비 건수증감"],
+        [ym_label, "예상건수"],
+    ]
+    ws_update(ws, block_values, f"A{start_row}:B{start_row+4}")
+
+    return {
+        "거래건수": start_row,
+        "중앙값(단위:억)": start_row + 1,
+        "평균가(단위:억)": start_row + 2,
+        "전월대비 건수증감": start_row + 3,
+        "예상건수": start_row + 4,
     }
 
-    for ym in months:
-        c = lookup[ym]
-        row_map["전국 거래건수"].append(int(c.get("전국", 0)))
-        row_map["서울 거래건수"].append(int(c.get("서울", 0)))
 
-    out_rows = [[k] + v for k, v in row_map.items()]
-    ws_update(ws, out_rows, f"A2:{a1_col(len(header))}{len(out_rows)+1}")
-    log(f"[summary] wrote rows={len(out_rows)} months={len(months)}")
+def write_summary_block(
+    ws: gspread.Worksheet,
+    ym_label: str,
+    counts: Dict[str, int],
+    med: Dict[str, str],
+    mean: Dict[str, str],
+    delta_counts: Dict[str, int],
+    est_counts: Dict[str, int],
+):
+    hmap = get_summary_header_map(ws)
+    if not hmap:
+        log("[summary] skip: 거래요약 헤더가 없음")
+        return
+
+    block = find_or_create_summary_block(ws, ym_label)
+    payload = []
+
+    # 헤더 기준으로 C열 이후 값 작성
+    for region, col_idx in hmap.items():
+        if col_idx < 3:
+            continue
+
+        if region in counts:
+            payload.append({"range": f"{a1_col(col_idx)}{block['거래건수']}", "values": [[counts.get(region, 0)]]})
+        if region in med:
+            payload.append({"range": f"{a1_col(col_idx)}{block['중앙값(단위:억)']}", "values": [[med.get(region, '')]]})
+        if region in mean:
+            payload.append({"range": f"{a1_col(col_idx)}{block['평균가(단위:억)']}", "values": [[mean.get(region, '')]]})
+        if region in delta_counts:
+            payload.append({"range": f"{a1_col(col_idx)}{block['전월대비 건수증감']}", "values": [[delta_counts.get(region, 0)]]})
+        if region in est_counts:
+            payload.append({"range": f"{a1_col(col_idx)}{block['예상건수']}", "values": [[est_counts.get(region, 0)]]})
+
+    if payload:
+        body = []
+        for item in payload:
+            body.append({"range": f"'{ws.title}'!{item['range']}", "values": item["values"]})
+        values_batch_update(ws, body)
+        log(f"[summary] wrote ym={ym_label} cells={len(payload)}")
 
 
 # ===================== 메인 =====================
@@ -668,26 +775,37 @@ def main():
         y, m = yymm_from_filename(p.name)
         return y, m
 
+    # 최신월부터
     xlsx_paths = sorted(xlsx_paths, key=ym_key_from_file, reverse=True)
+    log(f"[input] months_to_process={[f'{yymm_from_filename(p.name)[0]%100:02d}/{yymm_from_filename(p.name)[1]:02d}' for p in xlsx_paths]}")
 
-    summary_rows: List[Tuple[str, Dict[str, int]]] = []
+    month_results = []
 
     for p in xlsx_paths:
         year, month = yymm_from_filename(p.name)
-        yy = year % 100
-        ym_label = f"{yy:02d}/{month:02d}"
+        ym_label = f"{year % 100:02d}/{month:02d}"
 
         log(f"[file] {p.name}")
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
 
-        counts = agg_counts(df)
-        summary_rows.append((ym_label, counts))
+        counts, med, mean = agg_all_stats(df)
+        est = estimate_counts(counts, year, month, today)
+
+        month_results.append({
+            "ym": ym_label,
+            "year": year,
+            "month": month,
+            "counts": counts,
+            "med": med,
+            "mean": mean,
+            "est": est,
+        })
 
         ws_nat = ensure_month_ws(sh, "전국", year, month)
         header_nat = ["날짜"] + NATION_REGIONS
-        values_nat = {k: int(counts.get(k, 0)) for k in NATION_REGIONS if k != "총합계"}
-        values_nat["총합계"] = int(counts.get("전국", 0))
+        values_nat = {k: int(counts.get(k, 0)) for k in NATION_REGIONS if k != "전국"}
+        values_nat["전국"] = int(counts.get("전국", 0))
         write_month_sheet(ws_nat, today, header_nat, values_nat)
 
         ws_seoul = ensure_month_ws(sh, "서울", year, month)
@@ -696,7 +814,38 @@ def main():
         values_seoul["총합계"] = int(counts.get("서울", 0))
         write_month_sheet(ws_seoul, today, header_seoul, values_seoul)
 
-    update_summary_if_exists(sh, summary_rows)
+    # 거래요약: 스크린샷 구조대로 세로 블록 갱신
+    ws_sum = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
+    if ws_sum is not None:
+        # 전월대비 증감 계산을 위해 오래된 월 -> 최신월 순서로 계산
+        chronological = sorted(month_results, key=lambda x: (x["year"], x["month"]))
+        prev_counts: Optional[Dict[str, int]] = None
+        delta_map_by_ym: Dict[str, Dict[str, int]] = {}
+
+        for item in chronological:
+            cur_counts = item["counts"]
+            if prev_counts is None:
+                delta = {k: 0 for k in cur_counts.keys()}
+            else:
+                keys = set(prev_counts.keys()) | set(cur_counts.keys())
+                delta = {k: int(cur_counts.get(k, 0) - prev_counts.get(k, 0)) for k in keys}
+            delta_map_by_ym[item["ym"]] = delta
+            prev_counts = cur_counts
+
+        # 다시 최신월부터 기록
+        for item in month_results:
+            write_summary_block(
+                ws_sum,
+                ym_label=item["ym"],
+                counts=item["counts"],
+                med=item["med"],
+                mean=item["mean"],
+                delta_counts=delta_map_by_ym.get(item["ym"], {}),
+                est_counts=item["est"],
+            )
+    else:
+        log("[summary] skip: 거래요약 시트 없음")
+
     log("[MAIN] done")
 
 
