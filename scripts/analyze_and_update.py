@@ -9,20 +9,11 @@ analyze_and_update.py
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
 - 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
-- 날짜 기록은 A열 실제 값 기준으로 같은 날짜를 찾고, 없으면 마지막 사용 행 다음 줄에 기록
+- 날짜 기록은 A열 기준:
+  1) 같은 날짜가 있으면 그 행
+  2) 없으면 첫 빈 행
+  3) 빈 행도 없으면 마지막 사용 행 다음 줄
 - 압구정동 탭은 스냅샷/변동사항 분리
-
-필수 ENV:
-- SHEET_ID
-- SA_JSON 또는 SA_PATH (또는 GDRIVE_SA_JSON)
-- DRIVE_FOLDER_ID (아파트 폴더 자체 ID/URL)
-- DRIVE_SUPPORTS_ALL_DRIVES: "true" 권장
-
-선택 ENV:
-- DRIVE_FILE_REGEX: 기본 r"^아파트\\s*(\\d{6})\\.xlsx$"
-- DRIVE_SCAN_MAX_FILES: 기본 1000
-- DOWNLOAD_DIR: 기본 "_drive_downloads"
-- EXCEL_SHEET_NAME: 시트명 강제(권장X)
 """
 
 import os
@@ -491,11 +482,12 @@ def parse_any_date(x) -> Optional[date]:
         return None
 
 
-def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
+def find_or_append_date_row(ws: gspread.Worksheet, date_label) -> int:
     """
-    A열의 실제 값만 읽어서
-    - 같은 날짜가 있으면 그 행
-    - 없으면 마지막 사용 행 다음 줄
+    A열 기준
+    1) 같은 날짜가 있으면 그 행 반환
+    2) 없으면 첫 빈 행 반환
+    3) 빈 행도 없으면 마지막 사용 행 다음 줄 반환
     """
     target = parse_any_date(date_label)
     if not target:
@@ -503,16 +495,30 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, 
 
     col = _retry(ws.col_values, 1) or []
 
-    # A1만 있고 데이터가 없으면
     if len(col) <= 1:
         return 2
 
+    first_empty = None
+    last_used = 1
+
     for row_idx, v in enumerate(col[1:], start=2):
-        d = parse_any_date(v)
+        s = str(v).strip() if v is not None else ""
+
+        if s == "":
+            if first_empty is None:
+                first_empty = row_idx
+            continue
+
+        last_used = row_idx
+
+        d = parse_any_date(s)
         if d and d == target:
             return row_idx
 
-    return len(col) + 1
+    if first_empty is not None:
+        return first_empty
+
+    return last_used + 1
 
 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
