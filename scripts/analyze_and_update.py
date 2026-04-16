@@ -9,7 +9,7 @@ analyze_and_update.py
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
 - 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
-- 날짜 기록은 '실제 사용 중인 마지막 행' 기준으로 이어서 기록
+- 날짜 기록은 A열 실제 값 기준으로 같은 날짜를 찾고, 없으면 마지막 사용 행 다음 줄에 기록
 - 압구정동 탭은 스냅샷/변동사항 분리
 
 필수 ENV:
@@ -31,7 +31,7 @@ import json
 import time
 import random
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
@@ -439,80 +439,102 @@ def ym_from_apt_filename(fname: str):
     return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{y % 100:02d}/{mm:02d}"
 
 
-_DATE_PATS = [
-    re.compile(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})"),
-    re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})"),
-    re.compile(r"(\d{4})/(\d{1,2})/(\d{1,2})"),
-]
-
-
 def parse_any_date(x) -> Optional[date]:
     if x is None:
         return None
+
     if isinstance(x, datetime):
         return x.date()
     if isinstance(x, date):
         return x
+
+    if isinstance(x, (int, float)):
+        try:
+            base = date(1899, 12, 30)
+            days = int(float(x))
+            if 1 <= days <= 60000:
+                return base + timedelta(days=days)
+        except Exception:
+            pass
+
     s = str(x).strip()
     if not s:
         return None
-    for pat in _DATE_PATS:
-        m = pat.search(s)
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        try:
+            base = date(1899, 12, 30)
+            days = int(float(s))
+            if 1 <= days <= 60000:
+                return base + timedelta(days=days)
+        except Exception:
+            pass
+
+    patterns = [
+        r"(\d{4})-(\d{1,2})-(\d{1,2})",
+        r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})",
+        r"(\d{4})/(\d{1,2})/(\d{1,2})",
+        r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, s)
         if m:
             try:
                 return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             except Exception:
                 return None
-    return None
+
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except Exception:
+        return None
 
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
     """
-    A열 실제 사용 행을 기준으로 날짜를 찾고,
-    없으면 첫 빈 행 또는 마지막 사용 행 다음 줄을 반환.
+    A열의 실제 값만 읽어서
+    - 같은 날짜가 있으면 그 행
+    - 없으면 마지막 사용 행 다음 줄
     """
-    target = parse_any_date(date_label) or parse_any_date(str(date_label))
+    target = parse_any_date(date_label)
     if not target:
         return 2
 
-    vals = _retry(ws.get_all_values) or []
+    col = _retry(ws.col_values, 1) or []
 
-    if len(vals) <= 1:
+    # A1만 있고 데이터가 없으면
+    if len(col) <= 1:
         return 2
 
-    first_empty = None
-    last_used = 1
+    for row_idx, v in enumerate(col[1:], start=2):
+        d = parse_any_date(v)
+        if d and d == target:
+            return row_idx
 
-    for row_idx, row in enumerate(vals[1:], start=2):
-        v = row[0].strip() if row and len(row) > 0 else ""
-
-        if v:
-            last_used = row_idx
-            d = parse_any_date(v)
-            if d and d == target:
-                return row_idx
-        else:
-            if first_empty is None:
-                first_empty = row_idx
-
-    if first_empty is not None:
-        return first_empty
-
-    return last_used + 1
+    return len(col) + 1
 
 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_iso)
 
-    ensure_ws_size(ws, min_rows=max(MONTH_WS_MIN_ROWS, row_idx + MONTH_WS_MIN_EXTRA), min_cols=max(MONTH_WS_MIN_COLS, len(header) + 5))
+    ensure_ws_size(
+        ws,
+        min_rows=max(MONTH_WS_MIN_ROWS, row_idx + MONTH_WS_MIN_EXTRA),
+        min_cols=max(MONTH_WS_MIN_COLS, len(header) + 5),
+    )
 
     sheet_prefix = f"'{ws.title}'!"
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
+
     for col_name, val in values_by_colname.items():
         if col_name in hmap:
             c = hmap[col_name]
-            payload.append({"range": f"{sheet_prefix}{a1_col(c)}{row_idx}", "values": [[int(val)]]})
+            payload.append({
+                "range": f"{sheet_prefix}{a1_col(c)}{row_idx}",
+                "values": [[int(val)]]
+            })
 
     values_batch_update(ws, payload)
     log(f"[ws] {ws.title} -> {date_iso} row={row_idx} wrote_cells={len(payload)}")
