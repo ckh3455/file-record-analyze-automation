@@ -1,21 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""
-analyze_and_update.py
-
-핵심:
-- Drive의 '아파트 YYYYMM.xlsx' 파일을 읽어 최근 5개월만 월별 집계를 시트에 기록
-- 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
-- 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
-- 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
-- 날짜 기록은 A열 기준:
-  1) 같은 날짜가 있으면 그 행
-  2) 없으면 첫 빈 행
-  3) 빈 행도 없으면 마지막 사용 행 다음 줄
-- 압구정동 탭은 스냅샷/변동사항 분리
-"""
-
 import os
 import re
 import json
@@ -23,10 +8,10 @@ import time
 import random
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
@@ -36,58 +21,35 @@ from googleapiclient.http import MediaIoBaseDownload
 
 # ===================== 설정 =====================
 LOG_DIR = Path("analyze_report")
-SUMMARY_SHEET_NAME = "거래요약"
-
+RUN_LOG = LOG_DIR / "latest.log"
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "_drive_downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 DRIVE_FILE_REGEX = os.environ.get("DRIVE_FILE_REGEX", r"^아파트\s*(\d{6})\.xlsx$")
 APT_FILE_RE = re.compile(DRIVE_FILE_REGEX)
 DRIVE_SCAN_MAX_FILES = int(os.environ.get("DRIVE_SCAN_MAX_FILES", "1000"))
 
-MONTH_WS_MIN_ROWS = int(os.environ.get("MONTH_WS_MIN_ROWS", "2000"))
-MONTH_WS_MIN_EXTRA = int(os.environ.get("MONTH_WS_MIN_EXTRA", "50"))
-MONTH_WS_MIN_COLS = 40
+MONTH_WS_MIN_ROWS = int(os.environ.get("MONTH_WS_MIN_ROWS", "400"))
+MONTH_WS_MIN_EXTRA = int(os.environ.get("MONTH_WS_MIN_EXTRA", "30"))
+MONTH_WS_MIN_COLS = int(os.environ.get("MONTH_WS_MIN_COLS", "40"))
 
-SUMMARY_COLS = [
-    "전국", "서울", "서울특별시",
-    "강남구", "압구정동",
-    "경기도", "인천광역시", "세종특별자치시", "울산광역시",
-    "서초구", "송파구", "용산구", "강동구", "성동구", "마포구", "양천구", "동작구", "영등포구", "종로구", "광진구",
-    "강서구", "강북구", "관악구", "구로구", "금천구", "도봉구", "노원구",
-    "동대문구", "서대문구", "성북구", "은평구", "중구", "중랑구",
-    "부산광역시", "대구광역시", "광주광역시", "대전광역시",
-    "강원특별자치도", "경상남도", "경상북도", "전라남도", "전북특별자치도", "충청남도", "충청북도", "제주특별자치도"
-]
+SUMMARY_SHEET_NAME = "거래요약"
 
 SEOUL_REGIONS = [
     "강남구", "강동구", "강북구", "강서구", "관악구", "광진구", "구로구", "금천구", "노원구", "도봉구",
     "동대문구", "동작구", "마포구", "서대문구", "서초구", "성동구", "성북구", "송파구", "양천구", "영등포구",
     "용산구", "은평구", "종로구", "중구", "중랑구", "총합계"
 ]
+
 NATION_REGIONS = [
-    "강원특별자치도", "경기도", "경상남도", "경상북도", "광주광역시", "대구광역시", "대전광역시", "부산광역시",
+    "강원도", "경기도", "경상남도", "경상북도", "광주광역시", "대구광역시", "대전광역시", "부산광역시",
     "서울특별시", "세종특별자치시", "울산광역시", "인천광역시", "전라남도", "전북특별자치도", "제주특별자치도",
     "충청남도", "충청북도", "총합계"
 ]
 
-APGU_SHEET_NAME = "압구정동"
-APGU_BASE_SHEET_NAME = "압구정동_base"
 
-
-# ===================== 로깅/리트라이 =====================
-def _ensure_logdir():
-    try:
-        if LOG_DIR.exists() and not LOG_DIR.is_dir():
-            LOG_DIR.unlink()
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-
-_ensure_logdir()
-RUN_LOG = LOG_DIR / "latest.log"
-
-
+# ===================== 공통 =====================
 def log(msg: str):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
@@ -102,12 +64,11 @@ _LAST = 0.0
 
 
 def _throttle(sec: float = 0.60):
-    import time as _t
     global _LAST
-    now = _t.time()
+    now = time.time()
     if now - _LAST < sec:
-        _t.sleep(sec - (now - _LAST))
-    _LAST = _t.time()
+        time.sleep(sec - (now - _LAST))
+    _LAST = time.time()
 
 
 def _retry(fn, *a, **kw):
@@ -124,7 +85,6 @@ def _retry(fn, *a, **kw):
             raise
 
 
-# ===================== 유틸 =====================
 def _bool_env(name: str, default: bool = False) -> bool:
     v = str(os.environ.get(name, str(default))).strip().lower()
     return v in ("1", "true", "yes", "y", "on")
@@ -186,13 +146,9 @@ def drive_list_files(
     corpora: str = "allDrives",
     drive_id: Optional[str] = None,
     page_size: int = 1000,
-    fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size)"
+    fields: str = "nextPageToken, files(id,name,mimeType,driveId,parents,modifiedTime,createdTime,size)",
 ):
-    try:
-        page_size = int(page_size)
-    except Exception:
-        page_size = 1000
-    page_size = max(1, min(page_size, 1000))
+    page_size = max(1, min(int(page_size), 1000))
 
     kwargs = dict(
         q=q,
@@ -249,18 +205,12 @@ def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives:
         name = it.get("name", "")
         m = APT_FILE_RE.match(name)
         if m:
-            ym = m.group(1)
-            matched.append((ym, it))
+            matched.append((m.group(1), it))
 
     log(f"[drive] listed_xlsx={len(items)} matched_apt_xlsx={len(matched)} folder={folder_id}")
 
     if not matched:
-        raise RuntimeError(
-            "Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.\n"
-            "- DRIVE_FOLDER_ID가 '아파트 폴더 자체'인지\n"
-            "- 파일명이 '아파트 202602.xlsx' 형식인지\n"
-            "- DRIVE_FILE_REGEX가 맞는지 확인하세요."
-        )
+        raise RuntimeError("Drive 폴더에서 '아파트 YYYYMM.xlsx' 파일을 찾지 못했습니다.")
 
     def ts(it):
         s = it.get("modifiedTime") or it.get("createdTime") or ""
@@ -296,11 +246,11 @@ def download_latest_5_months_from_drive(creds) -> List[Path]:
 
     folder_env = os.environ.get("DRIVE_FOLDER_ID", "").strip()
     if not folder_env:
-        raise RuntimeError("DRIVE_FOLDER_ID 환경변수가 필요합니다. ('아파트' 폴더 자체 ID/URL)")
+        raise RuntimeError("DRIVE_FOLDER_ID 환경변수가 필요합니다.")
 
     folder_id = _extract_id(folder_env)
     if not folder_id:
-        raise RuntimeError("DRIVE_FOLDER_ID에서 폴더 ID를 추출하지 못했습니다. 폴더 URL 또는 ID를 확인하세요.")
+        raise RuntimeError("DRIVE_FOLDER_ID에서 폴더 ID를 추출하지 못했습니다.")
 
     drive = build_drive(creds)
     picked = pick_latest_5_months_from_folder(drive, folder_id, supports_all_drives)
@@ -320,7 +270,7 @@ def download_latest_5_months_from_drive(creds) -> List[Path]:
     return paths
 
 
-# ===================== 시트/캐시 =====================
+# ===================== 시트 기본 =====================
 _WS_VALUES_CACHE: Dict[int, List[List[str]]] = {}
 
 
@@ -342,12 +292,6 @@ def _get_all_values_cached(ws: gspread.Worksheet) -> List[List[str]]:
 
 def ws_update(ws: gspread.Worksheet, values, range_name: str):
     resp = _retry(ws.update, values, range_name)
-    _invalidate_cache(ws)
-    return resp
-
-
-def ws_clear(ws: gspread.Worksheet):
-    resp = _retry(ws.clear)
     _invalidate_cache(ws)
     return resp
 
@@ -375,23 +319,6 @@ def values_batch_update(ws: gspread.Worksheet, data: List[Dict]):
     return resp
 
 
-def batch_format(ws: gspread.Worksheet, requests: List[dict]):
-    if not requests:
-        return None
-
-    def _clean(obj):
-        if isinstance(obj, dict):
-            return {k: _clean(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_clean(v) for v in obj]
-        if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
-            return 0.0
-        return obj
-
-    payload = {"requests": _clean(requests)}
-    return _retry(ws.spreadsheet.batch_update, payload)
-
-
 def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet]:
     tgt = re.sub(r"\s+", "", wanted.strip())
     for ws in sh.worksheets():
@@ -399,14 +326,6 @@ def fuzzy_ws(sh: gspread.Spreadsheet, wanted: str) -> Optional[gspread.Worksheet
             log(f"[ws] matched: '{ws.title}' (wanted='{wanted}')")
             return ws
     return None
-
-
-def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols: int = 20) -> gspread.Worksheet:
-    ws = fuzzy_ws(sh, title)
-    if ws is None:
-        ws = _retry(sh.add_worksheet, title=title, rows=rows, cols=cols)
-        log(f"[ws] created: {title}")
-    return ws
 
 
 def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
@@ -418,18 +337,7 @@ def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
         log(f"[ws] resized: {ws.title} rows={new_rows} cols={new_cols}")
 
 
-# ===================== 월탭 처리 =====================
-def ym_from_apt_filename(fname: str):
-    s = str(fname or "")
-    m = re.search(r"(20\d{2})(\d{2})", s)
-    if not m:
-        return None, None, None
-    y, mm = int(m.group(1)), int(m.group(2))
-    if not (1 <= mm <= 12):
-        return None, None, None
-    return f"전국 {y}년 {mm}월", f"서울 {y}년 {mm}월", f"{y % 100:02d}/{mm:02d}"
-
-
+# ===================== 날짜/탭명 =====================
 def parse_any_date(x) -> Optional[date]:
     if x is None:
         return None
@@ -466,13 +374,19 @@ def parse_any_date(x) -> Optional[date]:
         r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})",
         r"(\d{4})/(\d{1,2})/(\d{1,2})",
         r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일",
+        r"(\d{1,2})월\s*(\d{1,2})일",
     ]
 
     for pat in patterns:
         m = re.search(pat, s)
         if m:
             try:
-                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                if len(m.groups()) == 3:
+                    return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                else:
+                    # 연도가 없는 "4월 16일" 형식은 비교용으로는 오늘 연도 사용
+                    today = datetime.now().date()
+                    return date(today.year, int(m.group(1)), int(m.group(2)))
             except Exception:
                 return None
 
@@ -482,38 +396,129 @@ def parse_any_date(x) -> Optional[date]:
         return None
 
 
-def find_or_append_date_row(ws: gspread.Worksheet, date_label) -> int:
+def yymm_from_filename(fname: str) -> Tuple[int, int]:
+    m = re.search(r"(20\d{2})(\d{2})", fname)
+    if not m:
+        raise ValueError(f"파일명에서 YYYYMM 추출 실패: {fname}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def month_sheet_titles(year: int, month: int) -> Dict[str, List[str]]:
+    yy = year % 100
+    return {
+        "전국": [
+            f"전국 {yy}년 {month}월",
+            f"전국 {month}월",
+            f"전국 {year}년 {month}월",
+        ],
+        "서울": [
+            f"서울 {yy}년 {month}월",
+            f"서울 {month}월",
+            f"서울 {year}년 {month}월",
+        ],
+    }
+
+
+def preferred_sheet_title(level: str, year: int, month: int) -> str:
+    yy = year % 100
+    return f"{level} {yy}년 {month}월"
+
+
+def date_label_for_sheet(d: date, style: str = "korean") -> str:
+    if style == "iso":
+        return d.isoformat()
+    return f"{d.month}월 {d.day}일"
+
+
+def detect_date_style(ws: gspread.Worksheet) -> str:
+    vals = _get_all_values_cached(ws)
+    if len(vals) >= 2 and len(vals[1]) >= 1:
+        sample = vals[1][0]
+        if parse_any_date(sample):
+            s = str(sample).strip()
+            if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", s):
+                return "iso"
+            if "월" in s and "일" in s:
+                return "korean"
+    return "korean"
+
+
+# ===================== 월별 탭 찾기/생성 =====================
+def find_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) -> Optional[gspread.Worksheet]:
+    for cand in month_sheet_titles(year, month)[level]:
+        ws = fuzzy_ws(sh, cand)
+        if ws is not None:
+            return ws
+    return None
+
+
+def ensure_month_ws(sh: gspread.Spreadsheet, level: str, year: int, month: int) -> gspread.Worksheet:
+    expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
+    min_cols = max(MONTH_WS_MIN_COLS, len(expected_header) + 5)
+
+    ws = find_month_ws(sh, level, year, month)
+    if ws is None:
+        title = preferred_sheet_title(level, year, month)
+        ws = _retry(sh.add_worksheet, title=title, rows=MONTH_WS_MIN_ROWS, cols=min_cols)
+        ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
+        log(f"[ws] created: {title}")
+        return ws
+
+    ensure_ws_size(ws, min_rows=MONTH_WS_MIN_ROWS, min_cols=min_cols)
+
+    vals = _get_all_values_cached(ws)
+    if not vals:
+        ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
+        log(f"[ws] header initialized: {ws.title}")
+        return ws
+
+    header = [str(x).strip() for x in vals[0]]
+    # A1이 비어 있고 B1부터 헤더가 있던 시트도 지원
+    if header and header[0] == "":
+        header[0] = "날짜"
+
+    if header[:len(expected_header)] != expected_header:
+        ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
+        log(f"[ws] header repaired: {ws.title}")
+    else:
+        log(f"[ws] exists: {ws.title}")
+
+    return ws
+
+
+# ===================== 날짜행 탐색 =====================
+def find_or_append_date_row(ws: gspread.Worksheet, target_label: str) -> int:
     """
-    A열 기준
-    1) 같은 날짜가 있으면 그 행 반환
-    2) 없으면 첫 빈 행 반환
-    3) 빈 행도 없으면 마지막 사용 행 다음 줄 반환
+    A열 기준:
+    1) 같은 날짜가 있으면 그 행
+    2) 없으면 첫 빈 행
+    3) 빈 행도 없으면 마지막 사용 행 다음 줄
     """
-    target = parse_any_date(date_label)
+    target = parse_any_date(target_label)
     if not target:
         return 2
 
-    col = _retry(ws.col_values, 1) or []
-
-    if len(col) <= 1:
-        return 2
+    # A열 전체 값을 직접 읽는다. 중간 빈 칸을 놓치지 않기 위해 A2:A2000 범위 사용.
+    # 현재 구조상 충분히 넉넉하게 본다.
+    ensure_ws_size(ws, min_rows=MONTH_WS_MIN_ROWS, min_cols=MONTH_WS_MIN_COLS)
+    col = _retry(ws.get, f"A2:A{ws.row_count}") or []
 
     first_empty = None
-    last_used = 1
+    last_used = 1  # 헤더 행
 
-    for row_idx, v in enumerate(col[1:], start=2):
+    for idx, row in enumerate(col, start=2):
+        v = row[0] if row else ""
         s = str(v).strip() if v is not None else ""
 
         if s == "":
             if first_empty is None:
-                first_empty = row_idx
+                first_empty = idx
             continue
 
-        last_used = row_idx
-
+        last_used = idx
         d = parse_any_date(s)
         if d and d == target:
-            return row_idx
+            return idx
 
     if first_empty is not None:
         return first_empty
@@ -521,9 +526,11 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label) -> int:
     return last_used + 1
 
 
-def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
-    hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
-    row_idx = find_or_append_date_row(ws, date_iso)
+# ===================== 기록 =====================
+def write_month_sheet(ws: gspread.Worksheet, target_day: date, header: List[str], values_by_colname: Dict[str, int]):
+    style = detect_date_style(ws)
+    date_label = date_label_for_sheet(target_day, style=style)
+    row_idx = find_or_append_date_row(ws, date_label)
 
     ensure_ws_size(
         ws,
@@ -531,49 +538,20 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
         min_cols=max(MONTH_WS_MIN_COLS, len(header) + 5),
     )
 
+    hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
     sheet_prefix = f"'{ws.title}'!"
-    payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
+    payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_label]]}]
 
     for col_name, val in values_by_colname.items():
         if col_name in hmap:
             c = hmap[col_name]
-            payload.append({
-                "range": f"{sheet_prefix}{a1_col(c)}{row_idx}",
-                "values": [[int(val)]]
-            })
+            payload.append({"range": f"{sheet_prefix}{a1_col(c)}{row_idx}", "values": [[int(val)]]})
 
     values_batch_update(ws, payload)
-    log(f"[ws] {ws.title} -> {date_iso} row={row_idx} wrote_cells={len(payload)}")
+    log(f"[ws] {ws.title} -> {date_label} row={row_idx} wrote_cells={len(payload)}")
 
 
-def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
-    expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
-    min_cols = max(MONTH_WS_MIN_COLS, len(expected_header) + 5)
-
-    ws = fuzzy_ws(sh, title)
-
-    if ws is None:
-        ws = _retry(sh.add_worksheet, title=title, rows=MONTH_WS_MIN_ROWS, cols=min_cols)
-        ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
-        log(f"[ws] created from scratch: {title}")
-        return ws
-
-    ensure_ws_size(ws, min_rows=MONTH_WS_MIN_ROWS, min_cols=min_cols)
-
-    vals = _get_all_values_cached(ws)
-    current_header = vals[0] if vals else []
-    current_header = [str(x).strip() for x in current_header]
-
-    if current_header[:len(expected_header)] != expected_header:
-        ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
-        log(f"[ws] header repaired: {title}")
-    else:
-        log(f"[ws] exists: {title}")
-
-    return ws
-
-
-# ===================== 파일 읽기/집계 =====================
+# ===================== 월 파일 읽기/집계 =====================
 def read_month_df(path: Path) -> pd.DataFrame:
     forced = os.environ.get("EXCEL_SHEET_NAME", "").strip()
 
@@ -587,45 +565,16 @@ def read_month_df(path: Path) -> pd.DataFrame:
         raise RuntimeError(f"엑셀 시트가 없습니다: {path.name}")
 
     if forced:
-        if forced not in sheet_names:
-            raise RuntimeError(f"{path.name}: EXCEL_SHEET_NAME='{forced}' 인데 시트가 없습니다. available={sheet_names}")
         picked = forced
-        log(f"[excel] {path.name} -> forced '{picked}'")
     else:
-        if "Sheet1" in sheet_names:
+        if "data" in sheet_names:
+            picked = "data"
+        elif "Sheet1" in sheet_names:
             picked = "Sheet1"
-            log(f"[excel] {path.name} -> picked 'Sheet1'")
         else:
-            def norm(s: str) -> str:
-                return re.sub(r"\s+", "", str(s or "")).lower()
+            picked = sheet_names[0]
 
-            norm_map = {norm(n): n for n in sheet_names}
-            picked = None
-            if "data" in norm_map:
-                picked = norm_map["data"]
-            else:
-                for k, v in norm_map.items():
-                    if "data" in k:
-                        picked = v
-                        break
-
-            if picked is None:
-                must_tokens = ["거래금액", "계약년", "계약월", "계약일", "광역", "구", "법정동", "전용면적", "단지명"]
-                best_name, best_score = sheet_names[0], -1
-                for sname in sheet_names:
-                    try:
-                        df_head = pd.read_excel(path, sheet_name=sname, nrows=5)
-                        cols = [str(c) for c in df_head.columns]
-                        score = sum(1 for t in must_tokens if any(t in c for c in cols))
-                        if score > best_score:
-                            best_score = score
-                            best_name = sname
-                    except Exception:
-                        continue
-                picked = best_name
-                log(f"[excel] {path.name} -> auto-picked '{picked}' score={best_score} candidates={sheet_names}")
-            else:
-                log(f"[excel] {path.name} -> picked '{picked}' candidates={sheet_names}")
+    log(f"[excel] {path.name} -> picked '{picked}' candidates={sheet_names}")
 
     df = pd.read_excel(path, sheet_name=picked, dtype=str).fillna("")
     for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
@@ -634,34 +583,17 @@ def read_month_df(path: Path) -> pd.DataFrame:
     return df
 
 
-def eok_series(ser) -> pd.Series:
-    s = pd.Series(ser)
-    s = pd.to_numeric(s, errors="coerce").dropna()
-    if s.empty:
-        return pd.Series([], dtype=float)
-    return s / 10000.0
-
-
-def round2(v) -> str:
-    try:
-        return f"{float(v):.2f}"
-    except Exception:
-        return ""
-
-
 def _strip_col(df: pd.DataFrame, col: str):
     if col in df.columns:
         df[col] = df[col].astype(str).map(lambda x: str(x).replace("\u3000", " ").strip())
     return df
 
 
-def agg_all_stats(df: pd.DataFrame):
-    counts = {col: 0 for col in SUMMARY_COLS}
-    med = {col: "" for col in SUMMARY_COLS}
-    mean = {col: "" for col in SUMMARY_COLS}
+def agg_counts(df: pd.DataFrame):
+    counts = {}
 
     if df is None or df.empty:
-        return counts, med, mean
+        return counts
 
     df = df.copy()
     _strip_col(df, "광역")
@@ -669,380 +601,49 @@ def agg_all_stats(df: pd.DataFrame):
     _strip_col(df, "법정동")
 
     counts["전국"] = int(len(df))
-    all_eok = eok_series(df.get("거래금액(만원)", []))
-    if not all_eok.empty:
-        med["전국"] = round2(all_eok.median())
-        mean["전국"] = round2(all_eok.mean())
 
     if "광역" in df.columns:
         for prov, sub in df.groupby("광역"):
             prov = str(prov).strip()
-            if prov in counts:
-                counts[prov] += int(len(sub))
-                se = eok_series(sub.get("거래금액(만원)", []))
-                if not se.empty:
-                    med[prov] = round2(se.median())
-                    mean[prov] = round2(se.mean())
+            counts[prov] = counts.get(prov, 0) + int(len(sub))
 
     seoul = df[df.get("광역", "") == "서울특별시"].copy()
     counts["서울"] = int(len(seoul))
-    if len(seoul) > 0:
-        se = eok_series(seoul.get("거래금액(만원)", []))
-        if not se.empty:
-            med["서울"] = round2(se.median())
-            mean["서울"] = round2(se.mean())
-        if "구" in seoul.columns:
-            for gu, sub in seoul.groupby("구"):
-                gu = str(gu).strip()
-                if gu in counts:
-                    counts[gu] += int(len(sub))
-                    se2 = eok_series(sub.get("거래금액(만원)", []))
-                    if not se2.empty:
-                        med[gu] = round2(se2.median())
-                        mean[gu] = round2(se2.mean())
 
-    ap = seoul[seoul.get("법정동", "") == "압구정동"]
-    counts["압구정동"] = int(len(ap))
-    if len(ap) > 0:
-        s = eok_series(ap.get("거래금액(만원)", []))
-        if not s.empty:
-            med["압구정동"] = round2(s.median())
-            mean["압구정동"] = round2(s.mean())
+    if "구" in seoul.columns:
+        for gu, sub in seoul.groupby("구"):
+            gu = str(gu).strip()
+            counts[gu] = counts.get(gu, 0) + int(len(sub))
 
-    return counts, med, mean
+    return counts
 
 
-# ===================== 압구정동 탭 =====================
-def _canon_col(s: str) -> str:
-    return str(s or "").strip().replace("\u00a0", " ").replace("\u3000", " ")
-
-
-def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {_canon_col(c): c for c in df.columns}
-    for cand in candidates:
-        cc = _canon_col(cand)
-        if cc in cols:
-            return cols[cc]
-
-    def norm2(x):
-        x = _canon_col(x)
-        x = re.sub(r"\s+", "", x)
-        x = x.replace("㎡", "m²").replace("m2", "m²")
-        x = x.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
-        x = x.replace(".", "").replace(",", "")
-        return x
-
-    cols2 = {norm2(c): c for c in df.columns}
-    for cand in candidates:
-        k = norm2(cand)
-        if k in cols2:
-            return cols2[k]
-    return None
-
-
-def _norm_text_series(s: pd.Series) -> pd.Series:
-    return (
-        s.astype(str)
-        .str.replace("\u3000", " ", regex=False)
-        .str.replace("\u00a0", " ", regex=False)
-        .str.strip()
-    )
-
-
-def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    area_col = _pick_col(df, ["전용면적(m²)", "전용면적(m2)", "전용면적(㎡)", "전용면적"])
-    if area_col and area_col != "전용면적(m²)":
-        df["전용면적(m²)"] = df[area_col]
-    elif "전용면적(m²)" not in df.columns and area_col is None:
-        df["전용면적(m²)"] = ""
-
-    dong_col = _pick_col(df, ["동"])
-    floor_col = _pick_col(df, ["층", "층수"])
-    if dong_col and dong_col != "동":
-        df["동"] = df[dong_col]
-    if floor_col and floor_col != "층":
-        df["층"] = df[floor_col]
-
-    main_no = _pick_col(df, ["본번"])
-    sub_no = _pick_col(df, ["부번"])
-    if main_no and main_no != "본번":
-        df["본번"] = df[main_no]
-    if sub_no and sub_no != "부번":
-        df["부번"] = df[sub_no]
-
-    comp_col = _pick_col(df, ["단지명"])
-    if comp_col and comp_col != "단지명":
-        df["단지명"] = df[comp_col]
-
-    for c in ["광역", "구", "법정동"]:
-        if c not in df.columns:
-            df[c] = ""
-
-    for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
-        if c not in df.columns:
-            df[c] = ""
-
-    for c in ["광역", "구", "법정동"]:
-        df[c] = _norm_text_series(df[c])
-
-    for c in ["본번", "부번", "동", "층", "단지명", "전용면적(m²)"]:
-        if c in df.columns:
-            df[c] = _norm_text_series(df[c])
-
-    for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["_면적_num"] = pd.to_numeric(df["전용면적(m²)"], errors="coerce")
-    return df
-
-
-def _norm_dash_blank(x: object) -> str:
-    s = str(x or "").strip().replace("\u3000", " ").replace("\u00a0", " ").strip()
-    if s in ("-", "—", "nan", "NaN", "None"):
-        return ""
-    return s
-
-
-def _zfill4(x: object) -> str:
-    s = _norm_dash_blank(x)
-    return s.zfill(4) if s.isdigit() else s
-
-
-def _to_int_str(x: object) -> str:
-    v = pd.to_numeric(pd.Series([x]), errors="coerce").fillna(0).astype(int).iloc[0]
-    return str(int(v))
-
-
-def _make_key_df(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-
-    if "_면적_num" in df2.columns:
-        df2["_면적_key"] = pd.to_numeric(df2["_면적_num"], errors="coerce").round(2).fillna(-1)
-    elif "전용면적(m²)" in df2.columns:
-        df2["_면적_key"] = pd.to_numeric(df2["전용면적(m²)"], errors="coerce").round(2).fillna(-1)
-    else:
-        df2["_면적_key"] = -1
-
-    for c in ["광역", "구", "법정동", "단지명"]:
-        if c not in df2.columns:
-            df2[c] = ""
-        df2[c] = df2[c].map(_norm_dash_blank)
-
-    for c in ["본번", "부번"]:
-        if c not in df2.columns:
-            df2[c] = ""
-    df2["본번"] = df2["본번"].map(_zfill4)
-    df2["부번"] = df2["부번"].map(_zfill4)
-
-    for c in ["동", "층"]:
-        if c not in df2.columns:
-            df2[c] = ""
-        df2[c] = df2[c].map(_norm_dash_blank)
-
-    for c in ["계약년", "계약월", "계약일", "거래금액(만원)"]:
-        if c not in df2.columns:
-            df2[c] = 0
-        df2[c] = df2[c].map(_to_int_str)
-
-    key_cols = [
-        "광역", "구", "법정동", "본번", "부번", "단지명",
-        "_면적_key", "계약년", "계약월", "계약일", "거래금액(만원)", "동", "층"
-    ]
-    for c in key_cols:
-        if c not in df2.columns:
-            df2[c] = ""
-    return df2[key_cols].astype(str)
-
-
-def _ws_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
-    vals = _get_all_values_cached(ws)
-    if not vals:
-        return pd.DataFrame()
-    header = [str(x).strip() for x in vals[0]]
-    rows = vals[1:]
-    if not header:
-        return pd.DataFrame()
-    maxw = max([len(r) for r in rows], default=len(header))
-    header = header + [""] * (maxw - len(header))
-    norm_rows = []
-    for r in rows:
-        rr = r + [""] * (maxw - len(r))
-        norm_rows.append(rr)
-    return pd.DataFrame(norm_rows, columns=header[:maxw])
-
-
-def _df_to_values(df: pd.DataFrame, header: List[str]) -> List[List[str]]:
-    df2 = df.copy()
-    for h in header:
-        if h not in df2.columns:
-            df2[h] = ""
-    df2 = df2[header]
-    return df2.replace([np.inf, -np.inf], "").fillna("").astype(str).values.tolist()
-
-
-def _hide_sheet(ws: gspread.Worksheet):
-    try:
-        batch_format(ws, [{
-            "updateSheetProperties": {
-                "properties": {"sheetId": ws.id, "hidden": True},
-                "fields": "hidden"
-            }
-        }])
-    except Exception:
-        pass
-
-
-def _set_text_color(ws: gspread.Worksheet, start_row: int, end_row: int, start_col: int, end_col: int, rgb: Tuple[float, float, float]):
-    r, g, b = rgb
-    req = [{
-        "repeatCell": {
-            "range": {
-                "sheetId": ws.id,
-                "startRowIndex": start_row - 1,
-                "endRowIndex": end_row,
-                "startColumnIndex": start_col - 1,
-                "endColumnIndex": end_col,
-            },
-            "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": {"red": float(r), "green": float(g), "blue": float(b)}}}},
-            "fields": "userEnteredFormat.textFormat.foregroundColor"
-        }
-    }]
-    batch_format(ws, req)
-
-
-def update_apgujong_tab(sh: gspread.Spreadsheet, df_all: pd.DataFrame):
-    if df_all is None or df_all.empty:
-        log("[apgu] skipped: df_all empty")
+# ===================== 거래요약(옵션) =====================
+def update_summary_if_exists(sh: gspread.Spreadsheet, summary_rows: List[Tuple[str, Dict[str, int]]]):
+    ws = fuzzy_ws(sh, SUMMARY_SHEET_NAME)
+    if ws is None:
+        log("[summary] skip: 거래요약 시트 없음")
         return
 
-    df_all = _ensure_cols(df_all)
-    bd = df_all["법정동"].astype(str).str.replace("\u3000", " ", regex=False).str.replace("\u00a0", " ", regex=False).str.strip()
-    cur = df_all[bd == "압구정동"].copy()
-    if cur.empty:
-        log("[apgu] no rows for 압구정동")
-        return
+    months = [x[0] for x in summary_rows]  # 최신월 -> 과거월
+    header = ["구분"] + months
+    ensure_ws_size(ws, min_rows=50, min_cols=max(20, len(header) + 2))
+    ws_update(ws, [header], f"A1:{a1_col(len(header))}1")
 
-    cur["_dt"] = pd.to_datetime(
-        cur["계약년"].map(_to_int_str) + "-" + cur["계약월"].map(_to_int_str) + "-" + cur["계약일"].map(_to_int_str),
-        errors="coerce",
-    )
-    cur = cur.sort_values(["_dt", "거래금액(만원)"], ascending=[True, False]).drop(columns=["_dt"])
+    lookup = {ym: counts for ym, counts in summary_rows}
+    row_map = {
+        "전국 거래건수": [],
+        "서울 거래건수": [],
+    }
 
-    cur_key = _make_key_df(cur)
-    cur_key["__k"] = cur_key.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-    cur_with_k = cur.copy()
-    cur_with_k["__k"] = cur_key["__k"].values
-    cur_set = set(cur_with_k["__k"].tolist())
+    for ym in months:
+        c = lookup[ym]
+        row_map["전국 거래건수"].append(int(c.get("전국", 0)))
+        row_map["서울 거래건수"].append(int(c.get("서울", 0)))
 
-    ws_main = get_or_create_ws(sh, APGU_SHEET_NAME, rows=5000, cols=60)
-    ws_base = get_or_create_ws(sh, APGU_BASE_SHEET_NAME, rows=5000, cols=60)
-    _hide_sheet(ws_base)
-
-    prev_df = _ws_to_df(ws_base)
-    if prev_df.empty:
-        prev_df = pd.DataFrame(columns=["__k"])
-        prev_set = set()
-    else:
-        if "__k" in prev_df.columns:
-            prev_df["__k"] = prev_df["__k"].astype(str)
-            prev_set = set(prev_df["__k"].tolist())
-        else:
-            pk = _make_key_df(prev_df)
-            pk["__k"] = pk.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-            prev_df["__k"] = pk["__k"].values
-            prev_set = set(prev_df["__k"].tolist())
-
-    added_keys = sorted(list(cur_set - prev_set))
-    removed_keys = sorted(list(prev_set - cur_set))
-    log(f"[apgu] snapshot rows={len(cur)} added={len(added_keys)} removed={len(removed_keys)}")
-
-    main_vals = _get_all_values_cached(ws_main)
-    if main_vals and main_vals[0]:
-        base_header = [str(x).strip() for x in main_vals[0] if str(x).strip()]
-        base_header = [h for h in base_header if h != "__k"]
-    else:
-        base_header = [c for c in cur.columns if c != "__k"]
-
-    if "변동" in base_header:
-        base_header = [h for h in base_header if h != "변동"]
-    header_snapshot = ["변동"] + base_header
-
-    ws_clear(ws_main)
-    ws_update(ws_main, [header_snapshot], "A1")
-
-    snap_df = cur.copy()
-    snap_df.insert(0, "변동", "")
-    snap_values = _df_to_values(snap_df, header_snapshot)
-    if snap_values:
-        ws_update(ws_main, snap_values, f"A2:{a1_col(len(header_snapshot))}{len(snap_values) + 1}")
-
-    diff_start = 2 + len(snap_values) + 2
-    if added_keys or removed_keys:
-        title = f"변동사항 (기준: 어제 base 대비) / 실행일: {datetime.now().date().isoformat()}"
-        ws_update(
-            ws_main,
-            [[title] + [""] * (len(header_snapshot) - 1)],
-            f"A{diff_start}:{a1_col(len(header_snapshot))}{diff_start}"
-        )
-
-        del_df = pd.DataFrame()
-        if removed_keys and not prev_df.empty:
-            del_df = prev_df[prev_df["__k"].isin(removed_keys)].copy()
-            if not del_df.empty:
-                if "변동" in del_df.columns:
-                    del_df["변동"] = "삭제"
-                else:
-                    del_df.insert(0, "변동", "삭제")
-
-        add_df = pd.DataFrame()
-        if added_keys:
-            add_df = cur_with_k[cur_with_k["__k"].isin(added_keys)].copy()
-            if "__k" in add_df.columns:
-                add_df = add_df.drop(columns=["__k"])
-            if "변동" in add_df.columns:
-                add_df["변동"] = "추가"
-            else:
-                add_df.insert(0, "변동", "추가")
-
-        out_diff = []
-        if not del_df.empty:
-            if "__k" in del_df.columns:
-                del_df = del_df.drop(columns=["__k"])
-            out_diff.append(del_df)
-        if not add_df.empty:
-            out_diff.append(add_df)
-
-        diff_df = pd.concat(out_diff, ignore_index=True) if out_diff else pd.DataFrame(columns=header_snapshot)
-        diff_values = _df_to_values(diff_df, header_snapshot)
-
-        diff_rows_start = diff_start + 1
-        if diff_values:
-            ws_update(
-                ws_main,
-                diff_values,
-                f"A{diff_rows_start}:{a1_col(len(header_snapshot))}{diff_rows_start + len(diff_values) - 1}"
-            )
-
-            del_n = 0 if del_df.empty else len(del_df)
-            add_n = 0 if add_df.empty else len(add_df)
-            if del_n:
-                _set_text_color(ws_main, diff_rows_start, diff_rows_start + del_n - 1, 1, len(header_snapshot), (0.85, 0.0, 0.0))
-            if add_n:
-                _set_text_color(ws_main, diff_rows_start + del_n, diff_rows_start + del_n + add_n - 1, 1, len(header_snapshot), (0.0, 0.2, 0.85))
-
-    base_cols = ["__k"] + [c for c in cur.columns if c != "__k"]
-    base_cols = list(dict.fromkeys(base_cols))
-
-    ws_clear(ws_base)
-    ws_update(ws_base, [base_cols], "A1")
-    base_vals = _df_to_values(cur_with_k.copy(), base_cols)
-    if base_vals:
-        ws_update(ws_base, base_vals, f"A2:{a1_col(len(base_cols))}{len(base_vals) + 1}")
-    _hide_sheet(ws_base)
-
-    log("[apgu] updated: snapshot(top) + diff(section) + base(saved)")
+    out_rows = [[k] + v for k, v in row_map.items()]
+    ws_update(ws, out_rows, f"A2:{a1_col(len(header))}{len(out_rows)+1}")
+    log(f"[summary] wrote rows={len(out_rows)} months={len(months)}")
 
 
 # ===================== 메인 =====================
@@ -1053,9 +654,6 @@ def main():
     if not sheet_id:
         raise RuntimeError("SHEET_ID 환경변수가 필요합니다.")
 
-    if not _get_sa_json_env() and not os.environ.get("SA_PATH", "").strip():
-        raise RuntimeError("SA_JSON(또는 GDRIVE_SA_JSON) 또는 SA_PATH 환경변수가 필요합니다.")
-
     creds = load_creds()
     xlsx_paths = download_latest_5_months_from_drive(creds)
     if not xlsx_paths:
@@ -1064,89 +662,41 @@ def main():
 
     gc = gspread.authorize(creds)
     sh = _retry(gc.open_by_key, sheet_id)
-    today_iso = datetime.now().date().isoformat()
+    today = datetime.now().date()
 
-    df_all_frames: List[pd.DataFrame] = []
-    summary_rows = []
+    def ym_key_from_file(p: Path):
+        y, m = yymm_from_filename(p.name)
+        return y, m
 
-    def ym_key(yymm: str):
-        yy, mm = yymm.split("/")
-        return 2000 + int(yy), int(mm)
+    xlsx_paths = sorted(xlsx_paths, key=ym_key_from_file, reverse=True)
 
-    file_map: Dict[str, Path] = {}
+    summary_rows: List[Tuple[str, Dict[str, int]]] = []
+
     for p in xlsx_paths:
-        _, _, yymm = ym_from_apt_filename(p.name)
-        if yymm:
-            file_map[yymm] = p
+        year, month = yymm_from_filename(p.name)
+        yy = year % 100
+        ym_label = f"{yy:02d}/{month:02d}"
 
-    yms = sorted(file_map.keys(), key=ym_key, reverse=True)
-    log(f"[input] months_to_process={yms}")
-
-    for yymm in yms:
-        p = file_map[yymm]
-        nat_title, seoul_title, _ = ym_from_apt_filename(p.name)
         log(f"[file] {p.name}")
-
         df = read_month_df(p)
         log(f"[read] rows={len(df)} cols={len(df.columns)}")
-        df_all_frames.append(df)
 
-        counts, med, mean = agg_all_stats(df)
-        summary_rows.append((yymm, counts, med, mean))
+        counts = agg_counts(df)
+        summary_rows.append((ym_label, counts))
 
-        ws_nat = ensure_month_ws(sh, nat_title, "전국")
+        ws_nat = ensure_month_ws(sh, "전국", year, month)
         header_nat = ["날짜"] + NATION_REGIONS
         values_nat = {k: int(counts.get(k, 0)) for k in NATION_REGIONS if k != "총합계"}
         values_nat["총합계"] = int(counts.get("전국", 0))
-        write_month_sheet(ws_nat, today_iso, header_nat, values_nat)
+        write_month_sheet(ws_nat, today, header_nat, values_nat)
 
-        ws_seoul = ensure_month_ws(sh, seoul_title, "서울")
+        ws_seoul = ensure_month_ws(sh, "서울", year, month)
         header_seoul = ["날짜"] + SEOUL_REGIONS
         values_seoul = {k: int(counts.get(k, 0)) for k in SEOUL_REGIONS if k != "총합계"}
         values_seoul["총합계"] = int(counts.get("서울", 0))
-        write_month_sheet(ws_seoul, today_iso, header_seoul, values_seoul)
+        write_month_sheet(ws_seoul, today, header_seoul, values_seoul)
 
-    ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = [x[0] for x in summary_rows]
-    header = ["구분"] + months
-    ensure_ws_size(ws_sum, min_rows=400, min_cols=max(60, len(header) + 5))
-    ws_update(ws_sum, [header], f"A1:{a1_col(len(header))}1")
-
-    lookup = {ym: (c, md, mn) for ym, c, md, mn in summary_rows}
-    row_map = {
-        "전국 거래건수": [],
-        "전국 중앙값(억)": [],
-        "전국 평균가(억)": [],
-        "서울 거래건수": [],
-        "서울 중앙값(억)": [],
-        "서울 평균가(억)": [],
-        "압구정동 거래건수": [],
-        "압구정동 중앙값(억)": [],
-        "압구정동 평균가(억)": [],
-    }
-
-    for ym in months:
-        c, md, mn = lookup[ym]
-        row_map["전국 거래건수"].append(int(c.get("전국", 0)))
-        row_map["전국 중앙값(억)"].append(md.get("전국", ""))
-        row_map["전국 평균가(억)"].append(mn.get("전국", ""))
-        row_map["서울 거래건수"].append(int(c.get("서울", 0)))
-        row_map["서울 중앙값(억)"].append(md.get("서울", ""))
-        row_map["서울 평균가(억)"].append(mn.get("서울", ""))
-        row_map["압구정동 거래건수"].append(int(c.get("압구정동", 0)))
-        row_map["압구정동 중앙값(억)"].append(md.get("압구정동", ""))
-        row_map["압구정동 평균가(억)"].append(mn.get("압구정동", ""))
-
-    out_rows = [[k] + arr for k, arr in row_map.items()]
-    ws_update(ws_sum, out_rows, f"A2:{a1_col(len(header))}{len(out_rows) + 1}")
-    log(f"[summary] wrote rows={len(out_rows)} months={len(months)}")
-
-    try:
-        df_all = pd.concat(df_all_frames, ignore_index=True) if df_all_frames else pd.DataFrame()
-        update_apgujong_tab(sh, df_all)
-    except Exception as e:
-        log(f"[apgu] ERROR: {e}")
-
+    update_summary_if_exists(sh, summary_rows)
     log("[MAIN] done")
 
 
