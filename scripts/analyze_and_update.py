@@ -9,6 +9,7 @@ analyze_and_update.py
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
 - 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
+- 기록 전에 시트 행/열을 자동 확장하여 grid limit 오류 방지
 - 압구정동 탭은 스냅샷/변동사항 분리
 
 필수 ENV:
@@ -281,7 +282,6 @@ def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives:
         if not cur or ts(it) > ts(cur):
             best_by_ym[ym] = it
 
-    # 최신 5개월만, 최신월이 앞에 오도록 유지
     yms = sorted(best_by_ym.keys(), reverse=True)[:5]
     log(f"[drive] months_to_process={yms}")
     return [best_by_ym[ym] for ym in yms]
@@ -320,7 +320,8 @@ def download_latest_5_months_from_drive(creds) -> List[Path]:
             continue
         out = DOWNLOAD_DIR / name
         log(f"[drive] downloading: {name}")
-        download_file_from_drive(drive, fid, out, supports_all_drives)
+        download_file_fromDrive = download_file_from_drive
+        download_file_fromDrive(drive, fid, out, supports_all_drives)
         paths.append(out)
 
     log(f"[drive] downloaded files={len(paths)} -> {DOWNLOAD_DIR}")
@@ -416,6 +417,26 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
     return ws
 
 
+def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
+    """시트 크기가 부족하면 자동 확장"""
+    need_resize = False
+    new_rows = ws.row_count
+    new_cols = ws.col_count
+
+    if ws.row_count < min_rows:
+        new_rows = min_rows
+        need_resize = True
+
+    if ws.col_count < min_cols:
+        new_cols = min_cols
+        need_resize = True
+
+    if need_resize:
+        _retry(ws.resize, rows=new_rows, cols=new_cols)
+        _invalidate_cache(ws)
+        log(f"[ws] resized: {ws.title} rows={new_rows} cols={new_cols}")
+
+
 # ===================== 월탭 처리 =====================
 def ym_from_apt_filename(fname: str):
     s = str(fname or "")
@@ -482,8 +503,11 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
     row_idx = find_or_append_date_row(ws, date_iso)
-    sheet_prefix = f"'{ws.title}'!"
 
+    # 쓰기 전에 자동 확장
+    ensure_ws_size(ws, min_rows=row_idx + 50, min_cols=max(40, len(header) + 5))
+
+    sheet_prefix = f"'{ws.title}'!"
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
     for col_name, val in values_by_colname.items():
         if col_name in hmap:
@@ -496,14 +520,17 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
 
 def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
     expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
+    min_cols = max(40, len(expected_header) + 5)
 
     ws = fuzzy_ws(sh, title)
 
     if ws is None:
-        ws = _retry(sh.add_worksheet, title=title, rows=800, cols=max(40, len(expected_header) + 5))
+        ws = _retry(sh.add_worksheet, title=title, rows=max(2000, MAX_SCAN_ROWS + 100), cols=min_cols)
         ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
         log(f"[ws] created from scratch: {title}")
         return ws
+
+    ensure_ws_size(ws, min_rows=max(2000, MAX_SCAN_ROWS + 100), min_cols=min_cols)
 
     vals = _get_all_values_cached(ws)
     current_header = vals[0] if vals else []
@@ -1024,7 +1051,6 @@ def main():
         if yymm:
             file_map[yymm] = p
 
-    # 최신월이 앞쪽
     yms = sorted(file_map.keys(), key=ym_key, reverse=True)
     log(f"[input] months_to_process={yms}")
 
@@ -1053,8 +1079,9 @@ def main():
         write_month_sheet(ws_seoul, today_iso, header_seoul, values_seoul)
 
     ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = [x[0] for x in summary_rows]  # 이미 최신월 -> 과거월 순서
+    months = [x[0] for x in summary_rows]
     header = ["구분"] + months
+    ensure_ws_size(ws_sum, min_rows=max(400, len(header) + 20), min_cols=max(60, len(header) + 5))
     ws_update(ws_sum, [header], f"A1:{a1_col(len(header))}1")
 
     lookup = {ym: (c, md, mn) for ym, c, md, mn in summary_rows}
