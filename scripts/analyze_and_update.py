@@ -9,7 +9,7 @@ analyze_and_update.py
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
 - 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
-- 기록 전에 시트 행/열을 자동 확장하여 grid limit 오류 방지
+- 월 탭은 기록 직전에 항상 최소 크기를 강제로 보장
 - 압구정동 탭은 스냅샷/변동사항 분리
 
 필수 ENV:
@@ -19,7 +19,7 @@ analyze_and_update.py
 - DRIVE_SUPPORTS_ALL_DRIVES: "true" 권장
 
 선택 ENV:
-- DRIVE_FILE_REGEX: 기본 r"^아파트\s*(\d{6})\.xlsx$"
+- DRIVE_FILE_REGEX: 기본 r"^아파트\\s*(\\d{6})\\.xlsx$"
 - DRIVE_SCAN_MAX_FILES: 기본 1000
 - DOWNLOAD_DIR: 기본 "_drive_downloads"
 - MAX_SCAN_ROWS: 기본 900
@@ -54,6 +54,10 @@ DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "_drive_downloads"))
 DRIVE_FILE_REGEX = os.environ.get("DRIVE_FILE_REGEX", r"^아파트\s*(\d{6})\.xlsx$")
 APT_FILE_RE = re.compile(DRIVE_FILE_REGEX)
 DRIVE_SCAN_MAX_FILES = int(os.environ.get("DRIVE_SCAN_MAX_FILES", "1000"))
+
+MONTH_WS_MIN_ROWS = int(os.environ.get("MONTH_WS_MIN_ROWS", "2000"))
+MONTH_WS_MIN_EXTRA = int(os.environ.get("MONTH_WS_MIN_EXTRA", "100"))
+MONTH_WS_MIN_COLS = 40
 
 SUMMARY_COLS = [
     "전국", "서울", "서울특별시",
@@ -320,8 +324,7 @@ def download_latest_5_months_from_drive(creds) -> List[Path]:
             continue
         out = DOWNLOAD_DIR / name
         log(f"[drive] downloading: {name}")
-        download_file_fromDrive = download_file_from_drive
-        download_file_fromDrive(drive, fid, out, supports_all_drives)
+        download_file_from_drive(drive, fid, out, supports_all_drives)
         paths.append(out)
 
     log(f"[drive] downloaded files={len(paths)} -> {DOWNLOAD_DIR}")
@@ -417,24 +420,18 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
     return ws
 
 
-def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
-    """시트 크기가 부족하면 자동 확장"""
-    need_resize = False
-    new_rows = ws.row_count
-    new_cols = ws.col_count
+def force_min_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int):
+    """
+    월별 시트는 기록 전에 항상 최소 크기를 강제로 보장.
+    조건부 판단 대신 목표치가 더 크면 resize 수행.
+    """
+    target_rows = max(ws.row_count, min_rows)
+    target_cols = max(ws.col_count, min_cols)
 
-    if ws.row_count < min_rows:
-        new_rows = min_rows
-        need_resize = True
-
-    if ws.col_count < min_cols:
-        new_cols = min_cols
-        need_resize = True
-
-    if need_resize:
-        _retry(ws.resize, rows=new_rows, cols=new_cols)
+    if target_rows != ws.row_count or target_cols != ws.col_count:
+        _retry(ws.resize, rows=target_rows, cols=target_cols)
         _invalidate_cache(ws)
-        log(f"[ws] resized: {ws.title} rows={new_rows} cols={new_cols}")
+        log(f"[ws] resized: {ws.title} rows={target_rows} cols={target_cols}")
 
 
 # ===================== 월탭 처리 =====================
@@ -477,11 +474,16 @@ def parse_any_date(x) -> Optional[date]:
 
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
+    """
+    A열에서 날짜를 찾고, 없으면 다음 빈 행을 반환.
+    스캔 범위는 MAX_SCAN_ROWS와 현재 시트 row_count를 함께 고려.
+    """
     target = parse_any_date(date_label) or parse_any_date(str(date_label))
     if not target:
         return 2
 
-    rng = f"A2:A{MAX_SCAN_ROWS}"
+    scan_to = max(MAX_SCAN_ROWS, ws.row_count)
+    rng = f"A2:A{scan_to}"
     col = _retry(ws.get, rng) or []
     first_empty = None
 
@@ -497,15 +499,20 @@ def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, 
 
     if first_empty is not None:
         return first_empty
-    return min(MAX_SCAN_ROWS + 1, 5000)
+
+    return scan_to + 1
 
 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
+
+    # 현재 탭 상태 기준으로 날짜 행 계산
     row_idx = find_or_append_date_row(ws, date_iso)
 
-    # 쓰기 전에 자동 확장
-    ensure_ws_size(ws, min_rows=row_idx + 50, min_cols=max(40, len(header) + 5))
+    # 기록 직전에 항상 강제로 충분한 크기 보장
+    min_rows = max(MONTH_WS_MIN_ROWS, row_idx + MONTH_WS_MIN_EXTRA, MAX_SCAN_ROWS + MONTH_WS_MIN_EXTRA)
+    min_cols = max(MONTH_WS_MIN_COLS, len(header) + 5)
+    force_min_ws_size(ws, min_rows=min_rows, min_cols=min_cols)
 
     sheet_prefix = f"'{ws.title}'!"
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
@@ -520,17 +527,19 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
 
 def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
     expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
-    min_cols = max(40, len(expected_header) + 5)
+    min_cols = max(MONTH_WS_MIN_COLS, len(expected_header) + 5)
+    min_rows = max(MONTH_WS_MIN_ROWS, MAX_SCAN_ROWS + MONTH_WS_MIN_EXTRA)
 
     ws = fuzzy_ws(sh, title)
 
     if ws is None:
-        ws = _retry(sh.add_worksheet, title=title, rows=max(2000, MAX_SCAN_ROWS + 100), cols=min_cols)
+        ws = _retry(sh.add_worksheet, title=title, rows=min_rows, cols=min_cols)
         ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
         log(f"[ws] created from scratch: {title}")
         return ws
 
-    ensure_ws_size(ws, min_rows=max(2000, MAX_SCAN_ROWS + 100), min_cols=min_cols)
+    # 기존 탭도 월 기록 전에 강제로 최소 크기 보장
+    force_min_ws_size(ws, min_rows=min_rows, min_cols=min_cols)
 
     vals = _get_all_values_cached(ws)
     current_header = vals[0] if vals else []
@@ -1079,9 +1088,9 @@ def main():
         write_month_sheet(ws_seoul, today_iso, header_seoul, values_seoul)
 
     ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = [x[0] for x in summary_rows]
+    months = [x[0] for x in summary_rows]  # 최신월 -> 과거월
     header = ["구분"] + months
-    ensure_ws_size(ws_sum, min_rows=max(400, len(header) + 20), min_cols=max(60, len(header) + 5))
+    force_min_ws_size(ws_sum, min_rows=400, min_cols=max(60, len(header) + 5))
     ws_update(ws_sum, [header], f"A1:{a1_col(len(header))}1")
 
     lookup = {ym: (c, md, mn) for ym, c, md, mn in summary_rows}
