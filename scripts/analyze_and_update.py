@@ -9,7 +9,7 @@ analyze_and_update.py
 - 월 탭은 검색해서 있으면 기록, 없으면 자동 생성
 - 월 탭 헤더가 비었거나 깨져 있으면 자동 복구
 - 최신월이 시트 기록 순서상 앞쪽에 오도록 처리
-- 월 탭은 기록 직전에 항상 최소 크기를 강제로 보장
+- 날짜 기록은 '실제 사용 중인 마지막 행' 기준으로 이어서 기록
 - 압구정동 탭은 스냅샷/변동사항 분리
 
 필수 ENV:
@@ -22,7 +22,6 @@ analyze_and_update.py
 - DRIVE_FILE_REGEX: 기본 r"^아파트\\s*(\\d{6})\\.xlsx$"
 - DRIVE_SCAN_MAX_FILES: 기본 1000
 - DOWNLOAD_DIR: 기본 "_drive_downloads"
-- MAX_SCAN_ROWS: 기본 900
 - EXCEL_SHEET_NAME: 시트명 강제(권장X)
 """
 
@@ -48,7 +47,6 @@ from googleapiclient.http import MediaIoBaseDownload
 LOG_DIR = Path("analyze_report")
 SUMMARY_SHEET_NAME = "거래요약"
 
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "900"))
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "_drive_downloads"))
 
 DRIVE_FILE_REGEX = os.environ.get("DRIVE_FILE_REGEX", r"^아파트\s*(\d{6})\.xlsx$")
@@ -56,7 +54,7 @@ APT_FILE_RE = re.compile(DRIVE_FILE_REGEX)
 DRIVE_SCAN_MAX_FILES = int(os.environ.get("DRIVE_SCAN_MAX_FILES", "1000"))
 
 MONTH_WS_MIN_ROWS = int(os.environ.get("MONTH_WS_MIN_ROWS", "2000"))
-MONTH_WS_MIN_EXTRA = int(os.environ.get("MONTH_WS_MIN_EXTRA", "100"))
+MONTH_WS_MIN_EXTRA = int(os.environ.get("MONTH_WS_MIN_EXTRA", "50"))
 MONTH_WS_MIN_COLS = 40
 
 SUMMARY_COLS = [
@@ -420,18 +418,13 @@ def get_or_create_ws(sh: gspread.Spreadsheet, title: str, rows: int = 100, cols:
     return ws
 
 
-def force_min_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int):
-    """
-    월별 시트는 기록 전에 항상 최소 크기를 강제로 보장.
-    조건부 판단 대신 목표치가 더 크면 resize 수행.
-    """
-    target_rows = max(ws.row_count, min_rows)
-    target_cols = max(ws.col_count, min_cols)
-
-    if target_rows != ws.row_count or target_cols != ws.col_count:
-        _retry(ws.resize, rows=target_rows, cols=target_cols)
+def ensure_ws_size(ws: gspread.Worksheet, min_rows: int, min_cols: int = 40):
+    new_rows = max(ws.row_count, min_rows)
+    new_cols = max(ws.col_count, min_cols)
+    if new_rows != ws.row_count or new_cols != ws.col_count:
+        _retry(ws.resize, rows=new_rows, cols=new_cols)
         _invalidate_cache(ws)
-        log(f"[ws] resized: {ws.title} rows={target_rows} cols={target_cols}")
+        log(f"[ws] resized: {ws.title} rows={new_rows} cols={new_cols}")
 
 
 # ===================== 월탭 처리 =====================
@@ -475,44 +468,44 @@ def parse_any_date(x) -> Optional[date]:
 
 def find_or_append_date_row(ws: gspread.Worksheet, date_label: Union[str, date, datetime]) -> int:
     """
-    A열에서 날짜를 찾고, 없으면 다음 빈 행을 반환.
-    스캔 범위는 MAX_SCAN_ROWS와 현재 시트 row_count를 함께 고려.
+    A열 실제 사용 행을 기준으로 날짜를 찾고,
+    없으면 첫 빈 행 또는 마지막 사용 행 다음 줄을 반환.
     """
     target = parse_any_date(date_label) or parse_any_date(str(date_label))
     if not target:
         return 2
 
-    scan_to = max(MAX_SCAN_ROWS, ws.row_count)
-    rng = f"A2:A{scan_to}"
-    col = _retry(ws.get, rng) or []
-    first_empty = None
+    vals = _retry(ws.get_all_values) or []
 
-    for offset, row in enumerate(col, start=2):
-        v = row[0] if row else ""
-        if not v:
+    if len(vals) <= 1:
+        return 2
+
+    first_empty = None
+    last_used = 1
+
+    for row_idx, row in enumerate(vals[1:], start=2):
+        v = row[0].strip() if row and len(row) > 0 else ""
+
+        if v:
+            last_used = row_idx
+            d = parse_any_date(v)
+            if d and d == target:
+                return row_idx
+        else:
             if first_empty is None:
-                first_empty = offset
-            continue
-        d = parse_any_date(v)
-        if d and d == target:
-            return offset
+                first_empty = row_idx
 
     if first_empty is not None:
         return first_empty
 
-    return scan_to + 1
+    return last_used + 1
 
 
 def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], values_by_colname: Dict[str, int]):
     hmap = {str(h).strip(): idx + 1 for idx, h in enumerate(header) if str(h).strip()}
-
-    # 현재 탭 상태 기준으로 날짜 행 계산
     row_idx = find_or_append_date_row(ws, date_iso)
 
-    # 기록 직전에 항상 강제로 충분한 크기 보장
-    min_rows = max(MONTH_WS_MIN_ROWS, row_idx + MONTH_WS_MIN_EXTRA, MAX_SCAN_ROWS + MONTH_WS_MIN_EXTRA)
-    min_cols = max(MONTH_WS_MIN_COLS, len(header) + 5)
-    force_min_ws_size(ws, min_rows=min_rows, min_cols=min_cols)
+    ensure_ws_size(ws, min_rows=max(MONTH_WS_MIN_ROWS, row_idx + MONTH_WS_MIN_EXTRA), min_cols=max(MONTH_WS_MIN_COLS, len(header) + 5))
 
     sheet_prefix = f"'{ws.title}'!"
     payload = [{"range": f"{sheet_prefix}A{row_idx}", "values": [[date_iso]]}]
@@ -528,18 +521,16 @@ def write_month_sheet(ws: gspread.Worksheet, date_iso: str, header: List[str], v
 def ensure_month_ws(sh: gspread.Spreadsheet, title: str, level: str) -> gspread.Worksheet:
     expected_header = ["날짜"] + (NATION_REGIONS if level == "전국" else SEOUL_REGIONS)
     min_cols = max(MONTH_WS_MIN_COLS, len(expected_header) + 5)
-    min_rows = max(MONTH_WS_MIN_ROWS, MAX_SCAN_ROWS + MONTH_WS_MIN_EXTRA)
 
     ws = fuzzy_ws(sh, title)
 
     if ws is None:
-        ws = _retry(sh.add_worksheet, title=title, rows=min_rows, cols=min_cols)
+        ws = _retry(sh.add_worksheet, title=title, rows=MONTH_WS_MIN_ROWS, cols=min_cols)
         ws_update(ws, [expected_header], f"A1:{a1_col(len(expected_header))}1")
         log(f"[ws] created from scratch: {title}")
         return ws
 
-    # 기존 탭도 월 기록 전에 강제로 최소 크기 보장
-    force_min_ws_size(ws, min_rows=min_rows, min_cols=min_cols)
+    ensure_ws_size(ws, min_rows=MONTH_WS_MIN_ROWS, min_cols=min_cols)
 
     vals = _get_all_values_cached(ws)
     current_header = vals[0] if vals else []
@@ -1088,9 +1079,9 @@ def main():
         write_month_sheet(ws_seoul, today_iso, header_seoul, values_seoul)
 
     ws_sum = get_or_create_ws(sh, SUMMARY_SHEET_NAME, rows=400, cols=60)
-    months = [x[0] for x in summary_rows]  # 최신월 -> 과거월
+    months = [x[0] for x in summary_rows]
     header = ["구분"] + months
-    force_min_ws_size(ws_sum, min_rows=400, min_cols=max(60, len(header) + 5))
+    ensure_ws_size(ws_sum, min_rows=400, min_cols=max(60, len(header) + 5))
     ws_update(ws_sum, [header], f"A1:{a1_col(len(header))}1")
 
     lookup = {ym: (c, md, mn) for ym, c, md, mn in summary_rows}
