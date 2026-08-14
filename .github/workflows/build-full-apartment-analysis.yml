@@ -30,7 +30,13 @@ jobs:
           pip install -r requirements.txt
 
       - name: Prepare report directory
-        run: mkdir -p analyze_report
+        shell: bash
+        run: |
+          set -e
+          if [ -f analyze_report ]; then
+            rm -f analyze_report
+          fi
+          mkdir -p analyze_report
 
       - name: Build nationwide and Seoul price-band analysis
         env:
