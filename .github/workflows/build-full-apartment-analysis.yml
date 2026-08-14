@@ -1,0 +1,48 @@
+name: build-full-apartment-analysis
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/build_full_apartment_analysis.py"
+      - ".github/workflows/build-full-apartment-analysis.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare report directory
+        run: mkdir -p analyze_report
+
+      - name: Build nationwide and Seoul price-band analysis
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          APT_ANALYSIS_FOLDER_ID: 1ZlhCi3vth9OXW7zw8E7xWX-_5YUEZiFY
+          APT_ANALYSIS_SHEET_NAME: 아파트 실거래분석
+        run: python scripts/build_full_apartment_analysis.py
+
+      - name: Upload analysis summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-apartment-analysis-summary
+          path: analyze_report/
+          if-no-files-found: warn
