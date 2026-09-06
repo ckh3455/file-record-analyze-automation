@@ -48,6 +48,13 @@ jobs:
           raise SystemExit(1 if missing else 0)
           PY
 
+      - name: Ensure canonical current-month tabs
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          python scripts/prepare_month_tabs.py
+
       - name: Run analyze_and_update (original Drive filenames preserved)
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
