@@ -1,0 +1,28 @@
+name: backfill-rows
+
+on:
+  workflow_dispatch:
+    inputs:
+      backfill_json:
+        description: '날짜별 집계 JSON {"YYYY-MM-DD": {"YYYYMM": {지역: 건수}}}'
+        required: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Backfill month-tab rows
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          BACKFILL_JSON: ${{ inputs.backfill_json }}
+        working-directory: scripts
+        run: python backfill_rows.py

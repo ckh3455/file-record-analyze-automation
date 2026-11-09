@@ -71,3 +71,15 @@ jobs:
           name: analyze_report
           path: analyze_report/
           if-no-files-found: warn
+
+  keepalive:
+    # 커밋이 60일 없으면 GitHub가 예약 실행을 자동으로 끄므로, 실행할 때마다 다시 활성화해 타이머를 초기화
+    name: Keepalive
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Reset inactivity timer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/analyze-and-update-sheets.yml/enable"

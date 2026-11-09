@@ -75,11 +75,13 @@ flowchart TD
 - 실행 파일: `scripts/analyze_and_update.py`
 - 결과 artifact: `analyze_report`
 
-### `molit.yml` 주의사항
+### `backfill-rows.yml`
 
-매일 `00:05 UTC` (`09:05 KST`)에도 같은 분석 스크립트를 실행하도록 설정되어 있어 기본 워크플로와 중복 실행될 수 있습니다. 또한 현재 이 파일은 `DRIVE_PARENT_FOLDER_ID`와 `DRIVE_SUBFOLDER_NAME`을 넘기지만, 분석 스크립트는 `DRIVE_FOLDER_ID`를 필수로 읽습니다. 따라서 수정 없이 실행하면 `DRIVE_FOLDER_ID 환경변수가 필요합니다` 오류가 발생할 수 있습니다.
+빠진 날짜의 전국·서울 월별 탭 행을 채우는 수동 보정용 워크플로입니다. 날짜별 집계 JSON을 입력으로 받아 `scripts/backfill_rows.py`를 실행하며, `거래요약` 탭은 건드리지 않습니다.
 
-둘 중 하나만 예약 실행하도록 정리하고, `molit.yml`을 유지한다면 `DRIVE_FOLDER_ID`를 secret 또는 환경변수로 전달해야 합니다.
+### 자동 비활성화 방지
+
+공개 저장소는 커밋이 60일 없으면 예약 워크플로가 자동으로 꺼집니다. `analyze-and-update-sheets.yml`의 `keepalive` 작업이 실행할 때마다 워크플로를 다시 활성화해 이를 막습니다.
 
 ### `artifact-inspector.yml`
 
@@ -151,7 +153,7 @@ python scripts/analyze_and_update.py
 
 ### `DRIVE_FOLDER_ID 환경변수가 필요합니다`
 
-`DRIVE_FOLDER_ID` secret이 없거나 워크플로에서 다른 이름으로 전달된 경우입니다. 특히 현재 `molit.yml`은 이 문제가 있으므로 위의 주의사항을 확인하십시오.
+`DRIVE_FOLDER_ID` secret이 없거나 워크플로에서 다른 이름으로 전달된 경우입니다. 
 
 ### Drive에서 파일을 찾지 못함
 
@@ -162,7 +164,3 @@ python scripts/analyze_and_update.py
 ### `거래요약`이 갱신되지 않음
 
 시트에 `거래요약` 탭이 있는지, 첫 행 C열 이후에 코드가 집계하는 지역명이 적혀 있는지 확인합니다.
-
-### 동일 시간대에 두 번 실행됨
-
-현재 두 예약 워크플로가 5분 간격으로 같은 스크립트를 실행할 수 있습니다. 사용할 워크플로 하나만 남기거나 다른 워크플로의 `schedule`을 제거하십시오.
