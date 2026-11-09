@@ -2,6 +2,11 @@ name: analyze-and-update-sheets
 
 on:
   workflow_dispatch:
+    inputs:
+      months:
+        description: '처리할 월 지정(비우면 최근 5개월). 예: 202601-202606'
+        required: false
+        default: ''
   schedule:
     - cron: "0 0 * * *"  # 필요시 조정
 
@@ -61,6 +66,7 @@ jobs:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           DRIVE_SUPPORTS_ALL_DRIVES: ${{ secrets.DRIVE_SUPPORTS_ALL_DRIVES }}
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          ANALYZE_MONTHS: ${{ inputs.months }}
         run: |
           python scripts/analyze_and_update.py
 

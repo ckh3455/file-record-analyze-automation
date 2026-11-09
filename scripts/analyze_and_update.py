@@ -243,7 +243,23 @@ def pick_latest_5_months_from_folder(drive, folder_id: str, supports_all_drives:
         if not cur or ts(it) > ts(cur):
             best_by_ym[ym] = it
 
-    yms = sorted(best_by_ym.keys(), reverse=True)[:5]
+    months_env = os.environ.get("ANALYZE_MONTHS", "").strip()
+    if months_env:
+        # 예: "202601-202606" 또는 "202601,202603"
+        wanted = set()
+        for part in months_env.replace(" ", "").split(","):
+            if "-" in part:
+                a, b = part.split("-", 1)
+                y, m = int(a[:4]), int(a[4:])
+                while (y, m) <= (int(b[:4]), int(b[4:])):
+                    wanted.add(f"{y}{m:02d}")
+                    y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+            elif part:
+                wanted.add(part)
+        yms = sorted([ym for ym in best_by_ym if ym in wanted], reverse=True)
+        log(f"[drive] ANALYZE_MONTHS={months_env} -> {yms}")
+    else:
+        yms = sorted(best_by_ym.keys(), reverse=True)[:5]
     log(f"[drive] months_to_process={yms}")
     return [best_by_ym[ym] for ym in yms]
 
